@@ -10,6 +10,7 @@ use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use notify::Watcher;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -70,13 +71,22 @@ pub(crate) fn resolve_claude_binary() -> Result<ResolvedBinary> {
     let mut seen = BTreeSet::new();
     let mut candidates: Vec<ResolvedBinary> = Vec::new();
 
+    // An explicit CLAUDE_BIN override is authoritative: falling back to other
+    // candidates would silently mask a broken override.
     if let Ok(override_path) = env::var("CLAUDE_BIN") {
-        push_candidate(
-            &mut candidates,
-            &mut seen,
-            PathBuf::from(override_path),
-            "override",
-        );
+        if !override_path.trim().is_empty() {
+            let path = PathBuf::from(override_path);
+            if claude_candidate_is_usable(&path) {
+                return Ok(ResolvedBinary {
+                    path,
+                    source: "override",
+                });
+            }
+            bail!(
+                "CLAUDE_BIN is set to {} but it is not a usable claude binary (`--version` must succeed)",
+                path.display()
+            );
+        }
     }
     if let Some(home) = dirs::home_dir() {
         push_candidate(
@@ -629,6 +639,14 @@ pub(crate) fn ingest_spool_events(now: u64) -> Result<(Vec<BridgeThreadSnapshot>
             .and_then(Value::as_str)
             .map(str::to_string);
 
+        // The Stop payload carries the final answer directly; the transcript
+        // parse is the fallback (older Claude Code versions, missing field).
+        let payload_answer = payload
+            .get("last_assistant_message")
+            .and_then(Value::as_str)
+            .and_then(|text| normalized_message(Some(text)))
+            .map(|text| truncate_chars(&text, MAX_PREVIEW_CHARS));
+
         let base = by_session.remove(&session_id);
         let snapshot = match event_name.as_str() {
             "Stop" => BridgeThreadSnapshot {
@@ -642,7 +660,7 @@ pub(crate) fn ingest_spool_events(now: u64) -> Result<(Vec<BridgeThreadSnapshot>
                 status_type: "idle".to_string(),
                 status_flags: Vec::new(),
                 last_turn_status: Some("completed".to_string()),
-                last_preview: summary.last_assistant_text,
+                last_preview: payload_answer.or(summary.last_assistant_text),
                 pending_prompt: None,
             },
             "Notification" => BridgeThreadSnapshot {
@@ -856,12 +874,6 @@ pub(crate) fn watch_events_from_sync_result(
 // ---------------------------------------------------------------------------
 // Headless turns (detached `claude -p` processes)
 
-#[derive(Debug, Clone)]
-pub(crate) struct ClaudeTransportInfo {
-    pub(crate) transport: &'static str,
-    pub(crate) pid: Option<u32>,
-}
-
 fn claude_config(config: &DaemonConfig) -> ClaudeConfig {
     config.claude.clone().unwrap_or_default()
 }
@@ -1043,13 +1055,6 @@ pub(crate) fn start_thread_in_cwd(
         },
         "sentAt": now
     }))
-}
-
-pub(crate) fn transport_info(pid: Option<u32>) -> ClaudeTransportInfo {
-    ClaudeTransportInfo {
-        transport: "headless-cli",
-        pid,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1335,6 +1340,7 @@ mod tests {
 
     #[test]
     fn headless_reply_spawns_resume_with_permission_mode() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
         let config = DaemonConfig {
             version: 1,
             bridge_command: "tinyctb".to_string(),
@@ -1366,6 +1372,7 @@ mod tests {
 
     #[test]
     fn headless_new_session_generates_session_id() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
         let config = DaemonConfig {
             version: 1,
             bridge_command: "tinyctb".to_string(),

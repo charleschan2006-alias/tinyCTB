@@ -239,11 +239,10 @@ pub(crate) fn resolve_telegram_bot_token(explicit: Option<&str>) -> Result<Strin
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
     fn config_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::state::test_env_lock()
     }
 
     struct ConfigBackup {

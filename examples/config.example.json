@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "bridgeCommand": "tinyctb",
+  "events": "thread_waiting,thread_completed",
+  "telegram": {
+    "botToken": "123456789:REPLACE_WITH_BOT_TOKEN",
+    "chatId": "123456789",
+    "allowedUserId": "123456789"
+  },
+  "claude": {
+    "permissionMode": "bypassPermissions",
+    "sessionScanLimit": 50
+  },
+  "projects": [
+    {
+      "id": "example",
+      "label": "Example Project",
+      "cwd": "/home/user/projects/example",
+      "aliases": ["ex"]
+    }
+  ]
+}

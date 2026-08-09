@@ -26,9 +26,11 @@ use crate::state::{
 };
 use crate::{
     daemon_config_path, load_daemon_config, merged_daemon_config, read_daemon_config_raw,
-    redacted_daemon_config, resolve_telegram_bot_token, write_daemon_config, ClaudeConfig,
-    DaemonConfig, RegisteredProject, TelegramConfig, TelegramSetupOptions,
+    redacted_daemon_config, resolve_telegram_bot_token, write_daemon_config, DaemonConfig,
+    RegisteredProject, TelegramConfig, TelegramSetupOptions,
 };
+#[cfg(test)]
+use crate::ClaudeConfig;
 
 use self::api::{
     telegram_answer_callback_query, telegram_bot_commands, telegram_chat_id,
@@ -1590,13 +1592,12 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
     use crate::{daemon_config_path, write_daemon_config, DaemonConfig, TelegramConfig};
 
     fn config_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::state::test_env_lock()
     }
 
     struct CommandEnv {

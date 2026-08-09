@@ -179,6 +179,7 @@ pub(crate) enum TelegramCallbackAction {
 }
 
 impl TelegramCallbackAction {
+    #[allow(dead_code)]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Approve => "approve",
@@ -210,6 +211,7 @@ pub(crate) struct HistoryAction {
     pub(crate) created_at: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ArchiveSelection {
     pub(crate) targets: Vec<String>,
@@ -1319,6 +1321,7 @@ pub(crate) fn list_inbox_from_db(
     })
 }
 
+#[allow(dead_code)]
 pub(crate) fn resolve_archive_targets(
     conn: &Connection,
     thread_ids: &[String],
@@ -1346,6 +1349,7 @@ pub(crate) fn resolve_archive_targets(
     })
 }
 
+#[allow(dead_code)]
 pub(crate) fn archive_result(dry_run: bool, results: Vec<Value>) -> Value {
     json!({
         "ok": true,
@@ -1415,6 +1419,7 @@ pub(crate) fn set_telegram_current_project_id(
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn unarchive_thread_result(
     conn: &Connection,
     thread_id: &str,
@@ -1546,6 +1551,7 @@ pub(crate) fn insert_telegram_message_route(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn insert_telegram_callback_route(
     conn: &Connection,
     route: &TelegramCallbackRoute,
