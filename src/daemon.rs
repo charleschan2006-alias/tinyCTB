@@ -465,16 +465,7 @@ pub(crate) fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<D
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .map(|value| {
-            let path = PathBuf::from(&value);
-            if path.is_absolute() {
-                value
-            } else {
-                env::current_dir()
-                    .map(|cwd| cwd.join(&path).display().to_string())
-                    .unwrap_or(value)
-            }
-        });
+        .map(|value| absolutize_claude_bin(&value));
     if cfg!(target_os = "macos") {
         let launch_agents_dir = dirs::home_dir()
             .context("home directory is not available")?
@@ -538,6 +529,20 @@ pub(crate) fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<D
     } else {
         bail!("daemon service install is only supported on macOS launchd and Linux systemd")
     }
+}
+
+/// Resolve a `CLAUDE_BIN` override to an absolute path against the current
+/// working directory. The service manager launches the daemon from a different
+/// cwd, so a relative value that works in the terminal would otherwise break.
+/// Symlinks are intentionally NOT resolved (a claude upgrade may repoint them).
+fn absolutize_claude_bin(value: &str) -> String {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return value.to_string();
+    }
+    env::current_dir()
+        .map(|cwd| cwd.join(&path).display().to_string())
+        .unwrap_or_else(|_| value.to_string())
 }
 
 /// Pure builder for the macOS LaunchAgent spec so the generated plist and
@@ -1159,5 +1164,18 @@ mod tests {
             std::path::Path::new(&resolved).is_absolute(),
             "service command must be absolute, got: {resolved}"
         );
+    }
+
+    #[test]
+    fn absolutize_claude_bin_makes_relative_paths_absolute() {
+        let absolute = absolutize_claude_bin("/opt/claude/bin/claude");
+        assert_eq!(absolute, "/opt/claude/bin/claude");
+
+        let relative = absolutize_claude_bin("./bin/claude");
+        assert!(
+            Path::new(&relative).is_absolute(),
+            "relative CLAUDE_BIN must be absolutized, got: {relative}"
+        );
+        assert!(relative.ends_with("bin/claude"));
     }
 }

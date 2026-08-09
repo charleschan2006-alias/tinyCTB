@@ -105,7 +105,11 @@ struct ReplyResult<'a> {
     sent_at: u64,
 }
 
-pub fn main_entry() -> anyhow::Result<()> {
+/// Runs the CLI and returns the process exit code. `main` owns the actual
+/// `process::exit`, so library code never terminates the process itself —
+/// a command that printed its own failure report (e.g. `setup` with a failed
+/// daemon start) returns a non-zero code without a second error envelope.
+pub fn main_entry() -> anyhow::Result<i32> {
     run()
 }
 
@@ -121,7 +125,7 @@ pub fn render_error_envelope(error: &anyhow::Error) -> String {
     serde_json::to_string(&envelope).expect("serialize error envelope")
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<i32> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -153,7 +157,7 @@ fn run() -> Result<()> {
             })?;
             println!("{}", serde_json::to_string(&result)?);
             if result.get("ok").and_then(Value::as_bool) != Some(true) {
-                std::process::exit(1);
+                return Ok(1);
             }
         }
         Commands::Doctor => {
@@ -510,7 +514,7 @@ fn run() -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(0)
 }
 
 fn now_millis() -> Result<u64> {
@@ -639,19 +643,40 @@ fn setup_result(options: SetupOptions<'_>) -> Result<Value> {
     } else {
         None
     };
+    Ok(assemble_setup_report(
+        options.dry_run,
+        json!({
+            "resolvedPath": resolved.path.display().to_string(),
+            "source": resolved.source
+        }),
+        telegram,
+        hooks,
+        daemon_install,
+        daemon_start,
+    ))
+}
+
+/// Pure assembly of the `setup` report so the failure-aggregation logic (a
+/// failed daemon start must drive top-level `ok:false` while preserving the
+/// install results) is unit-testable without shelling out to a service manager.
+fn assemble_setup_report(
+    dry_run: bool,
+    claude: Value,
+    telegram: Value,
+    hooks: Option<Value>,
+    daemon_install: Option<Value>,
+    daemon_start: Option<Value>,
+) -> Value {
     let daemon_start_failed = daemon_start
         .as_ref()
         .map(|result| result.get("ok").and_then(Value::as_bool) != Some(true))
         .unwrap_or(false);
 
-    Ok(json!({
+    json!({
         "ok": !daemon_start_failed,
         "action": "setup",
-        "dryRun": options.dry_run,
-        "claude": {
-            "resolvedPath": resolved.path.display().to_string(),
-            "source": resolved.source
-        },
+        "dryRun": dry_run,
+        "claude": claude,
         "telegram": telegram,
         "hooks": hooks,
         "daemon": {
@@ -660,12 +685,12 @@ fn setup_result(options: SetupOptions<'_>) -> Result<Value> {
         },
         "nextStep": if daemon_start_failed {
             "Setup wrote the config, hooks, and service, but the daemon failed to start. Inspect `daemon.start.error`, then run `tinyctb daemon start` again."
-        } else if options.dry_run {
+        } else if dry_run {
             "Run setup without --dry-run, then send /away to the Telegram bot when leaving your computer."
         } else {
             "Restart running interactive Claude Code sessions so hooks load, then send /away to the Telegram bot when leaving your computer. Reply to Claude Telegram messages to keep working from Telegram."
         }
-    }))
+    })
 }
 
 const RESET_RUNTIME_FILES: &[&str] = &[
@@ -1242,5 +1267,53 @@ mod tests {
         assert!(names.contains(&"state.db"));
         assert!(names.contains(&"events/"));
         assert!(result["wouldRemoveFiles"].is_null());
+    }
+
+    #[test]
+    fn setup_report_aggregates_daemon_start_failure() {
+        let report = assemble_setup_report(
+            false,
+            json!({"resolvedPath": "/usr/bin/claude", "source": "path"}),
+            json!({"ok": true}),
+            Some(json!({"ok": true, "action": "hooks_install"})),
+            Some(json!({"ok": true, "action": "daemon_install"})),
+            Some(json!({"ok": false, "action": "daemon_start", "error": "boom"})),
+        );
+        assert_eq!(report["ok"], false, "failed daemon start must fail the whole setup");
+        // Install steps that already succeeded stay in the report.
+        assert_eq!(report["daemon"]["install"]["ok"], true);
+        assert_eq!(report["hooks"]["ok"], true);
+        assert_eq!(report["daemon"]["start"]["error"], "boom");
+        assert!(report["nextStep"]
+            .as_str()
+            .unwrap()
+            .contains("daemon failed to start"));
+    }
+
+    #[test]
+    fn setup_report_ok_when_daemon_start_succeeds() {
+        let report = assemble_setup_report(
+            false,
+            json!({"resolvedPath": "/usr/bin/claude", "source": "path"}),
+            json!({"ok": true}),
+            Some(json!({"ok": true})),
+            Some(json!({"ok": true})),
+            Some(json!({"ok": true, "verifiedRunning": true})),
+        );
+        assert_eq!(report["ok"], true);
+    }
+
+    #[test]
+    fn setup_report_ok_when_daemon_start_skipped() {
+        let report = assemble_setup_report(
+            true,
+            json!({"resolvedPath": "/usr/bin/claude", "source": "path"}),
+            json!({"ok": true}),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(report["ok"], true, "no daemon start requested => setup ok");
+        assert!(report["nextStep"].as_str().unwrap().contains("without --dry-run"));
     }
 }

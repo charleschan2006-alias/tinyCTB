@@ -18,10 +18,12 @@ The product rule is simple:
 - `/back` stops remote notifications and clears the pending queue
 
 Linux (Ubuntu, systemd user service) is the primary platform. macOS (launchd
-user agent) has experimental support, not yet verified on real hardware — the
-`daemon install` command writes `~/Library/LaunchAgents/tinyctb.plist` and
-reloads it with `launchctl bootout` followed by `launchctl bootstrap`, so an
-updated plist always takes effect.
+user agent) has experimental support, not yet verified on real hardware:
+`daemon install` writes `~/Library/LaunchAgents/tinyctb.plist`, and
+`daemon start` (which `setup` runs by default) loads or reloads it with
+`launchctl bootout` followed by `launchctl bootstrap`, so an updated plist
+always takes effect. On Linux the equivalent pair is `systemctl --user
+daemon-reload && enable --now`.
 
 ## How it works
 
