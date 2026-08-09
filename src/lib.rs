@@ -152,6 +152,9 @@ fn run() -> Result<()> {
                 pair_timeout_ms,
             })?;
             println!("{}", serde_json::to_string(&result)?);
+            if result.get("ok").and_then(Value::as_bool) != Some(true) {
+                std::process::exit(1);
+            }
         }
         Commands::Doctor => {
             let resolved = resolve_claude_binary()?;
@@ -621,14 +624,28 @@ fn setup_result(options: SetupOptions<'_>) -> Result<Value> {
     } else {
         None
     };
+    // Config, hooks, and service install above have already happened by the
+    // time the daemon starts, so a start failure must not discard the report —
+    // it is embedded here and aggregated into the top-level `ok`.
     let daemon_start = if options.start_daemon {
-        Some(start_daemon_service(options.daemon_label, options.dry_run)?)
+        Some(match start_daemon_service(options.daemon_label, options.dry_run) {
+            Ok(result) => result,
+            Err(error) => json!({
+                "ok": false,
+                "action": "daemon_start",
+                "error": format!("{error:#}")
+            }),
+        })
     } else {
         None
     };
+    let daemon_start_failed = daemon_start
+        .as_ref()
+        .map(|result| result.get("ok").and_then(Value::as_bool) != Some(true))
+        .unwrap_or(false);
 
     Ok(json!({
-        "ok": true,
+        "ok": !daemon_start_failed,
         "action": "setup",
         "dryRun": options.dry_run,
         "claude": {
@@ -641,7 +658,9 @@ fn setup_result(options: SetupOptions<'_>) -> Result<Value> {
             "install": daemon_install,
             "start": daemon_start
         },
-        "nextStep": if options.dry_run {
+        "nextStep": if daemon_start_failed {
+            "Setup wrote the config, hooks, and service, but the daemon failed to start. Inspect `daemon.start.error`, then run `tinyctb daemon start` again."
+        } else if options.dry_run {
             "Run setup without --dry-run, then send /away to the Telegram bot when leaving your computer."
         } else {
             "Restart running interactive Claude Code sessions so hooks load, then send /away to the Telegram bot when leaving your computer. Reply to Claude Telegram messages to keep working from Telegram."

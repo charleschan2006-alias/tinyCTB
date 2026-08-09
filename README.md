@@ -17,8 +17,11 @@ The product rule is simple:
   answer comes back to Telegram
 - `/back` stops remote notifications and clears the pending queue
 
-Linux (Ubuntu, systemd user service) is the supported platform. macOS support
-is a planned extension.
+Linux (Ubuntu, systemd user service) is the primary platform. macOS (launchd
+user agent) has experimental support, not yet verified on real hardware — the
+`daemon install` command writes `~/Library/LaunchAgents/tinyctb.plist` and
+reloads it with `launchctl bootout` followed by `launchctl bootstrap`, so an
+updated plist always takes effect.
 
 ## How it works
 
@@ -40,7 +43,7 @@ Code surfaces together:
    passes `--session-id`, so reply routing works before the first token is
    produced. Turn output is logged to `~/.tinyctb/logs/turns/`.
 
-The daemon loop (systemd user service): ingest spooled hook events → refresh
+The daemon loop (systemd user service / macOS LaunchAgent): ingest spooled hook events → refresh
 the session cache → process Telegram updates (commands + reply routing) →
 refresh typing indicators → deliver queued notifications (away mode only, with
 retry/backoff and per-event dedupe in sqlite).
@@ -60,7 +63,7 @@ cargo install --path .
 ## Quick start
 
 ```bash
-# one-step setup: Telegram pairing + hooks + systemd daemon
+# one-step setup: Telegram pairing + hooks + daemon service (systemd / launchd)
 tinyctb setup --bot-token <telegram-bot-token>
 
 # verify everything

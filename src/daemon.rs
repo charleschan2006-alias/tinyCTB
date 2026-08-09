@@ -454,6 +454,42 @@ pub(crate) fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<D
     let stdout_log = logs_dir.join("daemon.out.log");
     let stderr_log = logs_dir.join("daemon.err.log");
     let runtime_path = daemon_runtime_path();
+    // A user-set CLAUDE_BIN is authoritative for the backend (no fallback), so
+    // it must reach the service environment too — otherwise the terminal and
+    // the background daemon would resolve different claude binaries.
+    // Relative CLAUDE_BIN values are resolved against the install-time cwd:
+    // the service manager starts the daemon from a different working directory,
+    // so a relative path that works in the terminal would break in the agent.
+    // Symlinks are deliberately NOT resolved (a claude upgrade may repoint them).
+    let claude_bin_override = env::var("CLAUDE_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let path = PathBuf::from(&value);
+            if path.is_absolute() {
+                value
+            } else {
+                env::current_dir()
+                    .map(|cwd| cwd.join(&path).display().to_string())
+                    .unwrap_or(value)
+            }
+        });
+    if cfg!(target_os = "macos") {
+        let launch_agents_dir = dirs::home_dir()
+            .context("home directory is not available")?
+            .join("Library")
+            .join("LaunchAgents");
+        return Ok(macos_launchd_spec(
+            label,
+            &service_bridge_command,
+            &launch_agents_dir,
+            &stdout_log,
+            &stderr_log,
+            &runtime_path,
+            claude_bin_override.as_deref(),
+        ));
+    }
     if cfg!(target_os = "linux") {
         let unit_name = if label.ends_with(".service") {
             label.to_string()
@@ -466,9 +502,14 @@ pub(crate) fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<D
             .join("systemd")
             .join("user")
             .join(&unit_name);
+        let claude_bin_env = claude_bin_override
+            .as_deref()
+            .map(|value| format!("Environment=\"CLAUDE_BIN={}\"\n", systemd_escape_env(value)))
+            .unwrap_or_default();
         let contents = format!(
-            "[Unit]\nDescription=tinyCTB Claude Telegram bridge daemon\n\n[Service]\nType=simple\nEnvironment=\"PATH={}\"\nExecStart={} daemon run\nRestart=always\nRestartSec=2\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription=tinyCTB Claude Telegram bridge daemon\n\n[Service]\nType=simple\nEnvironment=\"PATH={}\"\n{}ExecStart={} daemon run\nRestart=always\nRestartSec=2\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
             systemd_escape_env(&runtime_path),
+            claude_bin_env,
             shell_quote(&service_bridge_command),
             stdout_log.display(),
             stderr_log.display()
@@ -495,7 +536,93 @@ pub(crate) fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<D
             status_command: format!("systemctl --user status {}", shell_quote(&unit_name)),
         })
     } else {
-        bail!("daemon service install currently supports Linux systemd only (macOS support is a planned extension)")
+        bail!("daemon service install is only supported on macOS launchd and Linux systemd")
+    }
+}
+
+/// Pure builder for the macOS LaunchAgent spec so the generated plist and
+/// launchctl commands can be unit-tested on any platform.
+#[allow(clippy::too_many_arguments)]
+fn macos_launchd_spec(
+    label: &str,
+    service_bridge_command: &str,
+    launch_agents_dir: &Path,
+    stdout_log: &Path,
+    stderr_log: &Path,
+    runtime_path: &str,
+    claude_bin_override: Option<&str>,
+) -> DaemonServiceSpec {
+    let service_path = launch_agents_dir.join(format!("{label}.plist"));
+    let run_args = [
+        service_bridge_command.to_string(),
+        "daemon".to_string(),
+        "run".to_string(),
+    ];
+    let args_xml = run_args
+        .iter()
+        .map(|arg| format!("        <string>{}</string>", xml_escape(arg)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let claude_bin_xml = claude_bin_override
+        .map(|value| {
+            format!(
+                "        <key>CLAUDE_BIN</key>\n        <string>{}</string>\n",
+                xml_escape(value)
+            )
+        })
+        .unwrap_or_default();
+    let contents = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{}</string>
+    <key>ProgramArguments</key>
+    <array>
+{}
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{}</string>
+{}    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{}</string>
+    <key>StandardErrorPath</key>
+    <string>{}</string>
+</dict>
+</plist>
+"#,
+        xml_escape(label),
+        args_xml,
+        xml_escape(runtime_path),
+        claude_bin_xml,
+        xml_escape(&stdout_log.display().to_string()),
+        xml_escape(&stderr_log.display().to_string())
+    );
+    let quoted_path = shell_quote(&service_path.display().to_string());
+    let bootstrap_command = format!("launchctl bootstrap gui/$(id -u) {quoted_path}");
+    let bootout_command = format!("launchctl bootout gui/$(id -u)/{}", shell_quote(label));
+    // Reload semantics: an already-loaded agent keeps its old definition, so
+    // both install and start must bootout the existing job (ignoring "not
+    // loaded" failures) before bootstrapping the current plist.
+    let reload_command = format!("{bootout_command} 2>/dev/null; {bootstrap_command}");
+    DaemonServiceSpec {
+        service_path,
+        stdout_log: stdout_log.to_path_buf(),
+        stderr_log: stderr_log.to_path_buf(),
+        unit_name: label.to_string(),
+        contents,
+        install_command: reload_command.clone(),
+        uninstall_command: format!("{bootout_command} 2>/dev/null || true"),
+        start_command: reload_command,
+        stop_command: bootout_command,
+        status_command: format!("launchctl print gui/$(id -u)/{}", shell_quote(label)),
     }
 }
 
@@ -511,7 +638,12 @@ fn resolve_service_bridge_command(bridge_command: &str) -> String {
                 .unwrap_or_else(|_| trimmed.to_string())
         };
     }
-    which::which(trimmed)
+    if let Ok(path) = which::which(trimmed) {
+        return path.display().to_string();
+    }
+    // The service's first ProgramArguments/ExecStart entry must be an absolute
+    // path — a bare name would depend on the service manager's own PATH.
+    env::current_exe()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| trimmed.to_string())
 }
@@ -585,6 +717,45 @@ fn run_shell_command(command: &str) -> Result<Value> {
     }))
 }
 
+fn macos_service_runtime(output: &Value) -> Value {
+    let stdout = output
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let stderr = output
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let success = output
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !success {
+        let not_loaded = stderr.contains("Could not find service")
+            || stderr.contains("could not find service")
+            || stderr.contains("service not found");
+        return json!({
+            "loaded": !not_loaded,
+            "running": false,
+            "state": Value::Null,
+            "raw": output
+        });
+    }
+
+    let state = stdout.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("state = ")
+            .map(|value| value.trim().to_string())
+    });
+    let running = matches!(state.as_deref(), Some("running"));
+    json!({
+        "loaded": true,
+        "running": running,
+        "state": state,
+        "raw": output
+    })
+}
+
 fn linux_service_runtime(unit_name: &str, status_output: &Value) -> Result<Value> {
     let active_output = run_shell_command(&format!(
         "systemctl --user is-active {}",
@@ -622,6 +793,11 @@ fn service_runtime_status(spec: &DaemonServiceSpec) -> Result<Value> {
         }));
     }
 
+    if cfg!(target_os = "macos") {
+        let output = run_shell_command(&spec.status_command)?;
+        return Ok(macos_service_runtime(&output));
+    }
+
     if cfg!(target_os = "linux") {
         let output = run_shell_command(&spec.status_command)?;
         return linux_service_runtime(&spec.unit_name, &output);
@@ -638,18 +814,62 @@ fn service_runtime_status(spec: &DaemonServiceSpec) -> Result<Value> {
 pub(crate) fn start_daemon_service(label: &str, dry_run: bool) -> Result<Value> {
     let spec = daemon_service_spec(label, "tinyctb")?;
     let command = spec.start_command.clone();
-    let output = if dry_run {
-        None
-    } else {
-        Some(run_shell_command(&command)?)
-    };
+    if dry_run {
+        return Ok(json!({
+            "ok": true,
+            "action": "daemon_start",
+            "dryRun": true,
+            "label": spec.unit_name,
+            "command": command,
+            "output": Value::Null
+        }));
+    }
+    let output = run_shell_command(&command)?;
+    let command_ok = output
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // The start command returning 0 does not prove the daemon stayed up (bad
+    // plist/unit contents, wrong binary path, crash on boot). Poll the service
+    // manager until it reports running or the grace window expires.
+    let mut verified_running = false;
+    let mut runtime = Value::Null;
+    if command_ok {
+        for _ in 0..15 {
+            runtime = service_runtime_status(&spec)?;
+            if runtime.get("running").and_then(Value::as_bool) == Some(true) {
+                verified_running = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(400));
+        }
+    }
+    // A failed start is a hard error so `tinyctb daemon start` exits non-zero
+    // and callers (setup) cannot silently report success.
+    if !command_ok {
+        bail!(
+            "daemon start command failed (`{}`): status {:?}, stderr: {}",
+            command,
+            output.get("status").and_then(Value::as_i64),
+            output.get("stderr").and_then(Value::as_str).unwrap_or("")
+        );
+    }
+    if !verified_running {
+        bail!(
+            "daemon start command succeeded but service `{}` never reached running state within the grace window; check the daemon logs ({})",
+            spec.unit_name,
+            spec.stderr_log.display()
+        );
+    }
     Ok(json!({
         "ok": true,
         "action": "daemon_start",
-        "dryRun": dry_run,
+        "dryRun": false,
         "label": spec.unit_name,
         "command": command,
-        "output": output
+        "output": output,
+        "verifiedRunning": true,
+        "serviceStatus": runtime
     }))
 }
 
@@ -719,6 +939,15 @@ pub(crate) fn daemon_service_logs(label: &str) -> Result<Value> {
     }))
 }
 
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,7 +956,7 @@ mod tests {
 
     #[test]
     fn daemon_install_dry_run_resolves_relative_bridge_command_for_services() {
-        if !cfg!(target_os = "linux") {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
             return;
         }
         let result = install_daemon_service(DEFAULT_DAEMON_LABEL, "bin/tinyctb", true)
@@ -830,5 +1059,105 @@ mod tests {
         assert_eq!(disabled["away"], false);
         assert_eq!(disabled["clearedPendingNotifications"], 1);
         assert_eq!(pending_outbound_count(&conn).expect("pending"), 0);
+    }
+
+    #[test]
+    fn macos_service_runtime_marks_running_services_as_loaded() {
+        let runtime = macos_service_runtime(&json!({
+            "success": true,
+            "stdout": "gui/501/tinyctb = {\n\tstate = running\n}\n",
+            "stderr": ""
+        }));
+
+        assert_eq!(runtime["loaded"], true);
+        assert_eq!(runtime["running"], true);
+        assert_eq!(runtime["state"], "running");
+    }
+
+    #[test]
+    fn macos_service_runtime_marks_missing_services_as_not_loaded() {
+        let runtime = macos_service_runtime(&json!({
+            "success": false,
+            "stdout": "",
+            "stderr": "Bad request.\nCould not find service \"tinyctb\" in domain for user gui: 501"
+        }));
+
+        assert_eq!(runtime["loaded"], false);
+        assert_eq!(runtime["running"], false);
+        assert_eq!(runtime["state"], Value::Null);
+    }
+
+    #[test]
+    fn macos_launchd_spec_generates_reloadable_plist() {
+        let spec = macos_launchd_spec(
+            "tinyctb",
+            "/opt/tiny ctb/bin/tinyctb",
+            Path::new("/Users/test/Library/LaunchAgents"),
+            Path::new("/Users/test/.tinyctb/logs/daemon.out.log"),
+            Path::new("/Users/test/.tinyctb/logs/daemon.err.log"),
+            "/opt/homebrew/bin:/usr/bin",
+            None,
+        );
+
+        assert_eq!(
+            spec.service_path.display().to_string(),
+            "/Users/test/Library/LaunchAgents/tinyctb.plist"
+        );
+        assert!(spec.contents.contains("<key>Label</key>"));
+        // Space in the binary path must survive as-is inside ProgramArguments
+        // (array semantics, no shell), with XML escaping applied.
+        assert!(spec
+            .contents
+            .contains("<string>/opt/tiny ctb/bin/tinyctb</string>"));
+        assert!(spec.contents.contains("<string>daemon</string>"));
+        assert!(spec.contents.contains("<string>run</string>"));
+        assert!(spec.contents.contains("<key>RunAtLoad</key>"));
+        assert!(spec.contents.contains("<key>KeepAlive</key>"));
+        assert!(spec
+            .contents
+            .contains("<string>/Users/test/.tinyctb/logs/daemon.out.log</string>"));
+        assert!(!spec.contents.contains("CLAUDE_BIN"));
+
+        // Install and start must bootout the existing job before bootstrapping
+        // so an updated plist actually takes effect.
+        for command in [&spec.install_command, &spec.start_command] {
+            let bootout = command.find("launchctl bootout").expect("bootout present");
+            let bootstrap = command
+                .find("launchctl bootstrap")
+                .expect("bootstrap present");
+            assert!(bootout < bootstrap, "bootout must run before bootstrap: {command}");
+        }
+        assert!(!spec.start_command.contains("kickstart"));
+        assert!(spec.status_command.starts_with("launchctl print gui/"));
+    }
+
+    #[test]
+    fn macos_launchd_spec_escapes_xml_and_passes_claude_bin() {
+        let spec = macos_launchd_spec(
+            "tinyctb",
+            "/opt/a&b/tinyctb",
+            Path::new("/Users/test/Library/LaunchAgents"),
+            Path::new("/Users/test/.tinyctb/logs/daemon.out.log"),
+            Path::new("/Users/test/.tinyctb/logs/daemon.err.log"),
+            "/usr/bin",
+            Some("/custom/<claude> & bin"),
+        );
+
+        assert!(spec.contents.contains("<string>/opt/a&amp;b/tinyctb</string>"));
+        assert!(spec.contents.contains("<key>CLAUDE_BIN</key>"));
+        assert!(spec
+            .contents
+            .contains("<string>/custom/&lt;claude&gt; &amp; bin</string>"));
+        assert!(!spec.contents.contains("<string>/custom/<claude>"));
+    }
+
+    #[test]
+    fn service_bridge_command_falls_back_to_current_exe_for_unknown_names() {
+        let resolved =
+            resolve_service_bridge_command("definitely-not-a-real-binary-tinyctb-test");
+        assert!(
+            std::path::Path::new(&resolved).is_absolute(),
+            "service command must be absolute, got: {resolved}"
+        );
     }
 }
