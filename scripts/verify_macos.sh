@@ -16,7 +16,11 @@ set -u
 
 LABEL="tinyctb-verify"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
-STATE_DIR="$HOME/.tinyctb"
+# A dedicated throwaway state dir: the plist embeds TINYCTB_STATE_DIR, so the
+# verify daemon reads/writes only here and the user's real ~/.tinyctb (config,
+# state.db, hook spool, logs) is never touched.
+STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tinyctb-verify-state.XXXXXX")"
+export TINYCTB_STATE_DIR="$STATE_DIR"
 CONFIG="$STATE_DIR/config.json"
 
 pass=0
@@ -46,43 +50,20 @@ if launchctl print "gui/$(id -u)/tinyctb" >/dev/null 2>&1; then
     exit 2
 fi
 
-# --- state backup / cleanup ------------------------------------------------
-HAD_STATE_DIR=0
-[ -d "$STATE_DIR" ] && HAD_STATE_DIR=1
-HAD_CONFIG=0
-if [ -f "$CONFIG" ]; then
-    HAD_CONFIG=1
-    cp "$CONFIG" "$CONFIG.verify-backup"
-fi
-
+# --- cleanup ----------------------------------------------------------------
 cleanup() {
     step "Cleanup"
     "$BIN" daemon uninstall --label "$LABEL" >/dev/null 2>&1
     launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1
     rm -f "$PLIST"
-    if [ "$HAD_CONFIG" = "1" ]; then
-        mv -f "$CONFIG.verify-backup" "$CONFIG" 2>/dev/null
-        info "restored your original config.json"
-    elif [ "$HAD_STATE_DIR" = "0" ]; then
-        # We created ~/.tinyctb from scratch for this run — remove it whole.
-        rm -rf "$STATE_DIR"
-        info "removed the throwaway ~/.tinyctb created for this run"
-    else
-        # Pre-existing state dir but no config: drop just the fake config +
-        # verify-run artifacts, leave anything else alone.
-        rm -f "$CONFIG"
-        rm -rf "$STATE_DIR/events" "$STATE_DIR/logs"
-        rm -f "$STATE_DIR/state.db" "$STATE_DIR/state.db-wal" \
-              "$STATE_DIR/state.db-shm" "$STATE_DIR/remote-mode.json" \
-              "$STATE_DIR/daemon.lock"
-    fi
+    rm -rf "$STATE_DIR"
+    info "removed the throwaway verify state dir"
     info "done"
 }
 trap cleanup EXIT
 
 # A throwaway config so `daemon run` stays alive (bogus token → Telegram 401,
 # which the daemon cycle handles gracefully without exiting).
-mkdir -p "$STATE_DIR"
 cat > "$CONFIG" <<'JSON'
 {"version":1,"bridgeCommand":"tinyctb","events":"thread_waiting,thread_completed","telegram":{"botToken":"0:verify","chatId":"0"},"claude":{"permissionMode":"bypassPermissions","sessionScanLimit":10},"projects":[]}
 JSON
@@ -127,13 +108,20 @@ if grep -q "<key>RunAtLoad</key>" "$PLIST" && grep -q "<key>KeepAlive</key>" "$P
 else
     bad "plist missing RunAtLoad/KeepAlive"
 fi
+# Load-bearing isolation check: the verify daemon must be pinned to the
+# throwaway state dir, otherwise it would consume the real hook spool/db.
+if grep -q "<key>TINYCTB_STATE_DIR</key>" "$PLIST" && grep -qF "$STATE_DIR" "$PLIST"; then
+    ok "plist pins TINYCTB_STATE_DIR to the throwaway dir"
+else
+    bad "plist does not pin TINYCTB_STATE_DIR — verify daemon would touch real state"
+fi
 
 # --- 4. start + verify running ---------------------------------------------
 step "4. daemon start (launchctl bootout→bootstrap) + verify running"
 if "$BIN" daemon start --label "$LABEL" >/dev/null 2>&1; then
     ok "daemon start reached running state (verified within grace window)"
 else
-    bad "daemon start did not reach running — check ~/.tinyctb/logs/daemon.err.log"
+    bad "daemon start did not reach running — check $STATE_DIR/logs/daemon.err.log"
 fi
 if "$BIN" daemon status --label "$LABEL" 2>/dev/null | grep -q '"running":true'; then
     ok "daemon status reports running"

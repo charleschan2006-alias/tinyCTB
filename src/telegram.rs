@@ -17,7 +17,7 @@ use crate::state::{
     delete_setting, get_setting_number, get_telegram_current_project_id,
     insert_telegram_command_route, insert_telegram_message_route,
     list_recent_thread_snapshots_from_db, lookup_telegram_command_route,
-    lookup_telegram_message_route, mark_telegram_callback_route_used,
+    lookup_telegram_message_route, mark_bridge_turn, mark_telegram_callback_route_used,
     mark_telegram_command_route_used, observed_workspaces_from_db, record_action,
     record_telegram_inbound_processed, set_setting, set_setting_text,
     set_telegram_current_project_id, telegram_inbound_processed,
@@ -687,6 +687,8 @@ fn send_claude_reply_to_thread(
         .optional()?
         .flatten();
     let result = send_user_message(config, thread_id, message, cwd_hint.as_deref(), now)?;
+    // Answers to bridge-initiated turns are pushed back regardless of away mode.
+    mark_bridge_turn(conn, thread_id, now)?;
     record_action(
         conn,
         thread_id,
@@ -743,6 +745,8 @@ fn start_new_thread_from_telegram(
         .and_then(Value::as_str)
         .context("new Claude session result missing threadId")?
         .to_string();
+    // Answers to bridge-initiated turns are pushed back regardless of away mode.
+    mark_bridge_turn(conn, &thread_id, now)?;
     record_action(
         conn,
         &thread_id,
@@ -771,6 +775,7 @@ fn start_new_thread_from_telegram(
             last_turn_status: None,
             last_preview: None,
             pending_prompt: None,
+            event_uid: None,
         },
         now,
     )?;
@@ -1594,7 +1599,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
-    use crate::{daemon_config_path, write_daemon_config, DaemonConfig, TelegramConfig};
+    use crate::{write_daemon_config, DaemonConfig, TelegramConfig};
 
     fn config_test_lock() -> &'static Mutex<()> {
         crate::state::test_env_lock()
@@ -1657,37 +1662,6 @@ mod tests {
         }
     }
 
-    struct ConfigBackup {
-        path: std::path::PathBuf,
-        contents: Option<Vec<u8>>,
-    }
-
-    impl ConfigBackup {
-        fn capture() -> anyhow::Result<Self> {
-            let path = daemon_config_path()?;
-            let contents = fs::read(&path).ok();
-            Ok(Self { path, contents })
-        }
-    }
-
-    impl Drop for ConfigBackup {
-        fn drop(&mut self) {
-            match &self.contents {
-                Some(contents) => {
-                    if let Some(parent) = self.path.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    let _ = fs::write(&self.path, contents);
-                }
-                None => {
-                    if self.path.exists() {
-                        let _ = fs::remove_file(&self.path);
-                    }
-                }
-            }
-        }
-    }
-
     fn test_daemon_config() -> DaemonConfig {
         DaemonConfig {
             version: 1,
@@ -1706,10 +1680,7 @@ mod tests {
     #[test]
     fn telegram_setup_dry_run_writes_redacted_daemon_shape() {
         let _guard = config_test_lock().lock().expect("config lock");
-        let _backup = ConfigBackup::capture().expect("capture config backup");
-        if let Ok(path) = daemon_config_path() {
-            let _ = fs::remove_file(path);
-        }
+        let _env = CommandEnv::new("setup-dry-run");
 
         let result = telegram_setup_result(TelegramSetupOptions {
             bot_token: Some("123:secret"),
@@ -1817,6 +1788,9 @@ mod tests {
 
     #[test]
     fn telegram_reply_spawns_headless_resume_without_waiting() {
+        // test_spawn::RECORDED is a process-global; without the shared env
+        // lock this test races claude.rs's spawn tests under parallel runs.
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
         let conn = crate::state::create_state_db_in_memory().expect("db");
         let config = test_daemon_config();
         let _ = crate::claude::test_spawn::take();
@@ -1841,6 +1815,10 @@ mod tests {
         let (_, args, _) = &spawned[0];
         assert!(args.contains(&"--resume".to_string()));
         assert!(args.contains(&"sess-1".to_string()));
+        assert!(
+            crate::state::bridge_turn_pending(&conn, "sess-1", 1500).expect("bridge marker"),
+            "telegram replies must mark the turn so its answer is pushed back even when not away"
+        );
     }
 
     #[test]

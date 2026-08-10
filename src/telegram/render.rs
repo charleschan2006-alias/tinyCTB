@@ -571,6 +571,7 @@ mod tests {
             last_turn_status: Some("completed".to_string()),
             last_preview: Some("x".repeat(10_000)),
             pending_prompt: None,
+            event_uid: None,
         };
 
         let prepared = prepare_telegram_thread_snapshot_delivery("999", &snapshot)

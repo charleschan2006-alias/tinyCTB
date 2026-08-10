@@ -16,6 +16,9 @@ The product rule is simple:
   that exact session — a detached `claude -p --resume` continues it, and the
   answer comes back to Telegram
 - `/back` stops remote notifications and clears the pending queue
+- turns started **from Telegram** (a reply or `/new`) always push their answer
+  back to Telegram, whether or not away mode is on — away only gates
+  notifications about local terminal sessions
 
 Linux (Ubuntu, systemd user service) is the primary platform. macOS (launchd
 user agent) has experimental support, not yet verified on real hardware:
@@ -47,8 +50,9 @@ Code surfaces together:
 
 The daemon loop (systemd user service / macOS LaunchAgent): ingest spooled hook events → refresh
 the session cache → process Telegram updates (commands + reply routing) →
-refresh typing indicators → deliver queued notifications (away mode only, with
-retry/backoff and per-event dedupe in sqlite).
+refresh typing indicators → deliver queued notifications (with retry/backoff
+and per-event dedupe in sqlite). Local-session notifications are enqueued only
+in away mode; answers to bridge-initiated turns are always enqueued.
 
 Permission prompts inside an interactive terminal session can only be answered
 in that terminal — tinyCTB notifies you about them but deliberately has no
@@ -128,7 +132,8 @@ config.
   事件写进 `~/.tinyctb/events/` spool，daemon 轮询消化，away 模式下推送 Telegram。
 - **回复路由**：Telegram 里对某条通知使用 Reply，桥会派生一个独立的
   `claude -p --resume <会话ID>` 无头进程续写该会话；答案由该进程触发的 Stop
-  hook 事件送回 Telegram。
+  hook 事件送回 Telegram。从 Telegram 发起的回合（Reply 或 `/new`）无论
+  away 开关与否都会推回答案；away 只门控本地终端会话的通知。
 - **新会话**：`/new` 在项目注册表指定的目录下用本地生成的 UUID
   （`--session-id`）启动无头会话，因此确认消息可以立刻用于回复路由。
 - **审批**：交互式终端里的权限确认只能在终端处理，Telegram 只做提醒；

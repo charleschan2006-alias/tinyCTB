@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::config::{ClaudeConfig, DaemonConfig};
 use crate::state::{
-    clear_pending_outbound_events, get_setting_number, get_setting_text,
+    bridge_turn_pending, clear_pending_outbound_events, get_setting_number, get_setting_text,
     reconcile_thread_snapshots, remote_mode_status_path, set_setting, set_setting_text,
     state_dir_path, thread_snapshot_json, upsert_thread_snapshot, BridgeThreadSnapshot,
     PendingPrompt,
@@ -54,6 +54,8 @@ pub(crate) fn events_spool_dir() -> Result<PathBuf> {
     Ok(state_dir_path()?.join("events"))
 }
 
+// Only referenced from the non-test spawn path; the test build stubs spawning.
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn turn_logs_dir() -> Result<PathBuf> {
     Ok(state_dir_path()?.join("logs").join("turns"))
 }
@@ -240,6 +242,10 @@ pub(crate) fn set_away_mode(conn: &Connection, away: bool, now: u64) -> Result<V
         })
     } else {
         let cleared_pending = clear_pending_outbound_events(conn)?;
+        // The cleared backlog may include an undelivered sync-error
+        // notification; re-arm the streak so the next away session can
+        // notify about a still-persistent error.
+        crate::daemon::end_sync_error_streak(conn)?;
         conn.execute(
             "DELETE FROM settings WHERE key IN ('away_started_at', 'away_session_id')",
             params![],
@@ -331,7 +337,7 @@ pub(crate) fn list_session_files(limit: u64) -> Result<Vec<SessionFileInfo>> {
             });
         }
     }
-    sessions.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.mtime_ms));
     sessions.truncate(limit as usize);
     Ok(sessions)
 }
@@ -362,6 +368,79 @@ pub(crate) struct TranscriptSummary {
     pub(crate) cwd: Option<String>,
     pub(crate) last_assistant_text: Option<String>,
     pub(crate) last_record_type: Option<String>,
+    /// Human-readable summary of the tool call(s) in the most recent assistant
+    /// record, cleared once a later user record (tool result / reply) arrives.
+    /// This is what a permission prompt is actually about — the Notification
+    /// hook payload itself only carries a one-line message without the tool
+    /// arguments.
+    pub(crate) pending_tool_use: Option<String>,
+}
+
+const MAX_TOOL_DETAIL_CHARS: usize = 500;
+
+fn ask_user_question_summary(input: &Value) -> Option<String> {
+    let questions = input.get("questions")?.as_array()?;
+    let mut parts = Vec::new();
+    for question in questions {
+        let Some(text) = question.get("question").and_then(Value::as_str) else {
+            continue;
+        };
+        let options = question
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|options| {
+                options
+                    .iter()
+                    .filter_map(|option| option.get("label").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            })
+            .filter(|labels| !labels.is_empty());
+        parts.push(match options {
+            Some(labels) => format!("{text}\n▸ {labels}"),
+            None => text.to_string(),
+        });
+    }
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn compact_tool_use_summary(name: &str, input: &Value) -> String {
+    let detail = match name {
+        "Bash" => input
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        "Edit" | "Write" | "Read" | "NotebookEdit" => input
+            .get("file_path")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        "AskUserQuestion" => ask_user_question_summary(input),
+        _ => serde_json::to_string(input)
+            .ok()
+            .filter(|raw| raw != "{}" && raw != "null"),
+    };
+    match detail {
+        Some(detail) if !detail.trim().is_empty() => {
+            format!("{name}: {}", truncate_chars(detail.trim(), MAX_TOOL_DETAIL_CHARS))
+        }
+        _ => name.to_string(),
+    }
+}
+
+fn tool_use_summary_from_content(content: Option<&Value>) -> Option<String> {
+    let blocks = content?.as_array()?;
+    let summaries = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter_map(|block| {
+            let name = block.get("name").and_then(Value::as_str)?;
+            Some(compact_tool_use_summary(
+                name,
+                block.get("input").unwrap_or(&Value::Null),
+            ))
+        })
+        .collect::<Vec<_>>();
+    (!summaries.is_empty()).then(|| summaries.join("\n"))
 }
 
 fn text_from_message_content(content: &Value) -> Option<String> {
@@ -409,13 +488,13 @@ pub(crate) fn parse_transcript_summary(path: &Path) -> Result<TranscriptSummary>
                 if let Some(cwd) = record.get("cwd").and_then(Value::as_str) {
                     summary.cwd = Some(cwd.to_string());
                 }
-                if let Some(text) = record
+                let content = record
                     .get("message")
-                    .and_then(|message| message.get("content"))
-                    .and_then(text_from_message_content)
-                {
+                    .and_then(|message| message.get("content"));
+                if let Some(text) = content.and_then(text_from_message_content) {
                     summary.last_assistant_text = Some(truncate_chars(&text, MAX_PREVIEW_CHARS));
                 }
+                summary.pending_tool_use = tool_use_summary_from_content(content);
                 summary.last_record_type = Some("assistant".to_string());
             }
             "user" => {
@@ -425,6 +504,9 @@ pub(crate) fn parse_transcript_summary(path: &Path) -> Result<TranscriptSummary>
                 if let Some(cwd) = record.get("cwd").and_then(Value::as_str) {
                     summary.cwd = Some(cwd.to_string());
                 }
+                // A user record (tool result or reply) means the previous tool
+                // call is no longer pending.
+                summary.pending_tool_use = None;
                 summary.last_record_type = Some("user".to_string());
             }
             _ => {}
@@ -493,6 +575,7 @@ fn scan_snapshot(info: &SessionFileInfo) -> BridgeThreadSnapshot {
         last_turn_status: None,
         last_preview: summary.last_assistant_text,
         pending_prompt: None,
+        event_uid: None,
     }
 }
 
@@ -529,7 +612,7 @@ pub(crate) fn write_hook_event_from_reader<R: Read>(reader: &mut R, now: u64) ->
         "sessionId": session_id,
         "payload": payload
     });
-    let file_name = format!("{now:015}-{}-{}.json", std::process::id(), &event_name);
+    let file_name = format!("{now:015}-{}-{}.json", std::process::id(), event_name);
     let final_path = spool.join(&file_name);
     let tmp_path = spool.join(format!(".{file_name}.tmp"));
     fs::write(&tmp_path, serde_json::to_vec(&envelope)?)?;
@@ -543,7 +626,11 @@ pub(crate) fn write_hook_event_from_reader<R: Read>(reader: &mut R, now: u64) ->
     }))
 }
 
-fn pending_prompt_from_notification(payload: &Value, received_at: u64) -> PendingPrompt {
+fn pending_prompt_from_notification(
+    payload: &Value,
+    received_at: u64,
+    pending_tool_use: Option<&str>,
+) -> PendingPrompt {
     let message = payload
         .get("message")
         .and_then(Value::as_str)
@@ -554,11 +641,20 @@ fn pending_prompt_from_notification(payload: &Value, received_at: u64) -> Pendin
     } else {
         "reply"
     };
+    // The hook message alone ("Claude needs your permission to use Bash") says
+    // which tool but not what it would do; the transcript-derived pending tool
+    // summary carries the actual content the user must judge.
+    let question = match (message, pending_tool_use) {
+        (Some(message), Some(tool)) => Some(format!("{message}\n\n⚙️ {tool}")),
+        (Some(message), None) => Some(message),
+        (None, Some(tool)) => Some(format!("⚙️ {tool}")),
+        (None, None) => None,
+    };
     PendingPrompt {
         prompt_id: format!("notify:{received_at}"),
         kind: kind.to_string(),
         status: "pending".to_string(),
-        question: message,
+        question,
     }
 }
 
@@ -585,8 +681,19 @@ pub(crate) fn ingest_spool_events(now: u64) -> Result<(Vec<BridgeThreadSnapshot>
     files.truncate(MAX_SPOOL_EVENTS_PER_CYCLE);
 
     let mut consumed = 0usize;
+    // Snapshots that already carry a completed answer and were about to be
+    // overwritten by a later event in the same batch. Flushing them keeps
+    // every answer: two concurrent replies can both finish within one poll
+    // cycle, and a new turn can start right after an answer.
+    let mut completed: Vec<BridgeThreadSnapshot> = Vec::new();
     let mut by_session: BTreeMap<String, BridgeThreadSnapshot> = BTreeMap::new();
     for path in files {
+        // The spool file name ({receivedAt}-{pid}-{event}) is unique even for
+        // hooks firing in the same millisecond; it becomes the event uid.
+        let event_uid = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string);
         let parsed: Option<Value> = fs::read_to_string(&path)
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok());
@@ -647,7 +754,14 @@ pub(crate) fn ingest_spool_events(now: u64) -> Result<(Vec<BridgeThreadSnapshot>
             .and_then(|text| normalized_message(Some(text)))
             .map(|text| truncate_chars(&text, MAX_PREVIEW_CHARS));
 
-        let base = by_session.remove(&session_id);
+        let mut base = by_session.remove(&session_id);
+        if matches!(event_name.as_str(), "Stop" | "Notification" | "SessionStart") {
+            if let Some(previous) =
+                base.take_if(|previous| previous.last_turn_status.as_deref() == Some("completed"))
+            {
+                completed.push(previous);
+            }
+        }
         let snapshot = match event_name.as_str() {
             "Stop" => BridgeThreadSnapshot {
                 thread_id: session_id.clone(),
@@ -662,6 +776,7 @@ pub(crate) fn ingest_spool_events(now: u64) -> Result<(Vec<BridgeThreadSnapshot>
                 last_turn_status: Some("completed".to_string()),
                 last_preview: payload_answer.or(summary.last_assistant_text),
                 pending_prompt: None,
+                event_uid,
             },
             "Notification" => BridgeThreadSnapshot {
                 thread_id: session_id.clone(),
@@ -675,7 +790,12 @@ pub(crate) fn ingest_spool_events(now: u64) -> Result<(Vec<BridgeThreadSnapshot>
                 status_flags: vec!["waitingOnUserInput".to_string()],
                 last_turn_status: None,
                 last_preview: summary.last_assistant_text,
-                pending_prompt: Some(pending_prompt_from_notification(&payload, received_at)),
+                pending_prompt: Some(pending_prompt_from_notification(
+                    &payload,
+                    received_at,
+                    summary.pending_tool_use.as_deref(),
+                )),
+                event_uid,
             },
             "SessionStart" => BridgeThreadSnapshot {
                 thread_id: session_id.clone(),
@@ -687,6 +807,7 @@ pub(crate) fn ingest_spool_events(now: u64) -> Result<(Vec<BridgeThreadSnapshot>
                 last_turn_status: None,
                 last_preview: summary.last_assistant_text,
                 pending_prompt: None,
+                event_uid,
             },
             _ => {
                 if let Some(base) = base {
@@ -697,7 +818,10 @@ pub(crate) fn ingest_spool_events(now: u64) -> Result<(Vec<BridgeThreadSnapshot>
         };
         by_session.insert(session_id, snapshot);
     }
-    Ok((by_session.into_values().collect(), consumed))
+    // Flushed completed snapshots first (chronologically earlier), then the
+    // final per-session state, so later upserts win in the DB.
+    completed.extend(by_session.into_values());
+    Ok((completed, consumed))
 }
 
 // ---------------------------------------------------------------------------
@@ -746,6 +870,10 @@ fn existing_thread_state(
 ///    thread_completed notifications (via `reconcile_thread_snapshots`)
 /// 2. transcript scan -> metadata refresh only (existing status and pending
 ///    prompt are preserved; no events are generated from scans)
+/// 3. away-mode notifications are enqueued here, not in the daemon loop:
+///    ingesting the spool consumes its files, so every caller (CLI listing
+///    commands included) must persist the resulting notifications or they
+///    would be silently lost.
 pub(crate) fn sync_state_from_sessions(
     conn: &Connection,
     config: &DaemonConfig,
@@ -784,13 +912,42 @@ pub(crate) fn sync_state_from_sessions(
         threads.push(thread_snapshot_json(&snapshot));
     }
 
-    Ok(json!({
+    let mut result = json!({
         "synced": threads.len(),
         "threads": threads,
         "events": reconcile.get("events").cloned().unwrap_or_else(|| json!([])),
         "away": reconcile.get("away").cloned().unwrap_or(Value::Bool(false)),
         "spoolConsumed": consumed
-    }))
+    });
+    let filter = parse_event_filter(Some(&config.events));
+    let mut notifiable = Vec::new();
+    for event in watch_events_from_sync_result(&result, None) {
+        let event_type = event.get("type").and_then(Value::as_str);
+        let passes_filter = filter.as_ref().map_or(true, |filter| {
+            event_type
+                .map(|event_type| filter.contains(event_type))
+                .unwrap_or(false)
+        });
+        // The events filter is an away-notification preference. Events owed to
+        // a bridge-initiated turn bypass it: a narrow filter (e.g. only
+        // thread_waiting) must not swallow a promised answer — that would also
+        // leave the marker unconsumed to mis-match a later completion.
+        let bridge_owed = !passes_filter
+            && matches!(event_type, Some("thread_completed") | Some("thread_waiting"))
+            && match crate::event_thread_id(&event) {
+                Some(thread_id) => bridge_turn_pending(conn, &thread_id, now)?,
+                None => false,
+            };
+        if passes_filter || bridge_owed {
+            notifiable.push(event);
+        }
+    }
+    let enqueued =
+        crate::daemon::enqueue_daemon_notification_events(conn, &notifiable, now)?;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("enqueued".to_string(), json!(enqueued));
+    }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -827,10 +984,21 @@ pub(crate) fn filter_watch_events(
     }
 }
 
-pub(crate) fn watch_thread_error_event(error: &anyhow::Error) -> Value {
+pub(crate) fn watch_thread_error_event(error: &anyhow::Error, now: u64) -> Value {
+    let message = error.to_string();
     json!({
         "type": "thread_error",
-        "message": error.to_string()
+        "message": message,
+        // observedAt lets the away-window check pass (the error happened now).
+        // The key is unique per occurrence; deduping a continuous failure
+        // streak is the daemon's job (an active-error flag cleared by the
+        // next successful sync), so the same error recurring after recovery
+        // notifies again.
+        "observedAt": now,
+        "eventKey": format!(
+            "sync-error-{now}-{}",
+            crate::sha256_hex(message.as_bytes())
+        )
     })
 }
 
@@ -838,9 +1006,28 @@ fn enrich_event_with_thread(event: Value, threads: &[Value]) -> Value {
     let Some(thread_id) = event.get("threadId").and_then(Value::as_str) else {
         return event;
     };
+    // One batch can carry several snapshots of the same session (two answers
+    // from concurrent replies), so pair the event with the snapshot it came
+    // from — otherwise the second answer would render the first answer's
+    // preview. The spool uid is exact even for same-millisecond hooks; the
+    // updated_at comparison is only a fallback for uid-less events.
+    let event_uid = event.get("eventUid").filter(|value| !value.is_null());
+    let updated_at = event.get("updatedAt").filter(|value| !value.is_null());
+    let matches_id = |thread: &&Value| -> bool {
+        thread.get("threadId").and_then(Value::as_str) == Some(thread_id)
+    };
     let Some(thread) = threads
         .iter()
-        .find(|thread| thread.get("threadId").and_then(Value::as_str) == Some(thread_id))
+        .find(|thread| {
+            matches_id(thread)
+                && match event_uid {
+                    Some(uid) => thread.get("eventUid") == Some(uid),
+                    None => {
+                        updated_at.map_or(true, |updated| thread.get("updatedAt") == Some(updated))
+                    }
+                }
+        })
+        .or_else(|| threads.iter().find(matches_id))
     else {
         return event;
     };
@@ -910,14 +1097,16 @@ enum SessionRef<'a> {
 pub(crate) mod test_spawn {
     use std::sync::Mutex;
 
-    pub(crate) static RECORDED: Mutex<Vec<(String, Vec<String>, Option<String>)>> =
-        Mutex::new(Vec::new());
+    pub(crate) type SpawnRecord = (String, Vec<String>, Option<String>);
 
-    pub(crate) fn take() -> Vec<(String, Vec<String>, Option<String>)> {
+    pub(crate) static RECORDED: Mutex<Vec<SpawnRecord>> = Mutex::new(Vec::new());
+
+    pub(crate) fn take() -> Vec<SpawnRecord> {
         std::mem::take(&mut RECORDED.lock().expect("test spawn lock"))
     }
 }
 
+#[cfg_attr(test, allow(clippy::needless_return))]
 fn spawn_detached_headless(
     binary: &Path,
     args: &[String],
@@ -1182,6 +1371,113 @@ mod tests {
     }
 
     #[test]
+    fn transcript_summary_tracks_pending_tool_use_until_answered() {
+        let temp = TempDirGuard::new("transcript-pending-tool");
+        let path = write_transcript(
+            &temp.path,
+            "sess-tool",
+            &[
+                json!({"type": "user", "message": {"role": "user", "content": "build it"}}),
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "Building now."},
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "cargo build --release"}}
+                ]}}),
+            ],
+        );
+        let summary = parse_transcript_summary(&path).expect("summary");
+        assert_eq!(
+            summary.pending_tool_use.as_deref(),
+            Some("Bash: cargo build --release")
+        );
+
+        // Once the tool result arrives the call is no longer pending.
+        let path = write_transcript(
+            &temp.path,
+            "sess-tool-done",
+            &[
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "cargo build --release"}}
+                ]}}),
+                json!({"type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+                ]}}),
+            ],
+        );
+        let summary = parse_transcript_summary(&path).expect("summary");
+        assert_eq!(summary.pending_tool_use, None);
+    }
+
+    #[test]
+    fn transcript_summary_renders_ask_user_question_options() {
+        let temp = TempDirGuard::new("transcript-ask-user");
+        let path = write_transcript(
+            &temp.path,
+            "sess-ask",
+            &[
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "name": "AskUserQuestion", "input": {"questions": [{
+                        "question": "Which database should we use?",
+                        "options": [{"label": "Postgres"}, {"label": "SQLite"}]
+                    }]}}
+                ]}}),
+            ],
+        );
+        let summary = parse_transcript_summary(&path).expect("summary");
+        let pending = summary.pending_tool_use.expect("pending tool");
+        assert!(pending.contains("Which database should we use?"));
+        assert!(pending.contains("Postgres / SQLite"));
+    }
+
+    #[test]
+    fn permission_notification_includes_pending_tool_detail() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let temp = TempDirGuard::new("spool-permission-detail");
+        std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
+        let projects = temp.path.join("projects").join("-home-user-project");
+        fs::create_dir_all(&projects).expect("projects dir");
+        std::env::set_var(
+            "TINYCTB_CLAUDE_PROJECTS_DIR",
+            temp.path.join("projects").display().to_string(),
+        );
+        write_transcript(
+            &projects,
+            "sess-perm",
+            &[
+                json!({"type": "assistant", "cwd": "/home/user/project", "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "rm -rf build/"}}
+                ]}}),
+            ],
+        );
+        let mut notify_payload = std::io::Cursor::new(
+            json!({
+                "hook_event_name": "Notification",
+                "session_id": "sess-perm",
+                "cwd": "/home/user/project",
+                "message": "Claude needs your permission to use Bash"
+            })
+            .to_string(),
+        );
+        write_hook_event_from_reader(&mut notify_payload, 1000).expect("spool notify");
+
+        let (snapshots, _) = ingest_spool_events(2000).expect("ingest");
+        std::env::remove_var("TINYCTB_STATE_DIR");
+        std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
+
+        let waiting = snapshots
+            .iter()
+            .find(|snapshot| snapshot.thread_id == "sess-perm")
+            .expect("permission snapshot");
+        let prompt = waiting.pending_prompt.as_ref().expect("pending prompt");
+        assert_eq!(prompt.kind, "approval");
+        let question = prompt.question.as_deref().expect("question");
+        assert!(question.contains("Claude needs your permission to use Bash"));
+        assert!(
+            question.contains("⚙️ Bash: rm -rf build/"),
+            "notification body must show what the tool would do: {question}"
+        );
+    }
+
+    #[test]
     fn transcript_messages_skip_meta_and_tool_records() {
         let temp = TempDirGuard::new("transcript-messages");
         let path = write_transcript(
@@ -1336,6 +1632,355 @@ mod tests {
 
         std::env::remove_var("TINYCTB_STATE_DIR");
         std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
+    }
+
+    #[test]
+    fn cli_sync_preserves_away_notifications_from_consumed_spool() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let temp = TempDirGuard::new("cli-sync-enqueue");
+        std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
+        let projects_root = temp.path.join("projects");
+        let project = projects_root.join("-home-user-project");
+        fs::create_dir_all(&project).expect("projects dir");
+        std::env::set_var(
+            "TINYCTB_CLAUDE_PROJECTS_DIR",
+            projects_root.display().to_string(),
+        );
+        write_transcript(
+            &project,
+            "sess-cli",
+            &[
+                json!({"type": "assistant", "cwd": "/home/user/project", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "cli answer"}
+                ]}}),
+            ],
+        );
+        let conn = create_state_db_in_memory().expect("db");
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        set_away_mode(&conn, true, 500).expect("away on");
+        let mut stop_payload = std::io::Cursor::new(
+            json!({
+                "hook_event_name": "Stop",
+                "session_id": "sess-cli",
+                "cwd": "/home/user/project"
+            })
+            .to_string(),
+        );
+        write_hook_event_from_reader(&mut stop_payload, 1000).expect("spool stop");
+
+        // A CLI listing command (record_deliveries = false) consumes the spool
+        // file; the notification must survive as a pending outbound event so
+        // the daemon can still deliver it.
+        let result = sync_state_from_sessions(&conn, &config, 2000, 50, false).expect("cli sync");
+        std::env::remove_var("TINYCTB_STATE_DIR");
+        std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
+
+        assert_eq!(result["enqueued"], 1);
+        assert_eq!(
+            crate::state::pending_outbound_count(&conn).expect("pending"),
+            1
+        );
+    }
+
+    /// The full target scenario for bridge-initiated turns: user is NOT away,
+    /// replied from Telegram (marker set), the headless turn's Stop hook lands
+    /// in the spool. The answer must reach the outbox through the real
+    /// ingest -> reconcile -> enqueue chain, and must survive /back.
+    #[test]
+    fn bridge_turn_answer_flows_from_stop_hook_when_not_away() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let temp = TempDirGuard::new("bridge-turn-flow");
+        std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
+        let projects_root = temp.path.join("projects");
+        let project = projects_root.join("-home-user-project");
+        fs::create_dir_all(&project).expect("projects dir");
+        std::env::set_var(
+            "TINYCTB_CLAUDE_PROJECTS_DIR",
+            projects_root.display().to_string(),
+        );
+        write_transcript(
+            &project,
+            "sess-bridge",
+            &[
+                json!({"type": "assistant", "cwd": "/home/user/project", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "bridge answer"}
+                ]}}),
+            ],
+        );
+        let conn = create_state_db_in_memory().expect("db");
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        // Away is OFF; the Telegram reply marked the turn.
+        crate::state::mark_bridge_turn(&conn, "sess-bridge", 500).expect("mark");
+        let mut stop_payload = std::io::Cursor::new(
+            json!({
+                "hook_event_name": "Stop",
+                "session_id": "sess-bridge",
+                "cwd": "/home/user/project"
+            })
+            .to_string(),
+        );
+        write_hook_event_from_reader(&mut stop_payload, 1000).expect("spool stop");
+
+        // Daemon-path sync (record_deliveries = true), exactly what daemon_cycle runs.
+        let result = sync_state_from_sessions(&conn, &config, 2000, 50, true).expect("sync");
+        std::env::remove_var("TINYCTB_STATE_DIR");
+        std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
+
+        assert_eq!(
+            result["enqueued"], 1,
+            "bridge answer must be enqueued while the user is present: {result}"
+        );
+        assert_eq!(
+            crate::state::pending_outbound_count(&conn).expect("pending"),
+            1
+        );
+
+        // /back clears only the away backlog, not the owed bridge answer.
+        let disabled = set_away_mode(&conn, false, 2500).expect("back");
+        assert_eq!(disabled["clearedPendingNotifications"], 0);
+        assert_eq!(
+            crate::state::pending_outbound_count(&conn).expect("pending after /back"),
+            1,
+            "an undelivered bridge answer must survive /back"
+        );
+    }
+
+    /// Two concurrent Telegram replies to one session can both finish before a
+    /// single daemon poll: two Stop spool files, one sync, and BOTH answers
+    /// must reach the outbox (with their own previews), fully consuming the
+    /// two-count marker.
+    #[test]
+    fn two_stops_in_one_cycle_push_two_answers() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let temp = TempDirGuard::new("two-stops-one-cycle");
+        std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
+        let projects_root = temp.path.join("projects");
+        let project = projects_root.join("-home-user-project");
+        fs::create_dir_all(&project).expect("projects dir");
+        std::env::set_var(
+            "TINYCTB_CLAUDE_PROJECTS_DIR",
+            projects_root.display().to_string(),
+        );
+        write_transcript(
+            &project,
+            "sess-two",
+            &[
+                json!({"type": "assistant", "cwd": "/home/user/project", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "latest transcript text"}
+                ]}}),
+            ],
+        );
+        let conn = create_state_db_in_memory().expect("db");
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        // Away OFF; two Telegram replies were sent before either finished.
+        crate::state::mark_bridge_turn(&conn, "sess-two", 400).expect("mark 1");
+        crate::state::mark_bridge_turn(&conn, "sess-two", 500).expect("mark 2");
+        for (received_at, answer) in [(1000u64, "answer one"), (1100, "answer two")] {
+            let mut stop_payload = std::io::Cursor::new(
+                json!({
+                    "hook_event_name": "Stop",
+                    "session_id": "sess-two",
+                    "cwd": "/home/user/project",
+                    "last_assistant_message": answer
+                })
+                .to_string(),
+            );
+            write_hook_event_from_reader(&mut stop_payload, received_at).expect("spool stop");
+        }
+
+        let result = sync_state_from_sessions(&conn, &config, 2000, 50, true).expect("sync");
+        std::env::remove_var("TINYCTB_STATE_DIR");
+        std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
+
+        assert_eq!(
+            result["enqueued"], 2,
+            "both answers must be enqueued: {result}"
+        );
+        assert_eq!(
+            crate::state::pending_outbound_count(&conn).expect("pending"),
+            2
+        );
+        assert!(
+            !crate::state::bridge_turn_pending(&conn, "sess-two", 2500).expect("marker"),
+            "both outstanding turns must be consumed"
+        );
+        // Each event keeps its own answer text.
+        let events = result["events"].as_array().expect("events");
+        let previews = events
+            .iter()
+            .filter_map(|event| event.get("lastPreview").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(previews.contains(&"answer one"), "events: {events:?}");
+        assert!(previews.contains(&"answer two"), "events: {events:?}");
+    }
+
+    /// Same-millisecond variant: two hook processes can finish in the same
+    /// millisecond, so the spool files differ only by PID. Event keys must use
+    /// the spool uid, not the timestamp, or one answer is deduped away.
+    #[test]
+    fn two_same_millisecond_stops_push_two_answers() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let temp = TempDirGuard::new("same-ms-stops");
+        std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
+        let projects_root = temp.path.join("projects");
+        fs::create_dir_all(projects_root.join("-home-user-project")).expect("projects dir");
+        std::env::set_var(
+            "TINYCTB_CLAUDE_PROJECTS_DIR",
+            projects_root.display().to_string(),
+        );
+        let conn = create_state_db_in_memory().expect("db");
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        crate::state::mark_bridge_turn(&conn, "sess-samems", 400).expect("mark 1");
+        crate::state::mark_bridge_turn(&conn, "sess-samems", 500).expect("mark 2");
+        // Two spool files with identical receivedAt, distinct (fake) PIDs —
+        // exactly what write_hook_event_from_reader produces in two processes.
+        let spool = events_spool_dir().expect("spool dir");
+        fs::create_dir_all(&spool).expect("create spool");
+        for (pid, answer) in [(111u32, "answer one"), (222, "answer two")] {
+            let envelope = json!({
+                "receivedAt": 1000,
+                "hookEventName": "Stop",
+                "sessionId": "sess-samems",
+                "payload": {
+                    "hook_event_name": "Stop",
+                    "session_id": "sess-samems",
+                    "cwd": "/home/user/project",
+                    "last_assistant_message": answer
+                }
+            });
+            fs::write(
+                spool.join(format!("{:015}-{}-Stop.json", 1000, pid)),
+                envelope.to_string(),
+            )
+            .expect("write spool file");
+        }
+
+        let result = sync_state_from_sessions(&conn, &config, 2000, 50, true).expect("sync");
+        std::env::remove_var("TINYCTB_STATE_DIR");
+        std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
+
+        assert_eq!(
+            result["enqueued"], 2,
+            "same-millisecond answers must both be enqueued: {result}"
+        );
+        assert_eq!(
+            crate::state::pending_outbound_count(&conn).expect("pending"),
+            2
+        );
+        assert!(
+            !crate::state::bridge_turn_pending(&conn, "sess-samems", 2500).expect("marker"),
+            "both outstanding turns must be consumed"
+        );
+
+        // End to end: each rendered Telegram message must carry its own
+        // answer, not the other snapshot's preview (uid-exact enrichment).
+        let enriched = watch_events_from_sync_result(&result, None);
+        let completed = enriched
+            .iter()
+            .filter(|event| event["type"] == "thread_completed")
+            .collect::<Vec<_>>();
+        assert_eq!(completed.len(), 2, "events: {enriched:?}");
+        for event in completed {
+            let own = event["lastPreview"].as_str().expect("event preview");
+            let other = if own == "answer one" {
+                "answer two"
+            } else {
+                "answer one"
+            };
+            let prepared = crate::telegram::render::prepare_telegram_delivery("999", event)
+                .expect("prepared delivery");
+            let text = prepared.payloads[0]["text"].as_str().expect("text");
+            assert!(text.contains(own), "missing own answer in: {text}");
+            assert!(
+                !text.contains(other),
+                "message must not show the other snapshot's answer: {text}"
+            );
+        }
+    }
+
+    /// A narrow events filter (user only wants thread_waiting pushes) must not
+    /// swallow the answer to a turn started from Telegram.
+    #[test]
+    fn narrow_events_filter_does_not_swallow_bridge_answers() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let temp = TempDirGuard::new("narrow-filter-bridge");
+        std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
+        let projects_root = temp.path.join("projects");
+        let project = projects_root.join("-home-user-project");
+        fs::create_dir_all(&project).expect("projects dir");
+        std::env::set_var(
+            "TINYCTB_CLAUDE_PROJECTS_DIR",
+            projects_root.display().to_string(),
+        );
+        write_transcript(
+            &project,
+            "sess-filtered",
+            &[
+                json!({"type": "assistant", "cwd": "/home/user/project", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "filtered answer"}
+                ]}}),
+            ],
+        );
+        let conn = create_state_db_in_memory().expect("db");
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: "thread_waiting".to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        crate::state::mark_bridge_turn(&conn, "sess-filtered", 500).expect("mark");
+        let mut stop_payload = std::io::Cursor::new(
+            json!({
+                "hook_event_name": "Stop",
+                "session_id": "sess-filtered",
+                "cwd": "/home/user/project"
+            })
+            .to_string(),
+        );
+        write_hook_event_from_reader(&mut stop_payload, 1000).expect("spool stop");
+
+        let result = sync_state_from_sessions(&conn, &config, 2000, 50, true).expect("sync");
+        std::env::remove_var("TINYCTB_STATE_DIR");
+        std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
+
+        assert_eq!(
+            result["enqueued"], 1,
+            "bridge answer must bypass the events filter: {result}"
+        );
+        assert!(
+            !crate::state::bridge_turn_pending(&conn, "sess-filtered", 2500).expect("marker"),
+            "marker must be consumed so it cannot mis-match a later completion"
+        );
     }
 
     #[test]

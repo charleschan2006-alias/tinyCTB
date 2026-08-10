@@ -15,9 +15,10 @@ use crate::claude::{
     sync_state_from_sessions, watch_events_from_sync_result, watch_thread_error_event,
 };
 use crate::state::{
-    create_state_db, deliver_due_outbound_events, enqueue_outbound_event, pending_outbound_count,
-    prune_state_logs, record_transport_delivery, should_emit_for_away_window, state_db_path,
-    transport_delivery_exists, OutboxDeliverySummary,
+    bridge_turn_pending, consume_bridge_turn, create_state_db, delete_setting,
+    deliver_due_outbound_events, enqueue_outbound_event, get_setting_text, pending_outbound_count,
+    prune_state_logs, record_transport_delivery, set_setting_text, should_emit_for_away_window,
+    state_db_path, transport_delivery_exists, OutboxDeliverySummary,
 };
 use crate::telegram::{
     deliver_telegram_event, process_telegram_updates, refresh_telegram_typing_indicators,
@@ -64,6 +65,7 @@ fn acquire_daemon_lock() -> Result<DaemonLock> {
     let path = daemon_lock_path()?;
     let file = fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&path)
@@ -116,7 +118,7 @@ fn event_observed_at(event: &Value) -> Option<u64> {
         .or_else(|| event.pointer("/thread/updatedAt").and_then(Value::as_u64))
 }
 
-fn should_enqueue_daemon_notification(conn: &Connection, event: &Value) -> Result<bool> {
+fn should_enqueue_away_notification(conn: &Connection, event: &Value) -> Result<bool> {
     let away_status = crate::get_away_mode(conn)?;
     if !away_notifications_enabled_from_status(&away_status) {
         return Ok(false);
@@ -135,10 +137,27 @@ pub(crate) fn enqueue_daemon_notification_events(
 ) -> Result<usize> {
     let mut enqueued = 0usize;
     for event in events {
-        if should_enqueue_daemon_notification(conn, event)?
-            && enqueue_outbound_event(conn, event, now)?
-        {
+        // Turns started from the bridge (Telegram reply / /new) always report
+        // back, away mode or not: the user asked from Telegram and the
+        // confirmation promised the answer there.
+        let thread_id = crate::event_thread_id(event);
+        let bridge = match thread_id.as_deref() {
+            Some(thread_id) => bridge_turn_pending(conn, thread_id, now)?,
+            None => false,
+        };
+        if !bridge && !should_enqueue_away_notification(conn, event)? {
+            continue;
+        }
+        if enqueue_outbound_event(conn, event, now, if bridge { "bridge" } else { "away" })? {
             enqueued += 1;
+            // Each enqueued completion consumes one outstanding turn.
+            // thread_waiting keeps the marker: the turn is still running and
+            // its completion is still owed.
+            if bridge && event.get("type").and_then(Value::as_str) == Some("thread_completed") {
+                if let Some(thread_id) = thread_id.as_deref() {
+                    consume_bridge_turn(conn, thread_id, now)?;
+                }
+            }
         }
     }
     Ok(enqueued)
@@ -146,12 +165,6 @@ pub(crate) fn enqueue_daemon_notification_events(
 
 fn away_notifications_enabled_from_status(away_status: &Value) -> bool {
     away_status.get("away").and_then(Value::as_bool) == Some(true)
-}
-
-fn away_notifications_enabled(conn: &Connection) -> Result<bool> {
-    Ok(away_notifications_enabled_from_status(
-        &crate::get_away_mode(conn)?,
-    ))
 }
 
 fn deliver_outbound_events(
@@ -180,6 +193,43 @@ fn deliver_outbound_events(
 
 fn daemon_cycle_budget(timeout: Duration) -> Duration {
     timeout.max(Duration::from_secs(5)).saturating_mul(3)
+}
+
+/// Fingerprint of the sync error the user has already been notified about.
+/// While set, identical errors on subsequent cycles stay quiet; a successful
+/// sync clears it so the same error recurring later is a fresh incident.
+const SYNC_ERROR_NOTIFIED_KEY: &str = "sync_error_notified_fingerprint";
+
+/// Also called when away mode turns off: /back may delete an undelivered
+/// error notification from the outbox, so the streak must re-arm or the same
+/// persistent error would stay silent for the whole next away session.
+pub(crate) fn end_sync_error_streak(conn: &Connection) -> Result<()> {
+    delete_setting(conn, SYNC_ERROR_NOTIFIED_KEY)
+}
+
+fn enqueue_sync_error_notification(
+    conn: &Connection,
+    filter: Option<&std::collections::BTreeSet<String>>,
+    error: &anyhow::Error,
+    now: u64,
+) -> Result<(Vec<Value>, u64)> {
+    let fingerprint = crate::sha256_hex(error.to_string().as_bytes());
+    let already_notified =
+        get_setting_text(conn, SYNC_ERROR_NOTIFIED_KEY)?.as_deref() == Some(fingerprint.as_str());
+    let events = filter_watch_events(vec![watch_thread_error_event(error, now)], filter);
+    let mut enqueued = 0u64;
+    if !already_notified {
+        // thread_error events (for users who opt into them via the events
+        // config) go through the normal enqueue policy (away gating included).
+        enqueued = enqueue_daemon_notification_events(conn, &events, now)? as u64;
+        // Only a notification that actually went out starts a quiet streak:
+        // an error observed while not away must still notify once the user
+        // leaves (or enables the event type).
+        if enqueued > 0 {
+            set_setting_text(conn, SYNC_ERROR_NOTIFIED_KEY, &fingerprint)?;
+        }
+    }
+    Ok((events, enqueued))
 }
 
 fn daemon_cycle(
@@ -225,16 +275,25 @@ fn daemon_cycle(
         }
         None => Value::Null,
     };
-    let events = match sync_state_from_sessions(conn, config, now, 50, true) {
-        Ok(sync_result) => watch_events_from_sync_result(&sync_result, filter.as_ref()),
-        Err(error) => filter_watch_events(vec![watch_thread_error_event(&error)], filter.as_ref()),
+    // Notification enqueueing happens inside the sync (spool consumption and
+    // notification persistence must be atomic from the caller's perspective).
+    let (events, enqueued) = match sync_state_from_sessions(conn, config, now, 50, true) {
+        Ok(sync_result) => {
+            end_sync_error_streak(conn)?;
+            (
+                watch_events_from_sync_result(&sync_result, filter.as_ref()),
+                sync_result
+                    .get("enqueued")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            )
+        }
+        Err(error) => enqueue_sync_error_notification(conn, filter.as_ref(), &error, now)?,
     };
-    let enqueued = enqueue_daemon_notification_events(conn, &events, now)?;
-    let delivery = if away_notifications_enabled(conn)? {
-        deliver_outbound_events(conn, config, now, timeout, deadline)?
-    } else {
-        OutboxDeliverySummary::default()
-    };
+    // Delivery is not gated on away mode: enqueueing is the policy point.
+    // While the user is present the outbox only ever holds answers to turns
+    // they started from Telegram, which must always be delivered.
+    let delivery = deliver_outbound_events(conn, config, now, timeout, deadline)?;
     Ok(json!({
         "ok": true,
         "action": "daemon_cycle",
@@ -442,6 +501,16 @@ fn systemd_escape_env(value: &str) -> String {
         .replace('%', "%%")
 }
 
+/// Directory holding the service definition (`~/.config/systemd/user` /
+/// `~/Library/LaunchAgents`). `TINYCTB_SERVICE_DIR` overrides it so tests
+/// never see — let alone stop — the user's real daemon service.
+fn service_definition_dir(platform_default: PathBuf) -> PathBuf {
+    match env::var("TINYCTB_SERVICE_DIR") {
+        Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+        _ => platform_default,
+    }
+}
+
 pub(crate) fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<DaemonServiceSpec> {
     let label = validate_daemon_label(label)?;
     let bridge_command = bridge_command.trim();
@@ -465,12 +534,23 @@ pub(crate) fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<D
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .map(|value| absolutize_claude_bin(&value));
+        .map(|value| absolutize_env_path(&value));
+    // A TINYCTB_STATE_DIR override must reach the service environment for the
+    // same reason: an isolated run (tests, scripts/verify_macos.sh) that
+    // installs a service against an alternate state dir needs the daemon it
+    // starts to read that same directory instead of the real ~/.tinyctb.
+    let state_dir_override = env::var("TINYCTB_STATE_DIR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| absolutize_env_path(&value));
     if cfg!(target_os = "macos") {
-        let launch_agents_dir = dirs::home_dir()
-            .context("home directory is not available")?
-            .join("Library")
-            .join("LaunchAgents");
+        let launch_agents_dir = service_definition_dir(
+            dirs::home_dir()
+                .context("home directory is not available")?
+                .join("Library")
+                .join("LaunchAgents"),
+        );
         return Ok(macos_launchd_spec(
             label,
             &service_bridge_command,
@@ -479,6 +559,7 @@ pub(crate) fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<D
             &stderr_log,
             &runtime_path,
             claude_bin_override.as_deref(),
+            state_dir_override.as_deref(),
         ));
     }
     if cfg!(target_os = "linux") {
@@ -487,20 +568,27 @@ pub(crate) fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<D
         } else {
             format!("{label}.service")
         };
-        let service_path = dirs::home_dir()
-            .context("home directory is not available")?
-            .join(".config")
-            .join("systemd")
-            .join("user")
-            .join(&unit_name);
-        let claude_bin_env = claude_bin_override
-            .as_deref()
-            .map(|value| format!("Environment=\"CLAUDE_BIN={}\"\n", systemd_escape_env(value)))
-            .unwrap_or_default();
+        let service_path = service_definition_dir(
+            dirs::home_dir()
+                .context("home directory is not available")?
+                .join(".config")
+                .join("systemd")
+                .join("user"),
+        )
+        .join(&unit_name);
+        let extra_env = [
+            ("CLAUDE_BIN", claude_bin_override.as_deref()),
+            ("TINYCTB_STATE_DIR", state_dir_override.as_deref()),
+        ]
+        .iter()
+        .filter_map(|(key, value)| {
+            value.map(|value| format!("Environment=\"{key}={}\"\n", systemd_escape_env(value)))
+        })
+        .collect::<String>();
         let contents = format!(
             "[Unit]\nDescription=tinyCTB Claude Telegram bridge daemon\n\n[Service]\nType=simple\nEnvironment=\"PATH={}\"\n{}ExecStart={} daemon run\nRestart=always\nRestartSec=2\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
             systemd_escape_env(&runtime_path),
-            claude_bin_env,
+            extra_env,
             shell_quote(&service_bridge_command),
             stdout_log.display(),
             stderr_log.display()
@@ -531,11 +619,12 @@ pub(crate) fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<D
     }
 }
 
-/// Resolve a `CLAUDE_BIN` override to an absolute path against the current
-/// working directory. The service manager launches the daemon from a different
-/// cwd, so a relative value that works in the terminal would otherwise break.
-/// Symlinks are intentionally NOT resolved (a claude upgrade may repoint them).
-fn absolutize_claude_bin(value: &str) -> String {
+/// Resolve an env-var path override (CLAUDE_BIN, TINYCTB_STATE_DIR) to an
+/// absolute path against the current working directory. The service manager
+/// launches the daemon from a different cwd, so a relative value that works in
+/// the terminal would otherwise break. Symlinks are intentionally NOT resolved
+/// (a claude upgrade may repoint them).
+fn absolutize_env_path(value: &str) -> String {
     let path = PathBuf::from(value);
     if path.is_absolute() {
         return value.to_string();
@@ -556,6 +645,7 @@ fn macos_launchd_spec(
     stderr_log: &Path,
     runtime_path: &str,
     claude_bin_override: Option<&str>,
+    state_dir_override: Option<&str>,
 ) -> DaemonServiceSpec {
     let service_path = launch_agents_dir.join(format!("{label}.plist"));
     let run_args = [
@@ -568,14 +658,20 @@ fn macos_launchd_spec(
         .map(|arg| format!("        <string>{}</string>", xml_escape(arg)))
         .collect::<Vec<_>>()
         .join("\n");
-    let claude_bin_xml = claude_bin_override
-        .map(|value| {
+    let extra_env_xml = [
+        ("CLAUDE_BIN", claude_bin_override),
+        ("TINYCTB_STATE_DIR", state_dir_override),
+    ]
+    .iter()
+    .filter_map(|(key, value)| {
+        value.map(|value| {
             format!(
-                "        <key>CLAUDE_BIN</key>\n        <string>{}</string>\n",
+                "        <key>{key}</key>\n        <string>{}</string>\n",
                 xml_escape(value)
             )
         })
-        .unwrap_or_default();
+    })
+    .collect::<String>();
     let contents = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -606,7 +702,7 @@ fn macos_launchd_spec(
         xml_escape(label),
         args_xml,
         xml_escape(runtime_path),
-        claude_bin_xml,
+        extra_env_xml,
         xml_escape(&stdout_log.display().to_string()),
         xml_escape(&stderr_log.display().to_string())
     );
@@ -959,11 +1055,55 @@ mod tests {
     use crate::claude::set_away_mode;
     use crate::state::{create_state_db_in_memory, pending_outbound_count};
 
+    struct TempServiceEnv {
+        previous_state_dir: Option<String>,
+        previous_service_dir: Option<String>,
+        root: std::path::PathBuf,
+    }
+
+    impl TempServiceEnv {
+        /// Keeps service-spec tests away from the real ~/.tinyctb and the real
+        /// service definitions (read-only CI homes, and `reset`-style stops).
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("tinyctb-daemon-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("create temp daemon dir");
+            let previous_state_dir = std::env::var("TINYCTB_STATE_DIR").ok();
+            let previous_service_dir = std::env::var("TINYCTB_SERVICE_DIR").ok();
+            std::env::set_var("TINYCTB_STATE_DIR", root.join("state"));
+            std::env::set_var("TINYCTB_SERVICE_DIR", root.join("service"));
+            Self {
+                previous_state_dir,
+                previous_service_dir,
+                root,
+            }
+        }
+    }
+
+    impl Drop for TempServiceEnv {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous_state_dir {
+                std::env::set_var("TINYCTB_STATE_DIR", previous);
+            } else {
+                std::env::remove_var("TINYCTB_STATE_DIR");
+            }
+            if let Some(previous) = &self.previous_service_dir {
+                std::env::set_var("TINYCTB_SERVICE_DIR", previous);
+            } else {
+                std::env::remove_var("TINYCTB_SERVICE_DIR");
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
     #[test]
     fn daemon_install_dry_run_resolves_relative_bridge_command_for_services() {
         if !cfg!(any(target_os = "linux", target_os = "macos")) {
             return;
         }
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = TempServiceEnv::new("install-dry-run");
         let result = install_daemon_service(DEFAULT_DAEMON_LABEL, "bin/tinyctb", true)
             .expect("daemon install dry run");
         let expected = std::env::current_dir()
@@ -998,6 +1138,127 @@ mod tests {
         let on_count =
             enqueue_daemon_notification_events(&conn, &[event], 2000).expect("away on enqueue");
         assert_eq!(on_count, 1, "daemon should notify while user is away");
+    }
+
+    #[test]
+    fn bridge_initiated_turns_notify_even_when_not_away() {
+        let conn = create_state_db_in_memory().expect("db");
+        crate::state::mark_bridge_turn(&conn, "thr_bridge", 1000).expect("mark");
+        let events = vec![
+            json!({
+                "type": "thread_completed",
+                "threadId": "thr_bridge",
+                "updatedAt": 1500
+            }),
+            json!({
+                "type": "thread_completed",
+                "threadId": "thr_other",
+                "updatedAt": 1500
+            }),
+        ];
+
+        let count = enqueue_daemon_notification_events(&conn, &events, 2000).expect("enqueue");
+        assert_eq!(
+            count, 1,
+            "only the bridge-initiated turn notifies while the user is present"
+        );
+
+        // The marker is consumed by the pushed answer: a later completion of
+        // the same thread (e.g. continued from the terminal) stays quiet.
+        let later = json!({
+            "type": "thread_completed",
+            "threadId": "thr_bridge",
+            "updatedAt": 3000
+        });
+        let count = enqueue_daemon_notification_events(&conn, std::slice::from_ref(&later), 3500)
+            .expect("enqueue later");
+        assert_eq!(count, 0, "marker must be consumed by the first pushed answer");
+    }
+
+    #[test]
+    fn bridge_turn_marker_counts_concurrent_replies() {
+        let conn = create_state_db_in_memory().expect("db");
+        // Two Telegram replies to the same session before either finishes.
+        crate::state::mark_bridge_turn(&conn, "thr_two", 1000).expect("mark 1");
+        crate::state::mark_bridge_turn(&conn, "thr_two", 1100).expect("mark 2");
+
+        let first = json!({
+            "type": "thread_completed",
+            "threadId": "thr_two",
+            "updatedAt": 1500
+        });
+        assert_eq!(
+            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&first), 2000)
+                .expect("first answer"),
+            1
+        );
+        let second = json!({
+            "type": "thread_completed",
+            "threadId": "thr_two",
+            "updatedAt": 2500
+        });
+        assert_eq!(
+            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&second), 3000)
+                .expect("second answer"),
+            1,
+            "both concurrent replies are owed an answer"
+        );
+        let third = json!({
+            "type": "thread_completed",
+            "threadId": "thr_two",
+            "updatedAt": 3500
+        });
+        assert_eq!(
+            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&third), 4000)
+                .expect("third completion"),
+            0,
+            "marker count exhausted after both answers were enqueued"
+        );
+    }
+
+    #[test]
+    fn bridge_turn_marker_survives_waiting_events_and_expires() {
+        let conn = create_state_db_in_memory().expect("db");
+        crate::state::mark_bridge_turn(&conn, "thr_wait", 1000).expect("mark");
+
+        let waiting = json!({
+            "type": "thread_waiting",
+            "threadId": "thr_wait",
+            "updatedAt": 1500
+        });
+        assert_eq!(
+            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&waiting), 2000)
+                .expect("waiting enqueue"),
+            1,
+            "a bridge turn that needs input must notify"
+        );
+
+        // waiting does not consume the marker: the completion is still owed.
+        let completed = json!({
+            "type": "thread_completed",
+            "threadId": "thr_wait",
+            "updatedAt": 2500
+        });
+        assert_eq!(
+            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&completed), 3000)
+                .expect("completed enqueue"),
+            1
+        );
+
+        // A stale marker (turn never completed) expires after the TTL.
+        crate::state::mark_bridge_turn(&conn, "thr_stale", 1000).expect("mark stale");
+        let stale = json!({
+            "type": "thread_completed",
+            "threadId": "thr_stale",
+            "updatedAt": 2000
+        });
+        let after_ttl = 1000 + crate::state::BRIDGE_TURN_TTL_MS + 1;
+        assert_eq!(
+            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&stale), after_ttl)
+                .expect("stale enqueue"),
+            0,
+            "expired bridge-turn markers must not notify"
+        );
     }
 
     #[test]
@@ -1045,6 +1306,106 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(pending_outbound_count(&conn).expect("pending"), 1);
+    }
+
+    #[test]
+    fn thread_error_streak_notifies_once_and_rearms_after_recovery() {
+        let conn = create_state_db_in_memory().expect("db");
+        let no_filter: Option<&std::collections::BTreeSet<String>> = None;
+
+        // Not away: nothing notifies, and no quiet streak starts.
+        let (_, quiet) = enqueue_sync_error_notification(
+            &conn,
+            no_filter,
+            &anyhow::anyhow!("scan failed"),
+            600,
+        )
+        .expect("not away");
+        assert_eq!(quiet, 0);
+
+        // Going away with the error still present must notify (the flag was
+        // not set by the silent occurrence above).
+        set_away_mode(&conn, true, 1000).expect("away on");
+        let (_, first) = enqueue_sync_error_notification(
+            &conn,
+            no_filter,
+            &anyhow::anyhow!("scan failed"),
+            2000,
+        )
+        .expect("first away notify");
+        assert_eq!(first, 1, "errors observed while away must notify");
+
+        // Continuous failure: later cycles stay quiet.
+        let (_, repeat) = enqueue_sync_error_notification(
+            &conn,
+            no_filter,
+            &anyhow::anyhow!("scan failed"),
+            3500,
+        )
+        .expect("repeat");
+        assert_eq!(repeat, 0, "a persistent error must not notify every cycle");
+
+        // A different error mid-streak is a new notification.
+        let (_, other) = enqueue_sync_error_notification(
+            &conn,
+            no_filter,
+            &anyhow::anyhow!("other failure"),
+            4000,
+        )
+        .expect("other error");
+        assert_eq!(other, 1);
+
+        // Recovery (successful sync) re-arms: the ORIGINAL error recurring
+        // later — even much later, e.g. the next away session — notifies again.
+        end_sync_error_streak(&conn).expect("streak end");
+        let (_, recurrence) = enqueue_sync_error_notification(
+            &conn,
+            no_filter,
+            &anyhow::anyhow!("scan failed"),
+            9000,
+        )
+        .expect("recurrence");
+        assert_eq!(
+            recurrence, 1,
+            "the same error after a successful sync is a fresh incident"
+        );
+    }
+
+    /// /back can delete an undelivered error notification from the outbox;
+    /// the streak flag must re-arm with it, or the same persistent error
+    /// would stay silent for the entire next away session.
+    #[test]
+    fn thread_error_streak_rearms_when_away_turns_off() {
+        let conn = create_state_db_in_memory().expect("db");
+        let no_filter: Option<&std::collections::BTreeSet<String>> = None;
+
+        set_away_mode(&conn, true, 1000).expect("away on");
+        let (_, first) = enqueue_sync_error_notification(
+            &conn,
+            no_filter,
+            &anyhow::anyhow!("scan failed"),
+            2000,
+        )
+        .expect("first notify");
+        assert_eq!(first, 1);
+
+        // Delivery never happened; /back wipes the pending outbox row.
+        set_away_mode(&conn, false, 3000).expect("back");
+        assert_eq!(pending_outbound_count(&conn).expect("pending"), 0);
+
+        // Next away session with the error still present must notify again.
+        set_away_mode(&conn, true, 4000).expect("away again");
+        let (_, again) = enqueue_sync_error_notification(
+            &conn,
+            no_filter,
+            &anyhow::anyhow!("scan failed"),
+            5000,
+        )
+        .expect("second away notify");
+        assert_eq!(
+            again, 1,
+            "/back must re-arm the error streak alongside clearing the outbox"
+        );
     }
 
     #[test]
@@ -1102,6 +1463,7 @@ mod tests {
             Path::new("/Users/test/.tinyctb/logs/daemon.err.log"),
             "/opt/homebrew/bin:/usr/bin",
             None,
+            None,
         );
 
         assert_eq!(
@@ -1146,10 +1508,13 @@ mod tests {
             Path::new("/Users/test/.tinyctb/logs/daemon.err.log"),
             "/usr/bin",
             Some("/custom/<claude> & bin"),
+            Some("/tmp/verify state"),
         );
 
         assert!(spec.contents.contains("<string>/opt/a&amp;b/tinyctb</string>"));
         assert!(spec.contents.contains("<key>CLAUDE_BIN</key>"));
+        assert!(spec.contents.contains("<key>TINYCTB_STATE_DIR</key>"));
+        assert!(spec.contents.contains("<string>/tmp/verify state</string>"));
         assert!(spec
             .contents
             .contains("<string>/custom/&lt;claude&gt; &amp; bin</string>"));
@@ -1167,11 +1532,11 @@ mod tests {
     }
 
     #[test]
-    fn absolutize_claude_bin_makes_relative_paths_absolute() {
-        let absolute = absolutize_claude_bin("/opt/claude/bin/claude");
+    fn absolutize_env_path_makes_relative_paths_absolute() {
+        let absolute = absolutize_env_path("/opt/claude/bin/claude");
         assert_eq!(absolute, "/opt/claude/bin/claude");
 
-        let relative = absolutize_claude_bin("./bin/claude");
+        let relative = absolutize_env_path("./bin/claude");
         assert!(
             Path::new(&relative).is_absolute(),
             "relative CLAUDE_BIN must be absolutized, got: {relative}"

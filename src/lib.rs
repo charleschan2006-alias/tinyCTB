@@ -998,6 +998,7 @@ mod tests {
 
     struct TempStateDir {
         previous_state_dir: Option<String>,
+        previous_service_dir: Option<String>,
         root: PathBuf,
     }
 
@@ -1007,9 +1008,14 @@ mod tests {
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(&root).expect("create temp state dir");
             let previous_state_dir = std::env::var("TINYCTB_STATE_DIR").ok();
+            let previous_service_dir = std::env::var("TINYCTB_SERVICE_DIR").ok();
             std::env::set_var("TINYCTB_STATE_DIR", &root);
+            // Keep service lookups away from the user's real systemd/launchd
+            // definitions: `reset` stops a running service if it sees one.
+            std::env::set_var("TINYCTB_SERVICE_DIR", root.join("service"));
             Self {
                 previous_state_dir,
+                previous_service_dir,
                 root,
             }
         }
@@ -1021,6 +1027,11 @@ mod tests {
                 std::env::set_var("TINYCTB_STATE_DIR", previous_state_dir);
             } else {
                 std::env::remove_var("TINYCTB_STATE_DIR");
+            }
+            if let Some(previous_service_dir) = &self.previous_service_dir {
+                std::env::set_var("TINYCTB_SERVICE_DIR", previous_service_dir);
+            } else {
+                std::env::remove_var("TINYCTB_SERVICE_DIR");
             }
             let _ = fs::remove_dir_all(&self.root);
         }
@@ -1035,9 +1046,9 @@ mod tests {
             "updatedAt": 42
         });
 
-        assert!(enqueue_outbound_event(&conn, &event, 1000).expect("enqueue"));
+        assert!(enqueue_outbound_event(&conn, &event, 1000, "away").expect("enqueue"));
         assert!(
-            !enqueue_outbound_event(&conn, &event, 1001).expect("dedupe"),
+            !enqueue_outbound_event(&conn, &event, 1001, "away").expect("dedupe"),
             "same delivery id should not enqueue twice"
         );
 
@@ -1112,6 +1123,7 @@ mod tests {
             last_turn_status: Some("completed".to_string()),
             last_preview: Some("preview".to_string()),
             pending_prompt: None,
+            event_uid: None,
         };
 
         let item = classify_inbox_item(&snapshot, 1_776_219_400_000);
@@ -1151,6 +1163,7 @@ mod tests {
                 status: "pending".to_string(),
                 question: Some("Can you confirm?".to_string()),
             }),
+            event_uid: None,
         };
 
         let item = classify_inbox_item(&snapshot, 2000);

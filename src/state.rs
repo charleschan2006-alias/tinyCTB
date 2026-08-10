@@ -1,5 +1,3 @@
-#[cfg(test)]
-use anyhow::bail;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -41,6 +39,10 @@ pub(crate) struct BridgeThreadSnapshot {
     pub(crate) last_turn_status: Option<String>,
     pub(crate) last_preview: Option<String>,
     pub(crate) pending_prompt: Option<PendingPrompt>,
+    /// Unique id of the hook spool file this snapshot came from (None for
+    /// transcript scans and synthetic snapshots). Event keys use it so two
+    /// hooks that fire in the same millisecond stay distinct events.
+    pub(crate) event_uid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -508,7 +510,8 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
           next_attempt_at INTEGER NOT NULL,
           last_error TEXT,
           created_at INTEGER NOT NULL,
-          delivered_at INTEGER
+          delivered_at INTEGER,
+          origin TEXT NOT NULL DEFAULT 'away'
         );
         CREATE TABLE IF NOT EXISTS telegram_message_routes (
           chat_id TEXT NOT NULL,
@@ -569,6 +572,12 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "threads_cache", "last_turn_status", "TEXT")?;
     ensure_column(conn, "threads_cache", "last_preview", "TEXT")?;
     ensure_column(conn, "telegram_command_routes", "payload_json", "TEXT")?;
+    ensure_column(
+        conn,
+        "outbound_events",
+        "origin",
+        "TEXT NOT NULL DEFAULT 'away'",
+    )?;
     ensure_column(conn, "telegram_inbound_log", "thread_id", "TEXT")?;
     ensure_column(conn, "telegram_inbound_log", "route_message_id", "INTEGER")?;
     ensure_column(conn, "telegram_inbound_log", "result_action", "TEXT")?;
@@ -834,6 +843,7 @@ pub(crate) fn recent_actions_json(
 pub(crate) fn thread_snapshot_json(snapshot: &BridgeThreadSnapshot) -> Value {
     json!({
         "threadId": snapshot.thread_id,
+        "eventUid": snapshot.event_uid,
         "name": snapshot.name,
         "cwd": snapshot.cwd,
         "updatedAt": snapshot.updated_at,
@@ -914,19 +924,30 @@ pub(crate) fn reconcile_thread_snapshots(
         upsert_thread_snapshot(conn, snapshot, now)?;
         threads.push(thread_snapshot_json(snapshot));
 
-        if !away || !should_emit_for_away_window(away_started_at, snapshot.updated_at) {
+        // Bridge-initiated turns bypass the away gate entirely: their answer
+        // was promised to Telegram, so the event must be generated even while
+        // the user is present (and regardless of the away start window).
+        let bridge_pending = bridge_turn_pending(conn, &snapshot.thread_id, now)?;
+        if !bridge_pending
+            && (!away || !should_emit_for_away_window(away_started_at, snapshot.updated_at))
+        {
             continue;
         }
+
+        // The hook spool uid (unique even for same-millisecond hooks)
+        // disambiguates event keys; scan snapshots fall back to updated_at
+        // but never reach here anyway (they carry no prompt/completion).
+        let event_discriminator = snapshot.event_uid.clone().unwrap_or_else(|| {
+            snapshot
+                .updated_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        });
 
         if let Some(prompt) = &snapshot.pending_prompt {
             let event_key = format!(
                 "thread_waiting:{}:{}:{}",
-                snapshot.thread_id,
-                prompt.prompt_id,
-                snapshot
-                    .updated_at
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string())
+                snapshot.thread_id, prompt.prompt_id, event_discriminator
             );
             let should_emit = !record_deliveries
                 || record_delivery(conn, &event_key, &snapshot.thread_id, "thread_waiting", now)?;
@@ -934,9 +955,11 @@ pub(crate) fn reconcile_thread_snapshots(
                 let event = json!({
                     "type": "thread_waiting",
                     "threadId": snapshot.thread_id,
+                    "eventUid": snapshot.event_uid,
                     "promptKind": prompt.kind,
                     "updatedAt": snapshot.updated_at,
                     "lastPreview": snapshot.last_preview,
+                    "eventKey": event_key,
                 });
                 record_thread_event(
                     conn,
@@ -955,11 +978,7 @@ pub(crate) fn reconcile_thread_snapshots(
         {
             let event_key = format!(
                 "thread_completed:{}:{}",
-                snapshot.thread_id,
-                snapshot
-                    .updated_at
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string())
+                snapshot.thread_id, event_discriminator
             );
             let should_emit = !record_deliveries
                 || record_delivery(
@@ -973,8 +992,10 @@ pub(crate) fn reconcile_thread_snapshots(
                 let event = json!({
                     "type": "thread_completed",
                     "threadId": snapshot.thread_id,
+                    "eventUid": snapshot.event_uid,
                     "updatedAt": snapshot.updated_at,
                     "lastPreview": snapshot.last_preview,
+                    "eventKey": event_key,
                 });
                 record_thread_event(
                     conn,
@@ -1172,6 +1193,7 @@ pub(crate) fn list_recent_thread_snapshots_from_db(
                         status: prompt_status.unwrap_or_else(|| "Needs input".to_string()),
                         question,
                     }),
+                    event_uid: None,
                 })
             },
         )
@@ -1246,6 +1268,7 @@ pub(crate) fn list_inbox_from_db(
                     last_turn_status,
                     last_preview,
                     pending_prompt,
+                    event_uid: None,
                 };
                 let mut item = classify_inbox_item(&snapshot, now);
                 item.last_seen_at = Some(from_sql_i64(last_seen_at_raw)?);
@@ -1359,35 +1382,76 @@ pub(crate) fn archive_result(dry_run: bool, results: Vec<Value>) -> Value {
     })
 }
 
-#[cfg(test)]
-pub(crate) fn archive_from_db(
-    conn: &Connection,
-    thread_id: Option<&str>,
-    attention: Option<&str>,
-    dry_run: bool,
-    yes: bool,
-    now: u64,
-) -> Result<Value> {
-    let explicit = thread_id
-        .map(|value| vec![value.to_string()])
-        .unwrap_or_default();
-    let selection = resolve_archive_targets(conn, &explicit, None, None, attention, 100, now)?;
-    if !dry_run && selection.using_filter_selection && !yes {
-        bail!("Refusing bulk archive without --yes or --dry-run");
+/// Marker for turns started from the bridge (Telegram reply or /new). Their
+/// answers are always pushed back to Telegram, away mode or not — the user
+/// explicitly asked from there and was promised the answer there. The marker
+/// counts outstanding turns (concurrent replies to the same session each add
+/// one); each enqueued completion consumes one. The TTL only guards against
+/// stale markers from turns that never complete (crashed claude process).
+pub(crate) const BRIDGE_TURN_TTL_MS: u64 = 12 * 60 * 60 * 1000;
+
+fn bridge_turn_key(thread_id: &str) -> String {
+    format!("bridge_turn:{thread_id}")
+}
+
+/// (outstanding count, last marked_at). Expired or malformed markers are
+/// removed and read as absent.
+fn bridge_turn_state(conn: &Connection, thread_id: &str, now: u64) -> Result<Option<(u64, u64)>> {
+    let key = bridge_turn_key(thread_id);
+    let Some(raw) = get_setting_text(conn, &key)? else {
+        return Ok(None);
+    };
+    let state = serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|value| {
+            if let Some(marked_at) = value.as_u64() {
+                // Legacy format: a bare start timestamp = one outstanding turn.
+                return Some((1, marked_at));
+            }
+            Some((
+                value.get("count")?.as_u64()?,
+                value.get("markedAt")?.as_u64()?,
+            ))
+        });
+    match state {
+        Some((count, marked_at))
+            if count > 0 && now.saturating_sub(marked_at) <= BRIDGE_TURN_TTL_MS =>
+        {
+            Ok(Some((count, marked_at)))
+        }
+        _ => {
+            delete_setting(conn, &key)?;
+            Ok(None)
+        }
     }
+}
 
-    let results = selection
-        .targets
-        .into_iter()
-        .map(|thread_id| {
-            json!({
-                "threadId": thread_id,
-                "status": if dry_run { "would_archive" } else { "archived" }
-            })
-        })
-        .collect::<Vec<_>>();
+pub(crate) fn mark_bridge_turn(conn: &Connection, thread_id: &str, now: u64) -> Result<()> {
+    let count = bridge_turn_state(conn, thread_id, now)?
+        .map(|(count, _)| count)
+        .unwrap_or(0);
+    set_setting_text(
+        conn,
+        &bridge_turn_key(thread_id),
+        &json!({ "count": count + 1, "markedAt": now }).to_string(),
+    )
+}
 
-    Ok(archive_result(dry_run, results))
+pub(crate) fn bridge_turn_pending(conn: &Connection, thread_id: &str, now: u64) -> Result<bool> {
+    Ok(bridge_turn_state(conn, thread_id, now)?.is_some())
+}
+
+/// Consume one outstanding turn (its answer has been enqueued).
+pub(crate) fn consume_bridge_turn(conn: &Connection, thread_id: &str, now: u64) -> Result<()> {
+    match bridge_turn_state(conn, thread_id, now)? {
+        Some((count, marked_at)) if count > 1 => set_setting_text(
+            conn,
+            &bridge_turn_key(thread_id),
+            &json!({ "count": count - 1, "markedAt": marked_at }).to_string(),
+        ),
+        Some(_) => delete_setting(conn, &bridge_turn_key(thread_id)),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn telegram_current_project_key(chat_id: &str, user_id: Option<&str>) -> String {
@@ -1450,36 +1514,6 @@ pub(crate) fn unarchive_thread_result(
         "dryRun": false,
         "results": [{ "threadId": thread_id, "status": "unarchived", "result": result }]
     }))
-}
-
-#[cfg(test)]
-pub(crate) fn watch_once_from_db(conn: &Connection) -> Result<Vec<Value>> {
-    let waiting = list_waiting_from_db(conn, None, 100)?;
-    Ok(waiting
-        .threads
-        .into_iter()
-        .map(|thread| {
-            json!({
-                "type": "thread_waiting",
-                "threadId": thread.thread_id,
-                "thread": {
-                    "threadId": thread.thread_id,
-                    "name": thread.name,
-                    "cwd": thread.cwd,
-                    "updatedAt": thread.updated_at,
-                    "statusType": thread.status_type,
-                    "statusFlags": thread.status_flags,
-                    "lastPreview": thread.last_preview,
-                    "pendingPrompt": {
-                        "promptId": thread.prompt.prompt_id,
-                        "promptKind": thread.prompt.kind,
-                        "promptStatus": thread.prompt.status,
-                        "question": thread.prompt.question
-                    }
-                }
-            })
-        })
-        .collect())
 }
 
 pub(crate) fn telegram_inbound_processed(
@@ -1671,7 +1705,15 @@ pub(crate) fn mark_telegram_command_route_used(
     Ok(())
 }
 
-pub(crate) fn enqueue_outbound_event(conn: &Connection, event: &Value, now: u64) -> Result<bool> {
+/// `origin` records why the event was enqueued: "away" (away-mode
+/// notification about a local session) or "bridge" (answer to a turn started
+/// from Telegram). /back clears only the former.
+pub(crate) fn enqueue_outbound_event(
+    conn: &Connection,
+    event: &Value,
+    now: u64,
+    origin: &str,
+) -> Result<bool> {
     let event_id = crate::notification_event_id(event);
     let event_type = event
         .get("type")
@@ -1679,14 +1721,15 @@ pub(crate) fn enqueue_outbound_event(conn: &Connection, event: &Value, now: u64)
         .unwrap_or("bridge_event");
     let thread_id = crate::event_thread_id(event);
     let inserted = conn.execute(
-        "INSERT OR IGNORE INTO outbound_events(event_id, event_type, thread_id, payload_json, status, attempts, next_attempt_at, last_error, created_at, delivered_at)
-         VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, NULL, ?5, NULL)",
+        "INSERT OR IGNORE INTO outbound_events(event_id, event_type, thread_id, payload_json, status, attempts, next_attempt_at, last_error, created_at, delivered_at, origin)
+         VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, NULL, ?5, NULL, ?6)",
         params![
             event_id,
             event_type,
             thread_id,
             serde_json::to_string(event)?,
-            to_sql_i64(now)?
+            to_sql_i64(now)?,
+            origin
         ],
     )?;
     Ok(inserted > 0)
@@ -1701,9 +1744,12 @@ pub(crate) fn pending_outbound_count(conn: &Connection) -> Result<u64> {
     from_sql_i64(count)
 }
 
+/// /back clears the away-notification backlog only. Answers to turns the user
+/// started from Telegram (origin 'bridge') stay queued: they were explicitly
+/// requested and must survive a delivery failure followed by /back.
 pub(crate) fn clear_pending_outbound_events(conn: &Connection) -> Result<usize> {
     let deleted = conn.execute(
-        "DELETE FROM outbound_events WHERE status != 'delivered'",
+        "DELETE FROM outbound_events WHERE status != 'delivered' AND origin = 'away'",
         [],
     )?;
     Ok(deleted)
@@ -1877,6 +1923,7 @@ mod tests {
             last_turn_status: last_turn_status.map(|value| value.to_string()),
             last_preview: Some(format!("preview for {thread_id}")),
             pending_prompt,
+            event_uid: None,
         }
     }
 
@@ -2356,6 +2403,7 @@ mod tests {
                 "updatedAt": 42
             }),
             1000,
+            "away",
         )
         .expect("enqueue");
 

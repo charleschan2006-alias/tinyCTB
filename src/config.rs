@@ -245,34 +245,36 @@ mod tests {
         crate::state::test_env_lock()
     }
 
-    struct ConfigBackup {
-        path: std::path::PathBuf,
-        contents: Option<Vec<u8>>,
+    /// Points TINYCTB_STATE_DIR at a throwaway directory so config tests never
+    /// read or write the user's real ~/.tinyctb/config.json.
+    struct TempConfigDir {
+        previous_state_dir: Option<String>,
+        root: std::path::PathBuf,
     }
 
-    impl ConfigBackup {
-        fn capture() -> anyhow::Result<Self> {
-            let path = daemon_config_path()?;
-            let contents = fs::read(&path).ok();
-            Ok(Self { path, contents })
+    impl TempConfigDir {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("tinyctb-config-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("create temp config dir");
+            let previous_state_dir = std::env::var("TINYCTB_STATE_DIR").ok();
+            std::env::set_var("TINYCTB_STATE_DIR", &root);
+            Self {
+                previous_state_dir,
+                root,
+            }
         }
     }
 
-    impl Drop for ConfigBackup {
+    impl Drop for TempConfigDir {
         fn drop(&mut self) {
-            match &self.contents {
-                Some(contents) => {
-                    if let Some(parent) = self.path.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    let _ = fs::write(&self.path, contents);
-                }
-                None => {
-                    if self.path.exists() {
-                        let _ = fs::remove_file(&self.path);
-                    }
-                }
+            if let Some(previous_state_dir) = &self.previous_state_dir {
+                std::env::set_var("TINYCTB_STATE_DIR", previous_state_dir);
+            } else {
+                std::env::remove_var("TINYCTB_STATE_DIR");
             }
+            let _ = fs::remove_dir_all(&self.root);
         }
     }
 
@@ -317,7 +319,7 @@ mod tests {
     #[test]
     fn load_daemon_config_defaults_claude_config() {
         let _guard = config_test_lock().lock().expect("config lock");
-        let _backup = ConfigBackup::capture().expect("capture config backup");
+        let _state = TempConfigDir::new("defaults");
         write_daemon_config(&DaemonConfig {
             version: 1,
             bridge_command: "tinyctb".to_string(),
@@ -339,7 +341,7 @@ mod tests {
     #[test]
     fn load_daemon_config_rejects_invalid_permission_mode() {
         let _guard = config_test_lock().lock().expect("config lock");
-        let _backup = ConfigBackup::capture().expect("capture config backup");
+        let _state = TempConfigDir::new("bad-permission-mode");
         write_daemon_config(&DaemonConfig {
             version: 1,
             bridge_command: "tinyctb".to_string(),
