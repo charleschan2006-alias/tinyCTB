@@ -44,6 +44,7 @@ fn telegram_event_title(event_type: &str, event: &Value) -> &'static str {
         "thread_status_changed" => "🔄 Claude changed",
         "thread_error" => "⚠️ Bridge error",
         "bridge_notice" => "ℹ️ tinyCTB",
+        "approval_request" => "🔐 需要你批准",
         _ => "🧵 Claude update",
     }
 }
@@ -234,7 +235,7 @@ pub(crate) fn prepare_telegram_delivery(
         lines.push(telegram_event_reply_hint(event_type, event).to_string());
     }
 
-    let payloads = split_telegram_text(&lines.join("\n"), TELEGRAM_MESSAGE_CHAR_LIMIT)
+    let mut payloads = split_telegram_text(&lines.join("\n"), TELEGRAM_MESSAGE_CHAR_LIMIT)
         .into_iter()
         .map(|text| {
             json!({
@@ -245,14 +246,66 @@ pub(crate) fn prepare_telegram_delivery(
         })
         .collect::<Vec<_>>();
 
-    // Claude Code permission prompts belong to the interactive terminal
-    // session; there is no remote approval channel, so no inline keyboard is
-    // attached. The callback route table stays in the schema for future use.
+    // An approval request carries its answer buttons. The callback routes were
+    // registered by the hook that is blocking on the answer; they are returned
+    // here so delivery can stamp them with the message id.
+    let mut callback_routes = Vec::new();
+    if event_type == "approval_request" {
+        let buttons = event
+            .get("buttons")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut keyboard_row = Vec::new();
+        for button in &buttons {
+            let (Some(text), Some(callback_id)) = (
+                button.get("text").and_then(Value::as_str),
+                button.get("callbackId").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            keyboard_row.push(json!({
+                "text": text,
+                "callback_data": format!("claude:{callback_id}")
+            }));
+            if let Some(action) = button
+                .get("action")
+                .and_then(Value::as_str)
+                .and_then(crate::state::TelegramCallbackAction::from_str)
+            {
+                callback_routes.push(TelegramCallbackRoute {
+                    callback_id: callback_id.to_string(),
+                    chat_id: chat_id.to_string(),
+                    message_id: None,
+                    thread_id: thread_id.clone().unwrap_or_default(),
+                    action,
+                    approval_id: event
+                        .get("approvalId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                });
+            }
+        }
+        if !keyboard_row.is_empty() {
+            // Buttons ride on the LAST chunk so they sit under the full text.
+            if let Some(last) = payloads.last_mut().and_then(Value::as_object_mut) {
+                last.insert(
+                    "reply_markup".to_string(),
+                    json!({ "inline_keyboard": [keyboard_row] }),
+                );
+            }
+        }
+    }
+
+    // Notifications about a terminal session's own permission dialog still
+    // carry no buttons: that dialog can only be answered in its terminal.
+    // Only `approval_request` events (raised by the PreToolUse gate, which is
+    // blocking on the answer) get an inline keyboard.
     Ok(PreparedTelegramDelivery {
         payloads,
         thread_id,
         event_id,
-        callback_routes: Vec::new(),
+        callback_routes,
     })
 }
 
@@ -316,7 +369,12 @@ fn thread_snapshot_event(snapshot: &BridgeThreadSnapshot) -> Value {
         .pending_prompt
         .as_ref()
         .and_then(|prompt| prompt.question.as_deref())
-        .map(|question| question.chars().count().min(TELEGRAM_THREAD_SNAPSHOT_DETAIL_LIMIT))
+        .map(|question| {
+            question
+                .chars()
+                .count()
+                .min(TELEGRAM_THREAD_SNAPSHOT_DETAIL_LIMIT)
+        })
         .unwrap_or(0);
     let preview_budget = TELEGRAM_THREAD_SNAPSHOT_DETAIL_LIMIT
         .saturating_sub(question_len)
@@ -628,7 +686,10 @@ mod tests {
         let text = prepared.payloads[0]["text"].as_str().expect("text");
         assert!(text.starts_with("🔐 Claude needs approval"));
         assert!(text.contains("⚙️ Bash: rm -rf build/"), "{text}");
-        assert!(text.contains("I will clean the build directory next."), "{text}");
+        assert!(
+            text.contains("I will clean the build directory next."),
+            "{text}"
+        );
     }
 
     /// Regression: the body concatenates question AND preview, so a snapshot
@@ -656,7 +717,11 @@ mod tests {
 
         let prepared = prepare_telegram_thread_snapshot_delivery("999", &snapshot)
             .expect("long snapshot must not fail to render");
-        assert_eq!(prepared.payloads.len(), 1, "snapshot must stay single-message");
+        assert_eq!(
+            prepared.payloads.len(),
+            1,
+            "snapshot must stay single-message"
+        );
         let text = prepared.payloads[0]["text"].as_str().expect("text");
         assert!(
             text.chars().count() <= TELEGRAM_MESSAGE_CHAR_LIMIT,

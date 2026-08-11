@@ -11,16 +11,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::claude::{
-    filter_watch_events, parse_event_filter, read_bridge_turn_result,
-    start_claude_watch_receiver, sync_state_from_sessions, turn_log_tail,
-    watch_events_from_sync_result, watch_thread_error_event,
+    filter_watch_events, parse_event_filter, read_bridge_turn_result, start_claude_watch_receiver,
+    sync_state_from_sessions, turn_log_tail, watch_events_from_sync_result,
+    watch_thread_error_event,
 };
 use crate::state::{
     create_state_db, delete_setting, deliver_due_outbound_events, enqueue_outbound_event,
-    get_setting_text, list_running_bridge_turns, mark_bridge_turn_finished,
-    pending_outbound_count, prune_state_logs, record_transport_delivery, set_setting_text,
-    should_emit_for_away_window, state_db_path, transport_delivery_exists, BridgeTurn,
-    OutboxDeliverySummary,
+    get_setting_text, list_running_bridge_turns, mark_bridge_turn_finished, pending_outbound_count,
+    prune_state_logs, record_transport_delivery, set_setting_text, should_emit_for_away_window,
+    state_db_path, transport_delivery_exists, BridgeTurn, OutboxDeliverySummary,
 };
 use crate::telegram::{
     deliver_telegram_event, extend_telegram_typing_indicator, process_telegram_updates,
@@ -107,8 +106,9 @@ pub(crate) fn daemon_lock_free() -> Result<bool> {
     match FileExt::try_lock_exclusive(&file) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(false),
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to probe daemon lock at {}", path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to probe daemon lock at {}", path.display()))
+        }
     }
 }
 
@@ -157,10 +157,9 @@ pub(crate) fn enqueue_daemon_notification_events(
         // between them would leave the answer queued and the debt open, so
         // the next completion would be pushed as a second "answer" too.
         let tx = conn.unchecked_transaction()?;
-        let inserted = enqueue_outbound_event(&tx, event, now, if owed { "bridge" } else { "away" })?;
-        if inserted
-            && owed
-            && event.get("type").and_then(Value::as_str) == Some("thread_completed")
+        let inserted =
+            enqueue_outbound_event(&tx, event, now, if owed { "bridge" } else { "away" })?;
+        if inserted && owed && event.get("type").and_then(Value::as_str) == Some("thread_completed")
         {
             if let Some(thread_id) = thread_id.as_deref() {
                 crate::state::consume_live_injection(&tx, thread_id, event_at, now)?;
@@ -387,16 +386,16 @@ fn deliver_outbound_events(
     deliver_due_outbound_events(conn, now, 100, Some(deadline), |event| {
         let event_id = notification_event_id(event);
         let telegram = if let Some(telegram) = config.telegram.as_ref() {
-                if transport_delivery_exists(conn, &event_id, "telegram")? {
-                    json!({ "ok": true, "transport": "telegram", "skipped": "already_delivered" })
-                } else {
-                    let result = deliver_telegram_event(conn, telegram, event, now, timeout)?;
-                    record_transport_delivery(conn, &event_id, "telegram", &result, now)?;
-                    result
-                }
+            if transport_delivery_exists(conn, &event_id, "telegram")? {
+                json!({ "ok": true, "transport": "telegram", "skipped": "already_delivered" })
             } else {
-                Value::Null
-            };
+                let result = deliver_telegram_event(conn, telegram, event, now, timeout)?;
+                record_transport_delivery(conn, &event_id, "telegram", &result, now)?;
+                result
+            }
+        } else {
+            Value::Null
+        };
         Ok(json!({ "telegram": telegram }))
     })
 }
@@ -517,9 +516,8 @@ fn daemon_cycle(
     };
     // Bridge-turn answers are collected AFTER the sync so the away-duplicate
     // check can see anything the sync just enqueued for the same completion.
-    let bridge_turns = process_bridge_turns(conn, config, now).unwrap_or_else(|error| {
-        json!({ "ok": false, "error": format!("{error:#}") })
-    });
+    let bridge_turns = process_bridge_turns(conn, config, now)
+        .unwrap_or_else(|error| json!({ "ok": false, "error": format!("{error:#}") }));
     // Delivery is not gated on away mode: enqueueing is the policy point.
     // While the user is present the outbox only ever holds answers to turns
     // they started from Telegram, which must always be delivered.
@@ -547,19 +545,16 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
         return Ok(());
     }
 
-    let telegram_commands = config
-        .telegram
-        .as_ref()
-        .map(|telegram| {
-            telegram_set_my_commands(telegram, timeout)
-                .map(|_| json!({ "registered": true }))
-                .unwrap_or_else(|error| {
-                    json!({
-                        "registered": false,
-                        "error": format!("{error:#}")
-                    })
+    let telegram_commands = config.telegram.as_ref().map(|telegram| {
+        telegram_set_my_commands(telegram, timeout)
+            .map(|_| json!({ "registered": true }))
+            .unwrap_or_else(|error| {
+                json!({
+                    "registered": false,
+                    "error": format!("{error:#}")
                 })
-        });
+            })
+    });
 
     println!(
         "{}",
@@ -1296,8 +1291,8 @@ mod tests {
         /// Keeps service-spec tests away from the real ~/.tinyctb and the real
         /// service definitions (read-only CI homes, and `reset`-style stops).
         fn new(name: &str) -> Self {
-            let root = std::env::temp_dir()
-                .join(format!("tinyctb-daemon-{name}-{}", std::process::id()));
+            let root =
+                std::env::temp_dir().join(format!("tinyctb-daemon-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(&root).expect("create temp daemon dir");
             let previous_state_dir = std::env::var("TINYCTB_STATE_DIR").ok();
@@ -1417,8 +1412,7 @@ mod tests {
         )
         .expect("register");
 
-        let summary =
-            process_bridge_turns(&conn, &bridge_test_config(), 2000).expect("process");
+        let summary = process_bridge_turns(&conn, &bridge_test_config(), 2000).expect("process");
         assert_eq!(summary["answered"], 1, "{summary}");
         assert_eq!(pending_outbound_count(&conn).expect("pending"), 1);
         let (payload, origin): (String, String) = conn
@@ -1438,7 +1432,10 @@ mod tests {
 
         // /back clears only the away backlog; the answer stays queued.
         set_away_mode(&conn, false, 4000).expect("back");
-        assert_eq!(pending_outbound_count(&conn).expect("pending after back"), 1);
+        assert_eq!(
+            pending_outbound_count(&conn).expect("pending after back"),
+            1
+        );
     }
 
     /// Two concurrent replies to one session = two registered turns with two
@@ -1447,8 +1444,14 @@ mod tests {
     fn concurrent_bridge_turns_each_push_their_own_answer() {
         let conn = create_state_db_in_memory().expect("db");
         for (turn_id, text) in [
-            ("sess-c-1000", r#"{"type":"result","subtype":"success","result":"answer one"}"#),
-            ("sess-c-1100", r#"{"type":"result","subtype":"success","result":"answer two"}"#),
+            (
+                "sess-c-1000",
+                r#"{"type":"result","subtype":"success","result":"answer one"}"#,
+            ),
+            (
+                "sess-c-1100",
+                r#"{"type":"result","subtype":"success","result":"answer two"}"#,
+            ),
         ] {
             let log = write_turn_log(turn_id, &[text]);
             crate::state::register_bridge_turn(
@@ -1467,8 +1470,7 @@ mod tests {
             .expect("register");
         }
 
-        let summary =
-            process_bridge_turns(&conn, &bridge_test_config(), 2000).expect("process");
+        let summary = process_bridge_turns(&conn, &bridge_test_config(), 2000).expect("process");
         assert_eq!(summary["answered"], 2, "{summary}");
         let payloads: Vec<String> = conn
             .prepare("SELECT payload_json FROM outbound_events ORDER BY event_id")
@@ -1478,8 +1480,12 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .expect("payloads");
         assert_eq!(payloads.len(), 2);
-        assert!(payloads.iter().any(|payload| payload.contains("answer one")));
-        assert!(payloads.iter().any(|payload| payload.contains("answer two")));
+        assert!(payloads
+            .iter()
+            .any(|payload| payload.contains("answer one")));
+        assert!(payloads
+            .iter()
+            .any(|payload| payload.contains("answer two")));
     }
 
     /// A dead process without a result must produce a loud failure notice,
@@ -1542,8 +1548,7 @@ mod tests {
         .expect("register");
         crate::state::record_bridge_turn_exit(&conn, own_pid, Some(1)).expect("record exit");
 
-        let summary =
-            process_bridge_turns(&conn, &bridge_test_config(), 20_000).expect("process");
+        let summary = process_bridge_turns(&conn, &bridge_test_config(), 20_000).expect("process");
         assert_eq!(summary["failed"], 1, "{summary}");
         let payload: String = conn
             .query_row("SELECT payload_json FROM outbound_events", [], |row| {
@@ -1642,8 +1647,7 @@ mod tests {
         )
         .expect("away enqueue");
 
-        let summary =
-            process_bridge_turns(&conn, &bridge_test_config(), 3000).expect("process");
+        let summary = process_bridge_turns(&conn, &bridge_test_config(), 3000).expect("process");
         assert_eq!(summary["answered"], 1);
         assert_eq!(
             pending_outbound_count(&conn).expect("pending"),
@@ -1691,8 +1695,7 @@ mod tests {
         )
         .expect("away enqueue");
 
-        let summary =
-            process_bridge_turns(&conn, &bridge_test_config(), 2000).expect("process");
+        let summary = process_bridge_turns(&conn, &bridge_test_config(), 2000).expect("process");
         assert_eq!(summary["answered"], 1);
         assert_eq!(
             pending_outbound_count(&conn).expect("pending"),
@@ -1738,8 +1741,7 @@ mod tests {
         )
         .expect("away enqueue");
 
-        let summary =
-            process_bridge_turns(&conn, &bridge_test_config(), 2000).expect("process");
+        let summary = process_bridge_turns(&conn, &bridge_test_config(), 2000).expect("process");
         assert_eq!(summary["answered"], 1);
         assert_eq!(
             pending_outbound_count(&conn).expect("pending"),
@@ -1801,13 +1803,9 @@ mod tests {
         let no_filter: Option<&std::collections::BTreeSet<String>> = None;
 
         // Not away: nothing notifies, and no quiet streak starts.
-        let (_, quiet) = enqueue_sync_error_notification(
-            &conn,
-            no_filter,
-            &anyhow::anyhow!("scan failed"),
-            600,
-        )
-        .expect("not away");
+        let (_, quiet) =
+            enqueue_sync_error_notification(&conn, no_filter, &anyhow::anyhow!("scan failed"), 600)
+                .expect("not away");
         assert_eq!(quiet, 0);
 
         // Going away with the error still present must notify (the flag was
@@ -1979,7 +1977,10 @@ mod tests {
             let bootstrap = command
                 .find("launchctl bootstrap")
                 .expect("bootstrap present");
-            assert!(bootout < bootstrap, "bootout must run before bootstrap: {command}");
+            assert!(
+                bootout < bootstrap,
+                "bootout must run before bootstrap: {command}"
+            );
         }
         assert!(!spec.start_command.contains("kickstart"));
         assert!(spec.status_command.starts_with("launchctl print gui/"));
@@ -1998,7 +1999,9 @@ mod tests {
             Some("/tmp/verify state"),
         );
 
-        assert!(spec.contents.contains("<string>/opt/a&amp;b/tinyctb</string>"));
+        assert!(spec
+            .contents
+            .contains("<string>/opt/a&amp;b/tinyctb</string>"));
         assert!(spec.contents.contains("<key>CLAUDE_BIN</key>"));
         assert!(spec.contents.contains("<key>TINYCTB_STATE_DIR</key>"));
         assert!(spec.contents.contains("<string>/tmp/verify state</string>"));
@@ -2010,8 +2013,7 @@ mod tests {
 
     #[test]
     fn service_bridge_command_falls_back_to_current_exe_for_unknown_names() {
-        let resolved =
-            resolve_service_bridge_command("definitely-not-a-real-binary-tinyctb-test");
+        let resolved = resolve_service_bridge_command("definitely-not-a-real-binary-tinyctb-test");
         assert!(
             std::path::Path::new(&resolved).is_absolute(),
             "service command must be absolute, got: {resolved}"

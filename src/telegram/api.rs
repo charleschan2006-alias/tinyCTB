@@ -229,17 +229,7 @@ mod tests {
 
         assert_eq!(
             names,
-            vec![
-                "start",
-                "help",
-                "away",
-                "back",
-                "repair",
-                "status",
-                "threads",
-                "new",
-                "project",
-            ]
+            vec!["start", "help", "away", "back", "repair", "status", "threads", "new", "project",]
         );
         for removed in [
             "away_on",

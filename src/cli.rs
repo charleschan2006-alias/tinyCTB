@@ -90,6 +90,11 @@ pub(crate) enum Commands {
         about = "Receive one Claude Code hook payload on stdin and spool it for the daemon"
     )]
     HookEvent,
+    #[command(
+        hide = true,
+        about = "PreToolUse hook: confirm a gated tool call from Telegram while away"
+    )]
+    ApprovalGate,
     #[command(about = "Manage the curated project registry for Telegram-created sessions")]
     Projects {
         #[command(subcommand)]
@@ -394,7 +399,10 @@ mod tests {
         let help = command.render_long_help().to_string();
         assert!(help.contains("Inspect the Claude Code and bridge setup"));
         assert!(help.contains("Configure Telegram delivery"));
-        assert!(!help.contains("hook payload on stdin"), "hook-event stays hidden");
+        assert!(
+            !help.contains("hook payload on stdin"),
+            "hook-event stays hidden"
+        );
     }
 
     #[test]

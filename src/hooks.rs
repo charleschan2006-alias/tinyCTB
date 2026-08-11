@@ -13,6 +13,12 @@ use crate::claude::{claude_settings_path, events_spool_dir};
 use crate::shell_quote;
 
 pub(crate) const HOOKED_EVENTS: &[&str] = &["Stop", "Notification", "SessionStart"];
+/// Raised right before Claude Code would show a permission prompt, so the
+/// gate engages only for calls that actually need an answer. Installed
+/// separately from the spool hooks: different subcommand, and a timeout long
+/// enough to outlast a human reaching for their phone.
+pub(crate) const APPROVAL_HOOK_EVENT: &str = "PermissionRequest";
+const APPROVAL_HOOK_MARKER: &str = "approval-gate";
 const HOOK_MARKER: &str = "hook-event";
 const HOOK_TIMEOUT_SECONDS: u64 = 10;
 
@@ -44,8 +50,24 @@ fn is_tinyctb_hook(entry: &Value) -> bool {
     entry
         .get("command")
         .and_then(Value::as_str)
-        .map(|command| command.contains(HOOK_MARKER) && command.contains("tinyctb"))
+        .map(|command| {
+            command.contains("tinyctb")
+                && (command.contains(HOOK_MARKER) || command.contains(APPROVAL_HOOK_MARKER))
+        })
         .unwrap_or(false)
+}
+
+/// Hook timeout = the configured approval wait plus headroom, so Claude Code
+/// never kills the gate while the answer is still in flight.
+fn approval_hook_timeout_seconds() -> u64 {
+    crate::config::read_daemon_config_raw()
+        .ok()
+        .flatten()
+        .and_then(|config| config.claude)
+        .map(|claude| claude.approval_timeout_seconds)
+        .unwrap_or(300)
+        .clamp(5, 3600)
+        + 15
 }
 
 fn read_settings() -> Result<(PathBuf, Map<String, Value>)> {
@@ -57,9 +79,7 @@ fn read_settings() -> Result<(PathBuf, Map<String, Value>)> {
             Map::new()
         } else {
             serde_json::from_str::<Value>(&raw)
-                .with_context(|| {
-                    format!("failed to parse Claude settings at {}", path.display())
-                })?
+                .with_context(|| format!("failed to parse Claude settings at {}", path.display()))?
                 .as_object()
                 .cloned()
                 .context("Claude settings.json must contain a JSON object")?
@@ -123,6 +143,35 @@ pub(crate) fn install_hooks(bridge_command: &str, dry_run: bool) -> Result<Value
         installed.push(event.to_string());
     }
 
+    // The approval gate answers permission prompts from Telegram, so it must
+    // outlive a human reaction time; the spool hooks stay short because they
+    // only write a file.
+    let approval_command = format!(
+        "{} approval-gate",
+        shell_quote(
+            &resolve_bridge_binary_for_hooks(bridge_command)?
+                .display()
+                .to_string()
+        )
+    );
+    let approval_timeout = approval_hook_timeout_seconds();
+    let groups_value = hooks
+        .entry(APPROVAL_HOOK_EVENT.to_string())
+        .or_insert_with(|| json!([]));
+    let groups = groups_value
+        .as_array_mut()
+        .with_context(|| format!("Claude settings hooks.{APPROVAL_HOOK_EVENT} must be an array"))?;
+    strip_tinyctb_entries(groups);
+    groups.push(json!({
+        "matcher": "*",
+        "hooks": [{
+            "type": "command",
+            "command": approval_command,
+            "timeout": approval_timeout
+        }]
+    }));
+    installed.push(APPROVAL_HOOK_EVENT.to_string());
+
     if !dry_run {
         write_settings(&path, &settings)?;
         fs::create_dir_all(events_spool_dir()?)?;
@@ -133,6 +182,8 @@ pub(crate) fn install_hooks(bridge_command: &str, dry_run: bool) -> Result<Value
         "dryRun": dry_run,
         "settingsPath": path.display().to_string(),
         "command": command,
+        "approvalCommand": approval_command,
+        "approvalTimeoutSeconds": approval_timeout,
         "events": installed,
         "note": "Restart running interactive Claude Code sessions so they pick up the new hooks."
     }))
@@ -142,7 +193,10 @@ pub(crate) fn uninstall_hooks(dry_run: bool) -> Result<Value> {
     let (path, mut settings) = read_settings()?;
     let mut removed = 0usize;
     if let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) {
-        for event in HOOKED_EVENTS {
+        for event in HOOKED_EVENTS
+            .iter()
+            .chain(std::iter::once(&APPROVAL_HOOK_EVENT))
+        {
             if let Some(groups) = hooks.get_mut(*event).and_then(Value::as_array_mut) {
                 removed += strip_tinyctb_entries(groups);
             }
@@ -170,7 +224,10 @@ pub(crate) fn hooks_status() -> Result<Value> {
     let (path, settings) = read_settings()?;
     let mut events = Map::new();
     let mut missing = Vec::new();
-    for event in HOOKED_EVENTS {
+    for event in HOOKED_EVENTS
+        .iter()
+        .chain(std::iter::once(&APPROVAL_HOOK_EVENT))
+    {
         let installed = settings
             .get("hooks")
             .and_then(|hooks| hooks.get(*event))
@@ -222,7 +279,10 @@ mod tests {
                 "TINYCTB_CLAUDE_SETTINGS_PATH",
                 root.join("settings.json").display().to_string(),
             );
-            std::env::set_var("TINYCTB_STATE_DIR", root.join("state").display().to_string());
+            std::env::set_var(
+                "TINYCTB_STATE_DIR",
+                root.join("state").display().to_string(),
+            );
             Self { root }
         }
     }
@@ -283,9 +343,24 @@ mod tests {
 
         let status = hooks_status().expect("status");
         assert_eq!(status["installed"], true);
+        // The approval gate is installed as its own PreToolUse entry, with a
+        // timeout long enough to outlast a human tapping a Telegram button.
+        let approval = settings["hooks"][APPROVAL_HOOK_EVENT][0]["hooks"][0].clone();
+        assert!(approval["command"]
+            .as_str()
+            .expect("approval command")
+            .ends_with("approval-gate"));
+        assert!(
+            approval["timeout"].as_u64().expect("timeout") >= 60,
+            "approval hook must not be killed while waiting: {approval}"
+        );
 
         let uninstalled = uninstall_hooks(false).expect("uninstall");
-        assert_eq!(uninstalled["removed"], 3);
+        assert_eq!(
+            uninstalled["removed"],
+            (HOOKED_EVENTS.len() + 1) as i64,
+            "the spool hooks plus the PreToolUse approval gate"
+        );
         let settings: Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings"))
                 .expect("parse settings");

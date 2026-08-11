@@ -3,6 +3,7 @@
 //! detached `claude -p` processes.
 
 use anyhow::{bail, Context, Result};
+use notify::Watcher;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,7 +11,6 @@ use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use notify::Watcher;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -402,6 +402,12 @@ fn ask_user_question_summary(input: &Value) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
+/// Shared by the approval gate so a Telegram approval shows the same amount
+/// of detail as a permission notification.
+pub(crate) fn truncate_tool_detail(detail: &str) -> String {
+    truncate_chars(detail, MAX_TOOL_DETAIL_CHARS)
+}
+
 fn compact_tool_use_summary(name: &str, input: &Value) -> String {
     let detail = match name {
         "Bash" => input
@@ -419,7 +425,10 @@ fn compact_tool_use_summary(name: &str, input: &Value) -> String {
     };
     match detail {
         Some(detail) if !detail.trim().is_empty() => {
-            format!("{name}: {}", truncate_chars(detail.trim(), MAX_TOOL_DETAIL_CHARS))
+            format!(
+                "{name}: {}",
+                truncate_chars(detail.trim(), MAX_TOOL_DETAIL_CHARS)
+            )
         }
         _ => name.to_string(),
     }
@@ -766,7 +775,11 @@ pub(crate) fn peek_session_sockets(conn: &Connection, now: u64) -> Result<usize>
 
 pub(crate) fn ingest_spool_events(
     now: u64,
-) -> Result<(Vec<BridgeThreadSnapshot>, BTreeMap<String, SessionSocket>, usize)> {
+) -> Result<(
+    Vec<BridgeThreadSnapshot>,
+    BTreeMap<String, SessionSocket>,
+    usize,
+)> {
     let mut files = spool_event_files()?;
     files.truncate(MAX_SPOOL_EVENTS_PER_CYCLE);
 
@@ -849,7 +862,10 @@ pub(crate) fn ingest_spool_events(
             .map(|text| truncate_chars(&text, MAX_PREVIEW_CHARS));
 
         let mut base = by_session.remove(&session_id);
-        if matches!(event_name.as_str(), "Stop" | "Notification" | "SessionStart") {
+        if matches!(
+            event_name.as_str(),
+            "Stop" | "Notification" | "SessionStart"
+        ) {
             if let Some(previous) =
                 base.take_if(|previous| previous.last_turn_status.as_deref() == Some("completed"))
             {
@@ -859,7 +875,9 @@ pub(crate) fn ingest_spool_events(
         let snapshot = match event_name.as_str() {
             "Stop" => BridgeThreadSnapshot {
                 thread_id: session_id.clone(),
-                name: summary.name.or_else(|| base.as_ref().and_then(|b| b.name.clone())),
+                name: summary
+                    .name
+                    .or_else(|| base.as_ref().and_then(|b| b.name.clone())),
                 cwd: summary
                     .cwd
                     .or(payload_cwd)
@@ -874,7 +892,9 @@ pub(crate) fn ingest_spool_events(
             },
             "Notification" => BridgeThreadSnapshot {
                 thread_id: session_id.clone(),
-                name: summary.name.or_else(|| base.as_ref().and_then(|b| b.name.clone())),
+                name: summary
+                    .name
+                    .or_else(|| base.as_ref().and_then(|b| b.name.clone())),
                 cwd: summary
                     .cwd
                     .or(payload_cwd)
@@ -983,8 +1003,7 @@ pub(crate) fn sync_state_from_sessions(
         .iter()
         .map(|snapshot| snapshot.thread_id.clone())
         .collect::<BTreeSet<_>>();
-    let reconcile =
-        reconcile_thread_snapshots(conn, now, hook_snapshots, record_deliveries)?;
+    let reconcile = reconcile_thread_snapshots(conn, now, hook_snapshots, record_deliveries)?;
 
     let scan_limit = config
         .claude
@@ -1043,8 +1062,7 @@ pub(crate) fn sync_state_from_sessions(
             notifiable.push(event);
         }
     }
-    let enqueued =
-        crate::daemon::enqueue_daemon_notification_events(conn, &notifiable, now)?;
+    let enqueued = crate::daemon::enqueue_daemon_notification_events(conn, &notifiable, now)?;
     if let Some(object) = result.as_object_mut() {
         object.insert("enqueued".to_string(), json!(enqueued));
     }
@@ -1593,8 +1611,7 @@ pub(crate) fn inject_into_live_session(
         // number of such threads is hard-capped: past the cap we report "not
         // live" and fall back to the headless path rather than accumulating
         // one stuck thread per reply.
-        static IN_FLIGHT: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
+        static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         const MAX_IN_FLIGHT_CONNECTS: usize = 2;
         struct InFlightGuard;
         impl Drop for InFlightGuard {
@@ -1652,25 +1669,19 @@ pub(crate) fn send_user_message(
     cwd_hint: Option<&str>,
     now: u64,
 ) -> Result<Value> {
-    let message =
-        normalized_message(Some(message)).context("reply message cannot be empty")?;
+    let message = normalized_message(Some(message)).context("reply message cannot be empty")?;
     let claude = claude_config(config);
     let binary = resolve_claude_binary()?;
-    let cwd = cwd_hint
-        .map(str::to_string)
-        .or_else(|| {
-            find_session_file(session_id)
-                .ok()
-                .flatten()
-                .and_then(|info| parse_transcript_summary(&info.path).ok())
-                .and_then(|summary| summary.cwd)
-        });
+    let cwd = cwd_hint.map(str::to_string).or_else(|| {
+        find_session_file(session_id)
+            .ok()
+            .flatten()
+            .and_then(|info| parse_transcript_summary(&info.path).ok())
+            .and_then(|summary| summary.cwd)
+    });
     // The random suffix keeps turn ids unique even for two replies to the
     // same session in one update batch (which share `now`).
-    let turn_id = format!(
-        "{session_id}-{now}-{}",
-        &generate_session_uuid()?[..8]
-    );
+    let turn_id = format!("{session_id}-{now}-{}", &generate_session_uuid()?[..8]);
     let log_path = turn_logs_dir()?.join(format!("{turn_id}.log"));
     let args = headless_command_args(&claude, &message, SessionRef::Resume(session_id));
     let pid = spawn_detached_headless(&binary.path, &args, cwd.as_deref(), &turn_id)?;
@@ -1716,10 +1727,7 @@ pub(crate) fn start_thread_in_cwd(
     let claude = claude_config(config);
     let binary = resolve_claude_binary()?;
     let session_id = generate_session_uuid()?;
-    let turn_id = format!(
-        "{session_id}-{now}-{}",
-        &generate_session_uuid()?[..8]
-    );
+    let turn_id = format!("{session_id}-{now}-{}", &generate_session_uuid()?[..8]);
     let log_path = turn_logs_dir()?.join(format!("{turn_id}.log"));
     let args = headless_command_args(&claude, &message, SessionRef::New(&session_id));
     let pid = spawn_detached_headless(&binary.path, &args, cwd, &turn_id)?;
@@ -1778,7 +1786,10 @@ pub(crate) fn read_bridge_turn_result(log_path: &Path) -> Option<BridgeTurnResul
         if record.get("type").and_then(Value::as_str) != Some("result") {
             continue;
         }
-        let is_error = record.get("is_error").and_then(Value::as_bool).unwrap_or(false)
+        let is_error = record
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
             || record.get("subtype").and_then(Value::as_str) != Some("success");
         let text = record
             .get("result")
@@ -1789,7 +1800,10 @@ pub(crate) fn read_bridge_turn_result(log_path: &Path) -> Option<BridgeTurnResul
             .unwrap_or_else(|| {
                 format!(
                     "(turn ended with subtype `{}` and no result text)",
-                    record.get("subtype").and_then(Value::as_str).unwrap_or("unknown")
+                    record
+                        .get("subtype")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
                 )
             });
         return Some(BridgeTurnResult { is_error, text });
@@ -2457,8 +2471,7 @@ mod tests {
             return;
         }
 
-        let first =
-            send_user_message(&config, "sess-uid", "one", None, 4000).expect("first reply");
+        let first = send_user_message(&config, "sess-uid", "one", None, 4000).expect("first reply");
         let second =
             send_user_message(&config, "sess-uid", "two", None, 4000).expect("second reply");
         let first_turn = first
@@ -2648,7 +2661,10 @@ mod tests {
         let _guard = crate::state::test_env_lock().lock().expect("env lock");
         let temp = TempDirGuard::new("hook-socket-capture");
         std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
-        std::env::set_var("CLAUDE_CODE_MESSAGING_SOCKET", "/run/user/1000/cc-socks/4242.sock");
+        std::env::set_var(
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "/run/user/1000/cc-socks/4242.sock",
+        );
         let mut payload = std::io::Cursor::new(
             json!({"hook_event_name": "Stop", "session_id": "sess-sock"}).to_string(),
         );
@@ -2703,7 +2719,12 @@ mod tests {
     /// headless resume, which is correct for an idle or closed session.
     #[test]
     fn injection_reports_not_delivered_for_missing_or_stale_socket() {
-        assert!(!inject_into_live_session("/nonexistent/tinyctb.sock", (Some(1), Some("boot".into())), "hi").expect("missing"));
+        assert!(!inject_into_live_session(
+            "/nonexistent/tinyctb.sock",
+            (Some(1), Some("boot".into())),
+            "hi"
+        )
+        .expect("missing"));
 
         let dir = std::env::temp_dir().join(format!("tinyctb-uds-stale-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -2938,7 +2959,10 @@ mod tests {
         let _guard = crate::state::test_env_lock().lock().expect("env lock");
         let temp = TempDirGuard::new("socket-peek-order");
         std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
-        std::env::set_var("CLAUDE_CODE_MESSAGING_SOCKET", "/run/user/1000/cc-socks/77.sock");
+        std::env::set_var(
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "/run/user/1000/cc-socks/77.sock",
+        );
         let conn = create_state_db_in_memory().expect("db");
         let mut payload = std::io::Cursor::new(
             json!({"hook_event_name": "SessionStart", "session_id": "sess-peek"}).to_string(),
@@ -2976,9 +3000,8 @@ mod tests {
             return;
         }
 
-        let result =
-            start_thread_in_cwd(&config, Some("/tmp"), Some("build the thing"), 5000)
-                .expect("start thread");
+        let result = start_thread_in_cwd(&config, Some("/tmp"), Some("build the thing"), 5000)
+            .expect("start thread");
         assert_eq!(result["action"], "new");
         let thread_id = result["threadId"].as_str().expect("threadId");
         assert_eq!(thread_id.len(), 36);

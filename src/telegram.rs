@@ -21,16 +21,16 @@ use crate::state::{
     mark_telegram_command_route_used, observed_workspaces_from_db, record_action,
     record_telegram_inbound_processed, set_setting, set_setting_text,
     set_telegram_current_project_id, telegram_inbound_processed,
-    update_telegram_callback_message_id, BridgeThreadSnapshot, TelegramCallbackAction,
-    TelegramCommandRouteKind, TelegramInboundLogContext,
+    update_telegram_callback_message_id, ApprovalAnswer, BridgeThreadSnapshot,
+    TelegramCallbackAction, TelegramCommandRouteKind, TelegramInboundLogContext,
 };
+#[cfg(test)]
+use crate::ClaudeConfig;
 use crate::{
     daemon_config_path, load_daemon_config, merged_daemon_config, read_daemon_config_raw,
     redacted_daemon_config, resolve_telegram_bot_token, write_daemon_config, DaemonConfig,
     RegisteredProject, TelegramConfig, TelegramSetupOptions,
 };
-#[cfg(test)]
-use crate::ClaudeConfig;
 
 use self::api::{
     telegram_answer_callback_query, telegram_bot_commands, telegram_chat_id,
@@ -84,6 +84,7 @@ pub(crate) struct RoutedTelegramCallback {
     pub(crate) callback_id: String,
     pub(crate) thread_id: String,
     pub(crate) action: TelegramCallbackAction,
+    pub(crate) approval_id: Option<String>,
 }
 
 pub(crate) fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result<Value> {
@@ -469,18 +470,25 @@ pub(crate) fn extract_telegram_callback_route(
     };
     let route = conn
         .query_row(
-            "SELECT thread_id, action FROM telegram_callback_routes
+            "SELECT thread_id, action, approval_id FROM telegram_callback_routes
              WHERE callback_id = ?1 AND used_at IS NULL",
             params![callback_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .optional()?;
-    Ok(route.and_then(|(thread_id, action)| {
+    Ok(route.and_then(|(thread_id, action, approval_id)| {
         TelegramCallbackAction::from_str(&action).map(|action| RoutedTelegramCallback {
             callback_query_id: callback_query_id.to_string(),
             callback_id: callback_id.to_string(),
             thread_id,
             action,
+            approval_id,
         })
     }))
 }
@@ -798,8 +806,7 @@ fn send_claude_reply_to_thread(
             "sentAt": now
         }),
         None => {
-            let result =
-                send_user_message(config, thread_id, &prefixed, cwd_hint.as_deref(), now)?;
+            let result = send_user_message(config, thread_id, &prefixed, cwd_hint.as_deref(), now)?;
             register_bridge_turn_from_result(conn, &result, now)?;
             result
         }
@@ -1141,7 +1148,11 @@ fn execute_threads_command(
         // would be wrong, and a half-delivered snapshot (sent but unroutable)
         // must surface as a real error rather than be swallowed here.
         sent.push(deliver_prepared_telegram_delivery(
-            conn, telegram, &mut prepared, now, timeout,
+            conn,
+            telegram,
+            &mut prepared,
+            now,
+            timeout,
         )?);
     }
 
@@ -1462,6 +1473,57 @@ fn execute_telegram_command_prompt_reply(
     }
 }
 
+/// Turn a tapped button into a decision the blocked PreToolUse hook can read.
+/// The write is conditional on the approval still being unanswered, so a
+/// double tap (or the other button) cannot overturn the first answer.
+fn record_callback_answer(
+    conn: &Connection,
+    route: &RoutedTelegramCallback,
+    now: u64,
+) -> Result<Value> {
+    let Some(approval_id) = route.approval_id.as_deref() else {
+        return Ok(json!({
+            "ok": true,
+            "action": "callback_without_approval",
+            "toast": "这个按钮已经失效了。"
+        }));
+    };
+    let decision = match route.action {
+        TelegramCallbackAction::Approve => "allow",
+        TelegramCallbackAction::ApproveSession => "allow_session",
+        TelegramCallbackAction::Deny => "deny",
+    };
+    let outcome = crate::state::record_approval_decision(conn, approval_id, decision, now)?;
+    let tool_name = crate::state::pending_approval_row(conn, approval_id)?
+        .map(|(_, tool_name, _)| tool_name)
+        .unwrap_or_else(|| "该工具".to_string());
+    // The toast must not claim success for an answer that can no longer take
+    // effect: once the waiting hook has given up, the session has already
+    // fallen back to its own permission prompt.
+    let toast = match outcome {
+        ApprovalAnswer::Recorded => match route.action {
+            TelegramCallbackAction::Approve => "已允许。".to_string(),
+            TelegramCallbackAction::ApproveSession => {
+                format!("已允许，本会话内 {tool_name} 不再询问。")
+            }
+            TelegramCallbackAction::Deny => "已拒绝。".to_string(),
+        },
+        ApprovalAnswer::AlreadyAnswered => "这条请求已经处理过了。".to_string(),
+        ApprovalAnswer::Expired => "这条请求已超时，会话已回到终端等待处理。".to_string(),
+        ApprovalAnswer::Unknown => "这个按钮已经失效了。".to_string(),
+    };
+    Ok(json!({
+        "ok": true,
+        "action": "telegram_approval_answer",
+        "approvalId": approval_id,
+        "threadId": route.thread_id,
+        "decision": decision,
+        "outcome": format!("{outcome:?}"),
+        "recorded": outcome == ApprovalAnswer::Recorded,
+        "toast": toast
+    }))
+}
+
 pub(crate) fn process_telegram_updates(
     conn: &Connection,
     config: &DaemonConfig,
@@ -1646,9 +1708,7 @@ fn process_telegram_update_batch(
                             "message": hint,
                             "eventKey": format!("unrouted-hint:{bot_id}:{discriminator}")
                         });
-                        hinted = crate::state::enqueue_outbound_event(
-                            conn, &event, now, "bridge",
-                        )?;
+                        hinted = crate::state::enqueue_outbound_event(conn, &event, now, "bridge")?;
                     }
                     if let Some(update_id) = update_id {
                         record_telegram_inbound_processed(
@@ -1675,11 +1735,15 @@ fn process_telegram_update_batch(
                     .and_then(Value::as_i64);
                 match extract_telegram_callback_route(conn, callback_query, telegram)? {
                     Some(route) => {
+                        let answer = record_callback_answer(conn, &route, now)?;
                         mark_telegram_callback_route_used(conn, &route.callback_id, now)?;
                         let _ = telegram_answer_callback_query(
                             telegram,
                             &route.callback_query_id,
-                            "Remote approval is not supported for Claude Code. Handle it in the terminal.",
+                            answer
+                                .get("toast")
+                                .and_then(Value::as_str)
+                                .unwrap_or("已收到"),
                             timeout,
                         );
                         if let Some(update_id) = update_id {
@@ -1687,11 +1751,12 @@ fn process_telegram_update_batch(
                                 conn,
                                 bot_id,
                                 update_id,
-                                "callback_query_unsupported",
-                                &json!({ "threadId": route.thread_id }),
+                                "callback_query_answered",
+                                &answer,
                                 TelegramInboundLogContext {
                                     thread_id: Some(&route.thread_id),
                                     route_message_id,
+                                    result_action: answer.get("action").and_then(Value::as_str),
                                     ..TelegramInboundLogContext::default()
                                 },
                                 now,
@@ -1971,8 +2036,8 @@ mod tests {
             return;
         }
 
-        let result = send_claude_reply_to_thread(&conn, &config, "sess-1", "continue", 1000)
-            .expect("reply");
+        let result =
+            send_claude_reply_to_thread(&conn, &config, "sess-1", "continue", 1000).expect("reply");
 
         assert_eq!(result["action"], "telegram_reply");
         assert_eq!(
@@ -1999,7 +2064,9 @@ mod tests {
             "telegram replies must register a bridge turn so its log is watched"
         );
         assert_eq!(turns[0].thread_id, "sess-1");
-        assert!(turns[0].log_path.ends_with(&format!("{}.log", turns[0].turn_id)));
+        assert!(turns[0]
+            .log_path
+            .ends_with(&format!("{}.log", turns[0].turn_id)));
     }
 
     /// A reply to a LIVE session goes in over its socket — no headless
@@ -2061,6 +2128,77 @@ mod tests {
         let parsed: Value = serde_json::from_str(line.trim()).expect("json line");
         assert_eq!(parsed["message"]["content"], "telegram：在跑什么");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The toast the user actually sees for each outcome — the failure this
+    /// covers is a timed-out request reporting "已经处理过了" (or worse,
+    /// "已允许") when the session has already fallen back to its terminal.
+    #[test]
+    fn approval_toasts_tell_the_truth_about_each_outcome() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let route = |action: TelegramCallbackAction, approval_id: &str| RoutedTelegramCallback {
+            callback_query_id: "cq".to_string(),
+            callback_id: "cb".to_string(),
+            thread_id: "sess-toast".to_string(),
+            action,
+            approval_id: Some(approval_id.to_string()),
+        };
+
+        crate::state::create_pending_approval(
+            &conn,
+            "ap-ok",
+            "sess-toast",
+            "Bash",
+            "Bash: ls",
+            1000,
+            9000,
+        )
+        .expect("create");
+        let first = record_callback_answer(
+            &conn,
+            &route(TelegramCallbackAction::Approve, "ap-ok"),
+            2000,
+        )
+        .expect("first tap");
+        assert_eq!(first["outcome"], "Recorded");
+        assert_eq!(first["toast"], "已允许。");
+        let second =
+            record_callback_answer(&conn, &route(TelegramCallbackAction::Deny, "ap-ok"), 2100)
+                .expect("second tap");
+        assert_eq!(second["toast"], "这条请求已经处理过了。");
+
+        // A request the hook gave up on must say so, not "already handled".
+        crate::state::create_pending_approval(
+            &conn,
+            "ap-late",
+            "sess-toast",
+            "Bash",
+            "Bash: ls",
+            1000,
+            9000,
+        )
+        .expect("create");
+        crate::state::expire_or_take_decision(&conn, "ap-late", 9500).expect("expire");
+        let late = record_callback_answer(
+            &conn,
+            &route(TelegramCallbackAction::Approve, "ap-late"),
+            9600,
+        )
+        .expect("late tap");
+        assert_eq!(late["outcome"], "Expired");
+        assert!(
+            late["toast"].as_str().expect("toast").contains("超时"),
+            "a timed-out request must say so: {late}"
+        );
+        assert_eq!(late["recorded"], false);
+
+        let unknown = record_callback_answer(
+            &conn,
+            &route(TelegramCallbackAction::Approve, "ap-missing"),
+            9700,
+        )
+        .expect("unknown");
+        assert_eq!(unknown["outcome"], "Unknown");
     }
 
     #[test]
@@ -2443,6 +2581,7 @@ mod tests {
                 message_id: None,
                 thread_id: "thr_1".to_string(),
                 action: TelegramCallbackAction::Approve,
+                approval_id: None,
             },
             1000,
         )

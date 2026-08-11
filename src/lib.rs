@@ -7,6 +7,7 @@ use std::fs;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod approvals;
 mod claude;
 mod cli;
 mod config;
@@ -31,12 +32,12 @@ use crate::daemon::{
 };
 use crate::hooks::{hooks_status, install_hooks, uninstall_hooks};
 use crate::projects::{build_registered_project, ensure_unique_project_id, slugify_project_token};
+#[cfg(test)]
+use crate::state::{classify_inbox_item, create_state_db_in_memory, BridgeThreadSnapshot};
 use crate::state::{
     create_state_db, list_inbox_from_db, list_waiting_from_db, observed_workspaces_from_db,
     record_action, state_db_path, ObservedWorkspace,
 };
-#[cfg(test)]
-use crate::state::{classify_inbox_item, create_state_db_in_memory, BridgeThreadSnapshot};
 #[cfg(test)]
 use crate::state::{
     deliver_due_outbound_events, enqueue_outbound_event, record_transport_delivery,
@@ -44,13 +45,13 @@ use crate::state::{
 };
 use crate::telegram::{telegram_setup_result, telegram_status_result, telegram_test_result};
 use clap::Parser;
+#[cfg(test)]
+pub(crate) use config::ClaudeConfig;
 pub(crate) use config::{
     daemon_config_path, load_daemon_config, merged_daemon_config, read_daemon_config_raw,
     redacted_daemon_config, resolve_telegram_bot_token, write_daemon_config, DaemonConfig,
     RegisteredProject, SetupOptions, TelegramConfig, TelegramSetupOptions,
 };
-#[cfg(test)]
-pub(crate) use config::ClaudeConfig;
 pub(crate) use state::state_dir_path;
 
 #[derive(Serialize)]
@@ -348,6 +349,16 @@ fn run() -> Result<i32> {
                 ),
             }
         }
+        Commands::ApprovalGate => {
+            // Runs inside Claude Code before every tool call: it must never
+            // break the session, so any failure degrades to "no opinion"
+            // (the normal permission flow) rather than an error.
+            let now = now_millis().unwrap_or(0);
+            let stdin = std::io::stdin();
+            let result =
+                approvals::run_approval_gate(&mut stdin.lock(), now).unwrap_or_else(|_| json!({}));
+            println!("{}", serde_json::to_string(&result)?);
+        }
         Commands::Projects { command } => match command {
             ProjectCommands::List { observed_limit } => {
                 let result = projects_list_result(observed_limit)?;
@@ -405,12 +416,8 @@ fn run() -> Result<i32> {
             } else {
                 let now = now_millis()?;
                 let config = load_daemon_config()?;
-                let result = claude::start_thread_in_cwd(
-                    &config,
-                    cwd.as_deref(),
-                    message.as_deref(),
-                    now,
-                )?;
+                let result =
+                    claude::start_thread_in_cwd(&config, cwd.as_deref(), message.as_deref(), now)?;
                 let db_path = state_db_path()?;
                 let conn = create_state_db(&db_path)?;
                 if let Some(thread_id) = result.get("threadId").and_then(Value::as_str) {
@@ -632,14 +639,16 @@ fn setup_result(options: SetupOptions<'_>) -> Result<Value> {
     // time the daemon starts, so a start failure must not discard the report —
     // it is embedded here and aggregated into the top-level `ok`.
     let daemon_start = if options.start_daemon {
-        Some(match start_daemon_service(options.daemon_label, options.dry_run) {
-            Ok(result) => result,
-            Err(error) => json!({
-                "ok": false,
-                "action": "daemon_start",
-                "error": format!("{error:#}")
-            }),
-        })
+        Some(
+            match start_daemon_service(options.daemon_label, options.dry_run) {
+                Ok(result) => result,
+                Err(error) => json!({
+                    "ok": false,
+                    "action": "daemon_start",
+                    "error": format!("{error:#}")
+                }),
+            },
+        )
     } else {
         None
     };
@@ -1275,7 +1284,9 @@ mod tests {
             state.root.join("config.json").exists(),
             "config must be preserved"
         );
-        let removed = result["removedFiles"].as_array().expect("removedFiles array");
+        let removed = result["removedFiles"]
+            .as_array()
+            .expect("removedFiles array");
         let names = removed.iter().filter_map(Value::as_str).collect::<Vec<_>>();
         assert!(names.contains(&"state.db"));
         assert!(names.contains(&"events/"));
@@ -1292,7 +1303,10 @@ mod tests {
             Some(json!({"ok": true, "action": "daemon_install"})),
             Some(json!({"ok": false, "action": "daemon_start", "error": "boom"})),
         );
-        assert_eq!(report["ok"], false, "failed daemon start must fail the whole setup");
+        assert_eq!(
+            report["ok"], false,
+            "failed daemon start must fail the whole setup"
+        );
         // Install steps that already succeeded stay in the report.
         assert_eq!(report["daemon"]["install"]["ok"], true);
         assert_eq!(report["hooks"]["ok"], true);
@@ -1327,6 +1341,9 @@ mod tests {
             None,
         );
         assert_eq!(report["ok"], true, "no daemon start requested => setup ok");
-        assert!(report["nextStep"].as_str().unwrap().contains("without --dry-run"));
+        assert!(report["nextStep"]
+            .as_str()
+            .unwrap()
+            .contains("without --dry-run"));
     }
 }

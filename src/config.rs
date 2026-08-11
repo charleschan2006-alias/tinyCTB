@@ -28,6 +28,20 @@ pub(crate) struct ClaudeConfig {
     pub(crate) permission_mode: String,
     #[serde(default = "default_session_scan_limit")]
     pub(crate) session_scan_limit: u64,
+    /// Optional narrowing: only these tools are confirmed from Telegram.
+    /// Empty (the default) means every call that would raise a permission
+    /// prompt is offered remotely — `PermissionRequest` only fires when a
+    /// decision is genuinely needed, so there is nothing to filter out.
+    #[serde(default)]
+    pub(crate) approval_tools: Vec<String>,
+    /// How long a tool call waits for an answer before falling back to the
+    /// normal permission flow. Never auto-allows.
+    #[serde(default = "default_approval_timeout_seconds")]
+    pub(crate) approval_timeout_seconds: u64,
+}
+
+fn default_approval_timeout_seconds() -> u64 {
+    300
 }
 
 fn default_permission_mode() -> String {
@@ -43,6 +57,8 @@ impl Default for ClaudeConfig {
         ClaudeConfig {
             permission_mode: default_permission_mode(),
             session_scan_limit: default_session_scan_limit(),
+            approval_tools: Vec::new(),
+            approval_timeout_seconds: default_approval_timeout_seconds(),
         }
     }
 }
@@ -188,7 +204,9 @@ pub(crate) fn redacted_daemon_config(config: &DaemonConfig) -> Value {
         "events": config.events,
         "claude": config.claude.as_ref().map(|claude| json!({
             "permissionMode": claude.permission_mode,
-            "sessionScanLimit": claude.session_scan_limit
+            "sessionScanLimit": claude.session_scan_limit,
+            "approvalTools": claude.approval_tools,
+            "approvalTimeoutSeconds": claude.approval_timeout_seconds
         })),
         "telegram": config.telegram.as_ref().map(|telegram| json!({
             "botToken": "<redacted>",
@@ -254,8 +272,8 @@ mod tests {
 
     impl TempConfigDir {
         fn new(name: &str) -> Self {
-            let root = std::env::temp_dir()
-                .join(format!("tinyctb-config-{name}-{}", std::process::id()));
+            let root =
+                std::env::temp_dir().join(format!("tinyctb-config-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(&root).expect("create temp config dir");
             let previous_state_dir = std::env::var("TINYCTB_STATE_DIR").ok();
@@ -354,6 +372,8 @@ mod tests {
             claude: Some(ClaudeConfig {
                 permission_mode: "yolo".to_string(),
                 session_scan_limit: 50,
+                approval_tools: Vec::new(),
+                approval_timeout_seconds: 300,
             }),
             projects: vec![],
         })

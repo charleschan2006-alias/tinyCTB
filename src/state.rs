@@ -172,19 +172,22 @@ pub(crate) struct TelegramCallbackRoute {
     pub(crate) message_id: Option<i64>,
     pub(crate) thread_id: String,
     pub(crate) action: TelegramCallbackAction,
+    pub(crate) approval_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TelegramCallbackAction {
     Approve,
+    /// Approve and stop asking for this tool in this session.
+    ApproveSession,
     Deny,
 }
 
 impl TelegramCallbackAction {
-    #[allow(dead_code)]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Approve => "approve",
+            Self::ApproveSession => "approve_session",
             Self::Deny => "deny",
         }
     }
@@ -192,6 +195,7 @@ impl TelegramCallbackAction {
     pub(crate) fn from_str(value: &str) -> Option<Self> {
         match value {
             "approve" => Some(Self::Approve),
+            "approve_session" => Some(Self::ApproveSession),
             "deny" => Some(Self::Deny),
             _ => None,
         }
@@ -429,11 +433,25 @@ pub(crate) fn create_state_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.busy_timeout(Duration::from_secs(5))
         .context("failed to set SQLite busy timeout")?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;",
-    )
-    .context("failed to configure SQLite journal mode")?;
+    // Switching to WAL needs a brief exclusive lock, so a second process
+    // opening the database at the same moment (the approval hook and the
+    // daemon do exactly that) gets SQLITE_BUSY. The mode is persistent, so
+    // only set it when it is not already WAL, and treat losing the race as
+    // success — whoever won set the very mode we wanted.
+    let journal_mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap_or_default();
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        // Losing this race is harmless: the database works in either journal
+        // mode, and the connection that won has already set the one we want.
+        // Failing here instead would break the approval hook whenever it
+        // happens to start at the same instant as the daemon.
+        if let Err(error) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
+            eprintln!("tinyctb: could not switch SQLite to WAL ({error}); continuing");
+        }
+    }
+    conn.execute_batch("PRAGMA synchronous=NORMAL;")
+        .context("failed to configure SQLite synchronous mode")?;
     init_state_db(&conn)?;
     Ok(conn)
 }
@@ -472,8 +490,7 @@ fn prune_live_injections(conn: &Connection, now: u64, retention_ms: u64) -> Resu
     for (id, injected_at, claimed_at) in rows {
         let expired = match claimed_at {
             Some(claimed_at) => {
-                now_ms.saturating_sub(timestamp_to_millis(from_sql_i64(claimed_at)?))
-                    > retention_ms
+                now_ms.saturating_sub(timestamp_to_millis(from_sql_i64(claimed_at)?)) > retention_ms
             }
             None => {
                 now_ms.saturating_sub(timestamp_to_millis(from_sql_i64(injected_at)?))
@@ -481,10 +498,7 @@ fn prune_live_injections(conn: &Connection, now: u64, retention_ms: u64) -> Resu
             }
         };
         if expired {
-            removed += conn.execute(
-                "DELETE FROM live_injections WHERE id = ?1",
-                params![id],
-            )?;
+            removed += conn.execute("DELETE FROM live_injections WHERE id = ?1", params![id])?;
         }
     }
     Ok(removed)
@@ -601,6 +615,16 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
           payload_json TEXT NOT NULL,
           created_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS pending_approvals (
+          approval_id TEXT PRIMARY KEY,
+          thread_id TEXT NOT NULL,
+          tool_name TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          decision TEXT,
+          decided_at INTEGER,
+          expires_at INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS live_injections (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           thread_id TEXT NOT NULL,
@@ -637,18 +661,20 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "threads_cache", "socket_inode", "INTEGER")?;
     ensure_column(conn, "threads_cache", "socket_boot_id", "TEXT")?;
     ensure_column(conn, "telegram_command_routes", "payload_json", "TEXT")?;
+    ensure_column(conn, "telegram_callback_routes", "approval_id", "TEXT")?;
+    ensure_column(
+        conn,
+        "pending_approvals",
+        "expires_at",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     ensure_column(
         conn,
         "outbound_events",
         "origin",
         "TEXT NOT NULL DEFAULT 'away'",
     )?;
-    ensure_column(
-        conn,
-        "bridge_turns",
-        "exited",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
+    ensure_column(conn, "bridge_turns", "exited", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "bridge_turns", "exit_code", "INTEGER")?;
     migrate_live_injections(conn)?;
     ensure_column(conn, "bridge_turns", "proc_start", "TEXT")?;
@@ -660,12 +686,7 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "telegram_inbound_log", "route_message_id", "INTEGER")?;
     ensure_column(conn, "telegram_inbound_log", "result_action", "TEXT")?;
     ensure_column(conn, "telegram_inbound_log", "backend_transport", "TEXT")?;
-    ensure_column(
-        conn,
-        "telegram_inbound_log",
-        "backend_pid",
-        "INTEGER",
-    )?;
+    ensure_column(conn, "telegram_inbound_log", "backend_pid", "INTEGER")?;
     Ok(())
 }
 
@@ -725,12 +746,19 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
 
 fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
     let columns = table_columns(conn, table)?;
-    if !columns.iter().any(|current| current == column) {
-        conn.execute_batch(&format!(
-            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
-        ))?;
+    if columns.iter().any(|current| current == column) {
+        return Ok(());
     }
-    Ok(())
+    match conn.execute_batch(&format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+    )) {
+        Ok(()) => Ok(()),
+        // The hook process and the daemon open the database independently and
+        // can migrate at the same moment; losing that race means the column
+        // now exists, which is exactly the desired end state.
+        Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub(crate) fn state_dir_path() -> Result<PathBuf> {
@@ -1795,6 +1823,194 @@ pub(crate) fn mark_bridge_turn_finished(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Remote approvals
+
+/// Writes the away marker the approval gate reads on its fast path, without
+/// needing a database — used by tests to put the gate in "away" mode.
+#[cfg(test)]
+pub(crate) fn write_away_marker_for_test(away: bool) -> Result<()> {
+    let path = remote_mode_status_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, serde_json::to_vec(&json!({ "away": away }))?)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_pending_approval(
+    conn: &Connection,
+    approval_id: &str,
+    thread_id: &str,
+    tool_name: &str,
+    summary: &str,
+    now: u64,
+    expires_at: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO pending_approvals(
+            approval_id, thread_id, tool_name, summary, created_at, decision, decided_at, expires_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)",
+        params![
+            approval_id,
+            thread_id,
+            tool_name,
+            summary,
+            to_sql_i64(now)?,
+            to_sql_i64(expires_at)?
+        ],
+    )?;
+    Ok(())
+}
+
+/// Settles an approval nobody answered in time, as an ATOMIC transition:
+/// either this call marks it expired (returns None), or a tap beat it to the
+/// row by a hair and the decision that actually landed is returned so the
+/// caller can honour it. Without this, the losing side would return "no
+/// opinion" to the session while Telegram had already told the user their
+/// answer was accepted.
+pub(crate) fn expire_or_take_decision(
+    conn: &Connection,
+    approval_id: &str,
+    now: u64,
+) -> Result<Option<String>> {
+    let changed = conn.execute(
+        "UPDATE pending_approvals SET decision = 'expired', decided_at = ?2
+         WHERE approval_id = ?1 AND decision IS NULL",
+        params![approval_id, to_sql_i64(now)?],
+    )?;
+    if changed > 0 {
+        return Ok(None);
+    }
+    // Lost the race (or the row is gone): report whatever is recorded, but
+    // never treat our own "expired" marker as an answer.
+    Ok(approval_decision(conn, approval_id)?.filter(|decision| decision != "expired"))
+}
+
+pub(crate) fn approval_decision(conn: &Connection, approval_id: &str) -> Result<Option<String>> {
+    let decision: Option<Option<String>> = conn
+        .query_row(
+            "SELECT decision FROM pending_approvals WHERE approval_id = ?1",
+            params![approval_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(decision.flatten())
+}
+
+/// The outcome of tapping a button, so the toast can tell the truth instead
+/// of claiming success for an answer that arrived too late.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovalAnswer {
+    Recorded,
+    AlreadyAnswered,
+    Expired,
+    Unknown,
+}
+
+/// Records the answer only if the approval is still unanswered AND still
+/// within its deadline: the waiting hook gives up at that deadline, so an
+/// answer after it cannot reach the session no matter what we store.
+pub(crate) fn record_approval_decision(
+    conn: &Connection,
+    approval_id: &str,
+    decision: &str,
+    now: u64,
+) -> Result<ApprovalAnswer> {
+    let row: Option<(Option<String>, i64)> = conn
+        .query_row(
+            "SELECT decision, expires_at FROM pending_approvals WHERE approval_id = ?1",
+            params![approval_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((existing, expires_at)) = row else {
+        return Ok(ApprovalAnswer::Unknown);
+    };
+    // An expired record is settled too, but the user must be told which kind
+    // of "settled" it is: the session has already fallen back to its own
+    // prompt, so "already answered" would be misleading.
+    match existing.as_deref() {
+        Some("expired") => return Ok(ApprovalAnswer::Expired),
+        Some(_) => return Ok(ApprovalAnswer::AlreadyAnswered),
+        None => {}
+    }
+    let expires_at = from_sql_i64(expires_at)?;
+    if expires_at > 0 && timestamp_to_millis(now) > timestamp_to_millis(expires_at) {
+        // Past the deadline the waiting hook has already given up, so record
+        // the expiry rather than an answer that can no longer be delivered.
+        conn.execute(
+            "UPDATE pending_approvals SET decision = 'expired', decided_at = ?2
+             WHERE approval_id = ?1 AND decision IS NULL",
+            params![approval_id, to_sql_i64(now)?],
+        )?;
+        return Ok(ApprovalAnswer::Expired);
+    }
+    let changed = conn.execute(
+        "UPDATE pending_approvals SET decision = ?2, decided_at = ?3
+         WHERE approval_id = ?1 AND decision IS NULL",
+        params![approval_id, decision, to_sql_i64(now)?],
+    )?;
+    if changed > 0 {
+        return Ok(ApprovalAnswer::Recorded);
+    }
+    // The row was settled between the read above and this update — most
+    // likely by the waiting hook giving up. Classify from the state that
+    // actually landed, or the user would be told "already handled" when the
+    // truth is "timed out, your session is back at the terminal".
+    settled_answer_kind(conn, approval_id)
+}
+
+/// How a row that could not be updated ended up settled.
+fn settled_answer_kind(conn: &Connection, approval_id: &str) -> Result<ApprovalAnswer> {
+    Ok(match approval_decision(conn, approval_id)?.as_deref() {
+        Some("expired") => ApprovalAnswer::Expired,
+        Some(_) => ApprovalAnswer::AlreadyAnswered,
+        None => ApprovalAnswer::Unknown,
+    })
+}
+
+pub(crate) fn pending_approval_row(
+    conn: &Connection,
+    approval_id: &str,
+) -> Result<Option<(String, String, String)>> {
+    conn.query_row(
+        "SELECT thread_id, tool_name, summary FROM pending_approvals WHERE approval_id = ?1",
+        params![approval_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn approval_auto_allow_key(thread_id: &str, tool_name: &str) -> String {
+    format!("approval_auto_allow:{thread_id}:{tool_name}")
+}
+
+/// "Allow this tool for the rest of the session" — without it an agent doing
+/// many Bash calls would need one Telegram tap per call.
+pub(crate) fn set_approval_auto_allow(
+    conn: &Connection,
+    thread_id: &str,
+    tool_name: &str,
+    now: u64,
+) -> Result<()> {
+    set_setting_text(
+        conn,
+        &approval_auto_allow_key(thread_id, tool_name),
+        &now.to_string(),
+    )
+}
+
+pub(crate) fn approval_auto_allowed(
+    conn: &Connection,
+    thread_id: &str,
+    tool_name: &str,
+) -> Result<bool> {
+    Ok(get_setting_text(conn, &approval_auto_allow_key(thread_id, tool_name))?.is_some())
+}
+
 pub(crate) fn telegram_current_project_key(chat_id: &str, user_id: Option<&str>) -> String {
     format!(
         "telegram_current_project:{}:{}",
@@ -1926,22 +2142,22 @@ pub(crate) fn insert_telegram_message_route(
     Ok(())
 }
 
-#[allow(dead_code)]
 pub(crate) fn insert_telegram_callback_route(
     conn: &Connection,
     route: &TelegramCallbackRoute,
     now: u64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO telegram_callback_routes(callback_id, chat_id, message_id, thread_id, action, created_at, used_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+        "INSERT OR REPLACE INTO telegram_callback_routes(callback_id, chat_id, message_id, thread_id, action, created_at, used_at, approval_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
         params![
             route.callback_id,
             route.chat_id,
             route.message_id,
             route.thread_id,
             route.action.as_str(),
-            to_sql_i64(now)?
+            to_sql_i64(now)?,
+            route.approval_id
         ],
     )?;
     Ok(())
@@ -2440,10 +2656,8 @@ mod tests {
 
     #[test]
     fn create_state_db_migrates_legacy_telegram_inbound_log_columns() {
-        let path = std::env::temp_dir().join(format!(
-            "tinyctb-inbound-migrate-{}.db",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("tinyctb-inbound-migrate-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         {
             let conn = Connection::open(&path).expect("open legacy db");
@@ -2546,6 +2760,7 @@ mod tests {
                 message_id: None,
                 thread_id: "thr_approval".to_string(),
                 action: TelegramCallbackAction::Deny,
+                approval_id: None,
             },
             1000,
         )
