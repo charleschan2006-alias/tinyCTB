@@ -561,6 +561,22 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
           payload_json TEXT NOT NULL,
           created_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS bridge_turns (
+          turn_id TEXT PRIMARY KEY,
+          thread_id TEXT NOT NULL,
+          log_path TEXT NOT NULL,
+          pid INTEGER,
+          started_at INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          completed_at INTEGER,
+          exited INTEGER NOT NULL DEFAULT 0,
+          exit_code INTEGER,
+          proc_start TEXT,
+          proc_exe TEXT,
+          pgid INTEGER,
+          proc_start_ticks TEXT,
+          boot_id TEXT
+        );
         ",
     )?;
     ensure_column(
@@ -578,6 +594,18 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
         "origin",
         "TEXT NOT NULL DEFAULT 'away'",
     )?;
+    ensure_column(
+        conn,
+        "bridge_turns",
+        "exited",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(conn, "bridge_turns", "exit_code", "INTEGER")?;
+    ensure_column(conn, "bridge_turns", "proc_start", "TEXT")?;
+    ensure_column(conn, "bridge_turns", "proc_exe", "TEXT")?;
+    ensure_column(conn, "bridge_turns", "pgid", "INTEGER")?;
+    ensure_column(conn, "bridge_turns", "proc_start_ticks", "TEXT")?;
+    ensure_column(conn, "bridge_turns", "boot_id", "TEXT")?;
     ensure_column(conn, "telegram_inbound_log", "thread_id", "TEXT")?;
     ensure_column(conn, "telegram_inbound_log", "route_message_id", "INTEGER")?;
     ensure_column(conn, "telegram_inbound_log", "result_action", "TEXT")?;
@@ -924,13 +952,10 @@ pub(crate) fn reconcile_thread_snapshots(
         upsert_thread_snapshot(conn, snapshot, now)?;
         threads.push(thread_snapshot_json(snapshot));
 
-        // Bridge-initiated turns bypass the away gate entirely: their answer
-        // was promised to Telegram, so the event must be generated even while
-        // the user is present (and regardless of the away start window).
-        let bridge_pending = bridge_turn_pending(conn, &snapshot.thread_id, now)?;
-        if !bridge_pending
-            && (!away || !should_emit_for_away_window(away_started_at, snapshot.updated_at))
-        {
+        // Hook events drive away notifications only. Answers to
+        // bridge-initiated turns are delivered from their own turn logs
+        // (see bridge_turns), not attributed from Stop hooks.
+        if !away || !should_emit_for_away_window(away_started_at, snapshot.updated_at) {
             continue;
         }
 
@@ -1382,76 +1407,155 @@ pub(crate) fn archive_result(dry_run: bool, results: Vec<Value>) -> Value {
     })
 }
 
-/// Marker for turns started from the bridge (Telegram reply or /new). Their
-/// answers are always pushed back to Telegram, away mode or not — the user
-/// explicitly asked from there and was promised the answer there. The marker
-/// counts outstanding turns (concurrent replies to the same session each add
-/// one); each enqueued completion consumes one. The TTL only guards against
-/// stale markers from turns that never complete (crashed claude process).
-pub(crate) const BRIDGE_TURN_TTL_MS: u64 = 12 * 60 * 60 * 1000;
-
-fn bridge_turn_key(thread_id: &str) -> String {
-    format!("bridge_turn:{thread_id}")
+/// A turn started from the bridge (Telegram reply or /new). Its answer is
+/// read from the turn's own log file (`claude -p --output-format json` writes
+/// the result there), which binds the answer to exactly this turn — Stop
+/// hooks cannot attribute an answer when the target session is also active
+/// elsewhere (a busy agent session's own turn once got pushed as "the
+/// answer" while the real one queued for 19 minutes and was then dropped).
+#[derive(Debug, Clone)]
+pub(crate) struct BridgeTurn {
+    pub(crate) turn_id: String,
+    pub(crate) thread_id: String,
+    pub(crate) log_path: String,
+    pub(crate) pid: Option<u32>,
+    pub(crate) started_at: u64,
+    /// The daemon reaped this child and it is definitely gone (authoritative,
+    /// unlike `kill -0` which zombies and PID reuse can fool).
+    pub(crate) exited: bool,
+    pub(crate) exit_code: Option<i32>,
+    /// Restart-kill identity (Linux only): process group + starttime ticks
+    /// (/proc/<pid>/stat, exec-invariant, unique per PID incarnation) scoped
+    /// by boot_id. All three must match or the kill is refused. The DB also
+    /// stores proc_start/proc_exe for forensics, but they take no part in
+    /// the decision (unreachable on macOS, racy across exec on Linux).
+    pub(crate) pgid: Option<u32>,
+    pub(crate) proc_start_ticks: Option<String>,
+    pub(crate) boot_id: Option<String>,
 }
 
-/// (outstanding count, last marked_at). Expired or malformed markers are
-/// removed and read as absent.
-fn bridge_turn_state(conn: &Connection, thread_id: &str, now: u64) -> Result<Option<(u64, u64)>> {
-    let key = bridge_turn_key(thread_id);
-    let Some(raw) = get_setting_text(conn, &key)? else {
-        return Ok(None);
-    };
-    let state = serde_json::from_str::<Value>(&raw)
-        .ok()
-        .and_then(|value| {
-            if let Some(marked_at) = value.as_u64() {
-                // Legacy format: a bare start timestamp = one outstanding turn.
-                return Some((1, marked_at));
-            }
-            Some((
-                value.get("count")?.as_u64()?,
-                value.get("markedAt")?.as_u64()?,
-            ))
-        });
-    match state {
-        Some((count, marked_at))
-            if count > 0 && now.saturating_sub(marked_at) <= BRIDGE_TURN_TTL_MS =>
-        {
-            Ok(Some((count, marked_at)))
-        }
-        _ => {
-            delete_setting(conn, &key)?;
-            Ok(None)
-        }
-    }
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn register_bridge_turn(
+    conn: &Connection,
+    turn_id: &str,
+    thread_id: &str,
+    log_path: &str,
+    pid: Option<u32>,
+    proc_start: Option<&str>,
+    proc_exe: Option<&str>,
+    pgid: Option<u32>,
+    proc_start_ticks: Option<&str>,
+    boot_id: Option<&str>,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO bridge_turns(turn_id, thread_id, log_path, pid, started_at, status, completed_at, exited, exit_code, proc_start, proc_exe, pgid, proc_start_ticks, boot_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'running', NULL, 0, NULL, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            turn_id,
+            thread_id,
+            log_path,
+            pid.map(i64::from),
+            to_sql_i64(now)?,
+            proc_start,
+            proc_exe,
+            pgid.map(i64::from),
+            proc_start_ticks,
+            boot_id
+        ],
+    )?;
+    Ok(())
 }
 
-pub(crate) fn mark_bridge_turn(conn: &Connection, thread_id: &str, now: u64) -> Result<()> {
-    let count = bridge_turn_state(conn, thread_id, now)?
-        .map(|(count, _)| count)
-        .unwrap_or(0);
-    set_setting_text(
-        conn,
-        &bridge_turn_key(thread_id),
-        &json!({ "count": count + 1, "markedAt": now }).to_string(),
-    )
+pub(crate) fn list_running_bridge_turns(conn: &Connection) -> Result<Vec<BridgeTurn>> {
+    let mut stmt = conn.prepare(
+        "SELECT turn_id, thread_id, log_path, pid, started_at, exited, exit_code,
+                pgid, proc_start_ticks, boot_id
+         FROM bridge_turns WHERE status = 'running' ORDER BY started_at ASC",
+    )?;
+    type BridgeTurnRow = (
+        String,
+        String,
+        String,
+        Option<i64>,
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows = stmt.query_map([], |row| {
+        Ok::<BridgeTurnRow, rusqlite::Error>((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+            row.get(9)?,
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(
+            |(
+                turn_id,
+                thread_id,
+                log_path,
+                pid,
+                started_at,
+                exited,
+                exit_code,
+                pgid,
+                proc_start_ticks,
+                boot_id,
+            )| {
+                Ok(BridgeTurn {
+                    turn_id,
+                    thread_id,
+                    log_path,
+                    pid: pid.and_then(|value| u32::try_from(value).ok()),
+                    started_at: from_sql_i64(started_at)?,
+                    exited: exited != 0,
+                    exit_code: exit_code.and_then(|value| i32::try_from(value).ok()),
+                    pgid: pgid.and_then(|value| u32::try_from(value).ok()),
+                    proc_start_ticks,
+                    boot_id,
+                })
+            },
+        )
+        .collect()
 }
 
-pub(crate) fn bridge_turn_pending(conn: &Connection, thread_id: &str, now: u64) -> Result<bool> {
-    Ok(bridge_turn_state(conn, thread_id, now)?.is_some())
+/// Record that a spawned turn process was reaped by the daemon.
+pub(crate) fn record_bridge_turn_exit(
+    conn: &Connection,
+    pid: u32,
+    exit_code: Option<i32>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE bridge_turns SET exited = 1, exit_code = ?2
+         WHERE pid = ?1 AND status = 'running'",
+        params![i64::from(pid), exit_code],
+    )?;
+    Ok(())
 }
 
-/// Consume one outstanding turn (its answer has been enqueued).
-pub(crate) fn consume_bridge_turn(conn: &Connection, thread_id: &str, now: u64) -> Result<()> {
-    match bridge_turn_state(conn, thread_id, now)? {
-        Some((count, marked_at)) if count > 1 => set_setting_text(
-            conn,
-            &bridge_turn_key(thread_id),
-            &json!({ "count": count - 1, "markedAt": marked_at }).to_string(),
-        ),
-        Some(_) => delete_setting(conn, &bridge_turn_key(thread_id)),
-        None => Ok(()),
-    }
+pub(crate) fn mark_bridge_turn_finished(
+    conn: &Connection,
+    turn_id: &str,
+    status: &str,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE bridge_turns SET status = ?2, completed_at = ?3 WHERE turn_id = ?1",
+        params![turn_id, status, to_sql_i64(now)?],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn telegram_current_project_key(chat_id: &str, user_id: Option<&str>) -> String {

@@ -37,6 +37,7 @@ fn telegram_event_title(event_type: &str, event: &Value) -> &'static str {
         "thread_completed" => "✅ Claude finished",
         "thread_status_changed" => "🔄 Claude changed",
         "thread_error" => "⚠️ Bridge error",
+        "bridge_notice" => "ℹ️ tinyCTB",
         _ => "🧵 Claude update",
     }
 }
@@ -404,7 +405,7 @@ fn telegram_backend_status_line() -> String {
     }
 }
 
-fn trim_for_telegram_line(value: &str, max_chars: usize) -> String {
+pub(crate) fn trim_for_telegram_line(value: &str, max_chars: usize) -> String {
     let mut trimmed = value.trim().replace('\n', " ");
     if trimmed.chars().count() <= max_chars {
         return trimmed;

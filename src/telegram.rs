@@ -17,7 +17,7 @@ use crate::state::{
     delete_setting, get_setting_number, get_telegram_current_project_id,
     insert_telegram_command_route, insert_telegram_message_route,
     list_recent_thread_snapshots_from_db, lookup_telegram_command_route,
-    lookup_telegram_message_route, mark_bridge_turn, mark_telegram_callback_route_used,
+    lookup_telegram_message_route, mark_telegram_callback_route_used,
     mark_telegram_command_route_used, observed_workspaces_from_db, record_action,
     record_telegram_inbound_processed, set_setting, set_setting_text,
     set_telegram_current_project_id, telegram_inbound_processed,
@@ -554,6 +554,65 @@ fn send_recent_thread_snapshot(
     deliver_prepared_telegram_delivery(conn, telegram, &mut prepared, now, timeout)
 }
 
+/// Feedback for an authorized message that matched no route. Plain text never
+/// reaches a session on its own — say so loudly instead of dropping it.
+fn unrouted_message_hint_text(message: &Value) -> String {
+    match message
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        Some(text) => format!(
+            "This message isn't routed to any Claude session, so nothing happened.\n\nTo continue a session: use Telegram's Reply action on one of its messages (list them with /threads).\nTo start a new session with it, send:\n/new {}",
+            render::trim_for_telegram_line(text, 200)
+        ),
+        None => "Only text messages can reach Claude sessions. Use /threads to list sessions, or /new <prompt> to start one.".to_string(),
+    }
+}
+
+/// Register a spawned headless turn so the daemon watches its log for the
+/// answer (see `process_bridge_turns`). Answers to bridge-initiated turns are
+/// always pushed back, away mode or not.
+fn register_bridge_turn_from_result(conn: &Connection, result: &Value, now: u64) -> Result<()> {
+    let thread_id = result
+        .get("threadId")
+        .and_then(Value::as_str)
+        .context("headless turn result missing threadId")?;
+    let turn_id = result
+        .pointer("/claude/turnId")
+        .and_then(Value::as_str)
+        .context("headless turn result missing claude.turnId")?;
+    let log_path = result
+        .pointer("/claude/logPath")
+        .and_then(Value::as_str)
+        .context("headless turn result missing claude.logPath")?;
+    let pid = result
+        .pointer("/claude/pid")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    crate::state::register_bridge_turn(
+        conn,
+        turn_id,
+        thread_id,
+        log_path,
+        pid,
+        result.pointer("/claude/procStart").and_then(Value::as_str),
+        // The RESOLVED executable of the spawned process (/proc/<pid>/exe),
+        // not the configured binary path — restart-kill compares it exactly.
+        result.pointer("/claude/procExe").and_then(Value::as_str),
+        result
+            .pointer("/claude/pgid")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
+        result
+            .pointer("/claude/procStartTicks")
+            .and_then(Value::as_str),
+        result.pointer("/claude/procBootId").and_then(Value::as_str),
+        now,
+    )
+}
+
 fn telegram_typing_key(chat_id: &str, thread_id: &str) -> String {
     format!("telegram_typing:{chat_id}:{thread_id}")
 }
@@ -575,6 +634,28 @@ fn register_telegram_typing_indicator(
         })
         .to_string(),
     )
+}
+
+/// Keep an existing typing indicator alive without resetting its send cadence
+/// (used every daemon cycle while a bridge turn is queued or running, so long
+/// waits stay visible in the chat). Registers a fresh one if none exists.
+pub(crate) fn extend_telegram_typing_indicator(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    thread_id: &str,
+    now: u64,
+) -> Result<()> {
+    let key = telegram_typing_key(&telegram.chat_id, thread_id);
+    let Some(raw) = crate::state::get_setting_text(conn, &key)? else {
+        return register_telegram_typing_indicator(conn, telegram, thread_id, now);
+    };
+    let Ok(mut value) = serde_json::from_str::<Value>(&raw) else {
+        return register_telegram_typing_indicator(conn, telegram, thread_id, now);
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("until".to_string(), json!(now + TELEGRAM_TYPING_TTL_MS));
+    }
+    set_setting_text(conn, &key, &value.to_string())
 }
 
 pub(crate) fn refresh_telegram_typing_indicators(
@@ -686,9 +767,11 @@ fn send_claude_reply_to_thread(
         )
         .optional()?
         .flatten();
-    let result = send_user_message(config, thread_id, message, cwd_hint.as_deref(), now)?;
-    // Answers to bridge-initiated turns are pushed back regardless of away mode.
-    mark_bridge_turn(conn, thread_id, now)?;
+    // The `telegram：` prefix makes remote-injected messages recognizable in
+    // the session transcript (and tells the model the user is on the phone).
+    let prefixed = format!("telegram：{message}");
+    let result = send_user_message(config, thread_id, &prefixed, cwd_hint.as_deref(), now)?;
+    register_bridge_turn_from_result(conn, &result, now)?;
     record_action(
         conn,
         thread_id,
@@ -745,8 +828,7 @@ fn start_new_thread_from_telegram(
         .and_then(Value::as_str)
         .context("new Claude session result missing threadId")?
         .to_string();
-    // Answers to bridge-initiated turns are pushed back regardless of away mode.
-    mark_bridge_turn(conn, &thread_id, now)?;
+    register_bridge_turn_from_result(conn, &result, now)?;
     record_action(
         conn,
         &thread_id,
@@ -1477,13 +1559,42 @@ fn process_telegram_update_batch(
                     }
                     commands += 1;
                 } else {
+                    // A message we cannot route must not vanish silently: the
+                    // user typed it expecting an answer. The hint goes through
+                    // the persistent outbox so a transient Telegram failure
+                    // retries with backoff instead of dropping it.
+                    let mut hinted = false;
+                    if telegram_authorized(
+                        telegram,
+                        telegram_chat_id(message).as_deref(),
+                        telegram_from_user_id(message).as_deref(),
+                    ) {
+                        let hint = unrouted_message_hint_text(message);
+                        let discriminator = update_id
+                            .map(|update_id| update_id.to_string())
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "{now}-{}",
+                                    telegram_message_id(message).unwrap_or_default()
+                                )
+                            });
+                        let event = json!({
+                            "type": "bridge_notice",
+                            "observedAt": now,
+                            "message": hint,
+                            "eventKey": format!("unrouted-hint:{bot_id}:{discriminator}")
+                        });
+                        hinted = crate::state::enqueue_outbound_event(
+                            conn, &event, now, "bridge",
+                        )?;
+                    }
                     if let Some(update_id) = update_id {
                         record_telegram_inbound_processed(
                             conn,
                             bot_id,
                             update_id,
                             "message_ignored",
-                            &json!({ "ignored": true }),
+                            &json!({ "ignored": true, "hinted": hinted }),
                             TelegramInboundLogContext {
                                 route_message_id,
                                 ..TelegramInboundLogContext::default()
@@ -1816,9 +1927,17 @@ mod tests {
         assert!(args.contains(&"--resume".to_string()));
         assert!(args.contains(&"sess-1".to_string()));
         assert!(
-            crate::state::bridge_turn_pending(&conn, "sess-1", 1500).expect("bridge marker"),
-            "telegram replies must mark the turn so its answer is pushed back even when not away"
+            args.contains(&"telegram：continue".to_string()),
+            "telegram replies must be prefixed in the session transcript: {args:?}"
         );
+        let turns = crate::state::list_running_bridge_turns(&conn).expect("bridge turns");
+        assert_eq!(
+            turns.len(),
+            1,
+            "telegram replies must register a bridge turn so its log is watched"
+        );
+        assert_eq!(turns[0].thread_id, "sess-1");
+        assert!(turns[0].log_path.ends_with(&format!("{}.log", turns[0].turn_id)));
     }
 
     #[test]
@@ -1998,6 +2117,96 @@ mod tests {
         .expect("second batch");
         assert_eq!(second["duplicate"], 2);
         assert_eq!(second["failed"], 0);
+    }
+
+    /// A plain text message ("麻将的训练进度如何了？") matches no route; it must
+    /// get a loud hint back instead of vanishing silently.
+    #[test]
+    fn unrouted_plain_text_gets_a_routing_hint() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let config = test_daemon_config();
+        let telegram = config.telegram.clone().expect("telegram");
+        let bot_id = telegram_bot_id(&telegram.bot_token);
+        let key = format!("telegram_offset:{bot_id}");
+        let updates = vec![
+            json!({
+                "update_id": 1,
+                "message": {
+                    "message_id": 10,
+                    "chat": { "id": "456" },
+                    "from": { "id": "789" },
+                    "text": "麻将的训练进度如何了？"
+                }
+            }),
+            // Unauthorized chat: stays silent (no hint leaks to strangers).
+            json!({
+                "update_id": 2,
+                "message": {
+                    "message_id": 11,
+                    "chat": { "id": "999" },
+                    "from": { "id": "789" },
+                    "text": "hello"
+                }
+            }),
+        ];
+
+        let result = process_telegram_update_batch(
+            &conn,
+            &config,
+            &telegram,
+            &bot_id,
+            &key,
+            &updates,
+            0,
+            Duration::from_secs(1),
+            None,
+        )
+        .expect("batch");
+        assert_eq!(result["ignored"], 2);
+        // The hint sits in the persistent outbox (retry/backoff on transient
+        // Telegram failures) rather than being fired-and-forgotten.
+        assert_eq!(
+            crate::state::pending_outbound_count(&conn).expect("pending"),
+            1
+        );
+        let payload: String = conn
+            .query_row("SELECT payload_json FROM outbound_events", [], |row| {
+                row.get(0)
+            })
+            .expect("hint row");
+        assert!(payload.contains("isn't routed"), "payload: {payload}");
+
+        let hinted: Vec<Option<bool>> = [1i64, 2]
+            .iter()
+            .map(|update_id| {
+                let raw: String = conn
+                    .query_row(
+                        "SELECT result_json FROM telegram_inbound_log
+                         WHERE bot_id = ?1 AND update_id = ?2",
+                        rusqlite::params![bot_id, update_id],
+                        |row| row.get(0),
+                    )
+                    .expect("log row");
+                serde_json::from_str::<Value>(&raw)
+                    .expect("log json")
+                    .get("hinted")
+                    .and_then(Value::as_bool)
+            })
+            .collect();
+        assert_eq!(
+            hinted[0],
+            Some(true),
+            "authorized unrouted text must be answered with a hint"
+        );
+        assert_eq!(
+            hinted[1],
+            Some(false),
+            "unauthorized chats must not receive hints"
+        );
+
+        let hint = unrouted_message_hint_text(&updates[0]["message"]);
+        assert!(hint.contains("/new 麻将的训练进度如何了？"));
+        assert!(hint.contains("Reply action"));
     }
 
     #[test]

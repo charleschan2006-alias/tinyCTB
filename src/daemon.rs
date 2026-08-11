@@ -11,18 +11,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::claude::{
-    filter_watch_events, parse_event_filter, start_claude_watch_receiver,
-    sync_state_from_sessions, watch_events_from_sync_result, watch_thread_error_event,
+    filter_watch_events, parse_event_filter, read_bridge_turn_result,
+    start_claude_watch_receiver, sync_state_from_sessions, turn_log_tail,
+    watch_events_from_sync_result, watch_thread_error_event,
 };
 use crate::state::{
-    bridge_turn_pending, consume_bridge_turn, create_state_db, delete_setting,
-    deliver_due_outbound_events, enqueue_outbound_event, get_setting_text, pending_outbound_count,
-    prune_state_logs, record_transport_delivery, set_setting_text, should_emit_for_away_window,
-    state_db_path, transport_delivery_exists, OutboxDeliverySummary,
+    create_state_db, delete_setting, deliver_due_outbound_events, enqueue_outbound_event,
+    get_setting_text, list_running_bridge_turns, mark_bridge_turn_finished,
+    pending_outbound_count, prune_state_logs, record_transport_delivery, set_setting_text,
+    should_emit_for_away_window, state_db_path, transport_delivery_exists, BridgeTurn,
+    OutboxDeliverySummary,
 };
 use crate::telegram::{
-    deliver_telegram_event, process_telegram_updates, refresh_telegram_typing_indicators,
-    telegram_set_my_commands,
+    deliver_telegram_event, extend_telegram_typing_indicator, process_telegram_updates,
+    refresh_telegram_typing_indicators, telegram_set_my_commands,
 };
 use crate::{
     daemon_config_path, load_daemon_config, notification_event_id, now_millis, shell_quote,
@@ -137,30 +139,212 @@ pub(crate) fn enqueue_daemon_notification_events(
 ) -> Result<usize> {
     let mut enqueued = 0usize;
     for event in events {
-        // Turns started from the bridge (Telegram reply / /new) always report
-        // back, away mode or not: the user asked from Telegram and the
-        // confirmation promised the answer there.
-        let thread_id = crate::event_thread_id(event);
-        let bridge = match thread_id.as_deref() {
-            Some(thread_id) => bridge_turn_pending(conn, thread_id, now)?,
-            None => false,
-        };
-        if !bridge && !should_enqueue_away_notification(conn, event)? {
-            continue;
-        }
-        if enqueue_outbound_event(conn, event, now, if bridge { "bridge" } else { "away" })? {
+        if should_enqueue_away_notification(conn, event)?
+            && enqueue_outbound_event(conn, event, now, "away")?
+        {
             enqueued += 1;
-            // Each enqueued completion consumes one outstanding turn.
-            // thread_waiting keeps the marker: the turn is still running and
-            // its completion is still owed.
-            if bridge && event.get("type").and_then(Value::as_str) == Some("thread_completed") {
-                if let Some(thread_id) = thread_id.as_deref() {
-                    consume_bridge_turn(conn, thread_id, now)?;
+        }
+    }
+    Ok(enqueued)
+}
+
+const BRIDGE_TURN_FAILURE_GRACE_MS: u64 = 10_000;
+/// Absolute backstop: after a daemon restart the child handle is lost and PID
+/// reuse can make `kill -0` claim a dead turn is alive forever.
+const BRIDGE_TURN_MAX_RUNTIME_MS: u64 = 6 * 60 * 60 * 1000;
+
+fn bridge_turn_process_alive(pid: Option<u32>) -> bool {
+    let Some(pid) = pid.filter(|pid| *pid > 0) else {
+        return false;
+    };
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Thread context for rendering a bridge-turn message (display name, project).
+fn bridge_turn_thread_json(conn: &Connection, turn: &BridgeTurn, preview: &str) -> Result<Value> {
+    use rusqlite::OptionalExtension;
+    let (name, cwd): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT name, cwd FROM threads_cache WHERE thread_id = ?1",
+            rusqlite::params![turn.thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or((None, None));
+    let project = crate::projects::derive_project_label(cwd.as_deref());
+    let display_name = crate::state::derive_thread_display_name(
+        name.as_deref(),
+        project.as_deref(),
+        None,
+        &turn.thread_id,
+    );
+    Ok(json!({
+        "threadId": turn.thread_id,
+        "name": name,
+        "displayName": display_name,
+        "project": project,
+        "cwd": cwd,
+        "lastPreview": preview
+    }))
+}
+
+/// Deliver answers of bridge-initiated turns from their own turn logs.
+/// This is attribution by construction: the log is this turn's output, so a
+/// concurrently active session cannot mislabel its own Stop as the answer.
+/// Pushes bypass away gating and the events filter (origin 'bridge').
+pub(crate) fn process_bridge_turns(
+    conn: &Connection,
+    config: &DaemonConfig,
+    now: u64,
+) -> Result<Value> {
+    // Reap finished children first: this prevents zombies (which would fool
+    // `kill -0`) and records authoritative exit facts for crash detection.
+    for (pid, exit_code) in crate::claude::reap_finished_turn_processes() {
+        crate::state::record_bridge_turn_exit(conn, pid, exit_code)?;
+    }
+    let turns = list_running_bridge_turns(conn)?;
+    let mut answered = 0usize;
+    let mut failed = 0usize;
+    let mut running = 0usize;
+    for turn in turns {
+        let log_path = std::path::PathBuf::from(&turn.log_path);
+        match read_bridge_turn_result(&log_path) {
+            Some(result) => {
+                // While away, the sync pass may have already enqueued this
+                // very completion (Stop hook) — possibly in an EARLIER cycle:
+                // the Stop can wake the daemon before the result JSON hits the
+                // log. So the window is "since this turn started", and the
+                // check is bound to the ANSWER CONTENT, not just the session:
+                // a terminal Stop or another concurrent reply must never make
+                // this turn's distinct answer get dropped.
+                let already_pushed_by_away: bool = {
+                    let mut stmt = conn.prepare(
+                        "SELECT payload_json FROM outbound_events
+                         WHERE thread_id = ?1 AND event_type = 'thread_completed'
+                           AND origin = 'away' AND created_at >= ?2",
+                    )?;
+                    let payloads = stmt
+                        .query_map(
+                            rusqlite::params![turn.thread_id, turn.started_at as i64],
+                            |row| row.get::<_, String>(0),
+                        )?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    let answer = result.text.trim();
+                    payloads
+                        .iter()
+                        .filter_map(|raw| serde_json::from_str::<Value>(raw).ok())
+                        .filter_map(|payload| {
+                            payload
+                                .get("lastPreview")
+                                .and_then(Value::as_str)
+                                .map(|preview| preview.trim().to_string())
+                        })
+                        // The away preview may be a truncated prefix of the
+                        // full result text.
+                        .any(|preview| {
+                            !preview.is_empty()
+                                && (preview == answer || answer.starts_with(&preview))
+                        })
+                };
+                if !already_pushed_by_away {
+                    let preview = if result.is_error {
+                        format!("⚠️ The turn ended with an error:\n{}", result.text)
+                    } else {
+                        result.text.clone()
+                    };
+                    let event = json!({
+                        "type": "thread_completed",
+                        "threadId": turn.thread_id,
+                        "eventUid": turn.turn_id,
+                        "updatedAt": now,
+                        "lastPreview": preview,
+                        "eventKey": format!("bridge-turn-result:{}", turn.turn_id),
+                        "thread": bridge_turn_thread_json(conn, &turn, &preview)?
+                    });
+                    enqueue_outbound_event(conn, &event, now, "bridge")?;
+                }
+                mark_bridge_turn_finished(
+                    conn,
+                    &turn.turn_id,
+                    if result.is_error { "error" } else { "done" },
+                    now,
+                )?;
+                answered += 1;
+            }
+            None => {
+                let age = now.saturating_sub(turn.started_at);
+                let timed_out = age > BRIDGE_TURN_MAX_RUNTIME_MS;
+                // `exited` is authoritative (the daemon reaped the child);
+                // `kill -0` is a best-effort fallback for turns that survived
+                // a daemon restart, backstopped by the hard timeout because
+                // PID reuse can make it lie forever.
+                let alive = !turn.exited && !timed_out && bridge_turn_process_alive(turn.pid);
+                if alive || (!turn.exited && !timed_out && age <= BRIDGE_TURN_FAILURE_GRACE_MS) {
+                    // Still queued or working: keep the chat's typing
+                    // indicator alive so the wait is visible.
+                    if alive {
+                        if let Some(telegram) = config.telegram.as_ref() {
+                            extend_telegram_typing_indicator(conn, telegram, &turn.thread_id, now)?;
+                        }
+                    }
+                    running += 1;
+                } else {
+                    // Gone (or timed out) without a result: say so loudly
+                    // instead of leaving the user waiting forever.
+                    let reason = if turn.exited {
+                        format!(
+                            "exited (status {}) without producing an answer",
+                            turn.exit_code
+                                .map(|code| code.to_string())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        )
+                    } else if timed_out {
+                        "ran past the hard timeout without producing an answer".to_string()
+                    } else {
+                        "exited without producing an answer".to_string()
+                    };
+                    // A timed-out turn is still alive by definition of this
+                    // branch's fall-through: actually terminate it so it stops
+                    // consuming resources and mutating the session.
+                    if timed_out && !turn.exited {
+                        crate::claude::kill_turn_process(&turn);
+                    }
+                    let tail = turn_log_tail(&log_path, 400);
+                    let event = json!({
+                        "type": "thread_error",
+                        "threadId": turn.thread_id,
+                        "observedAt": now,
+                        "eventKey": format!("bridge-turn-failed:{}", turn.turn_id),
+                        "message": format!(
+                            "The headless turn {reason}.\nLog tail:\n{}",
+                            if tail.is_empty() { "(empty log)".to_string() } else { tail }
+                        ),
+                    });
+                    enqueue_outbound_event(conn, &event, now, "bridge")?;
+                    mark_bridge_turn_finished(
+                        conn,
+                        &turn.turn_id,
+                        if timed_out { "expired" } else { "failed" },
+                        now,
+                    )?;
+                    failed += 1;
                 }
             }
         }
     }
-    Ok(enqueued)
+    Ok(json!({
+        "ok": true,
+        "answered": answered,
+        "failed": failed,
+        "running": running
+    }))
 }
 
 fn away_notifications_enabled_from_status(away_status: &Value) -> bool {
@@ -290,6 +474,11 @@ fn daemon_cycle(
         }
         Err(error) => enqueue_sync_error_notification(conn, filter.as_ref(), &error, now)?,
     };
+    // Bridge-turn answers are collected AFTER the sync so the away-duplicate
+    // check can see anything the sync just enqueued for the same completion.
+    let bridge_turns = process_bridge_turns(conn, config, now).unwrap_or_else(|error| {
+        json!({ "ok": false, "error": format!("{error:#}") })
+    });
     // Delivery is not gated on away mode: enqueueing is the policy point.
     // While the user is present the outbox only ever holds answers to turns
     // they started from Telegram, which must always be delivered.
@@ -299,6 +488,7 @@ fn daemon_cycle(
         "action": "daemon_cycle",
         "observed": events.len(),
         "enqueued": enqueued,
+        "bridgeTurns": bridge_turns,
         "delivery": delivery,
         "telegramUpdates": telegram_updates,
         "pending": pending_outbound_count(conn)?
@@ -1140,124 +1330,380 @@ mod tests {
         assert_eq!(on_count, 1, "daemon should notify while user is away");
     }
 
-    #[test]
-    fn bridge_initiated_turns_notify_even_when_not_away() {
-        let conn = create_state_db_in_memory().expect("db");
-        crate::state::mark_bridge_turn(&conn, "thr_bridge", 1000).expect("mark");
-        let events = vec![
-            json!({
-                "type": "thread_completed",
-                "threadId": "thr_bridge",
-                "updatedAt": 1500
-            }),
-            json!({
-                "type": "thread_completed",
-                "threadId": "thr_other",
-                "updatedAt": 1500
-            }),
-        ];
-
-        let count = enqueue_daemon_notification_events(&conn, &events, 2000).expect("enqueue");
-        assert_eq!(
-            count, 1,
-            "only the bridge-initiated turn notifies while the user is present"
-        );
-
-        // The marker is consumed by the pushed answer: a later completion of
-        // the same thread (e.g. continued from the terminal) stays quiet.
-        let later = json!({
-            "type": "thread_completed",
-            "threadId": "thr_bridge",
-            "updatedAt": 3000
-        });
-        let count = enqueue_daemon_notification_events(&conn, std::slice::from_ref(&later), 3500)
-            .expect("enqueue later");
-        assert_eq!(count, 0, "marker must be consumed by the first pushed answer");
+    fn write_turn_log(name: &str, lines: &[&str]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tinyctb-turnlog-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("turn log dir");
+        let path = dir.join(format!("{name}.log"));
+        fs::write(&path, lines.join("\n")).expect("write turn log");
+        path
     }
 
-    #[test]
-    fn bridge_turn_marker_counts_concurrent_replies() {
-        let conn = create_state_db_in_memory().expect("db");
-        // Two Telegram replies to the same session before either finishes.
-        crate::state::mark_bridge_turn(&conn, "thr_two", 1000).expect("mark 1");
-        crate::state::mark_bridge_turn(&conn, "thr_two", 1100).expect("mark 2");
+    fn bridge_test_config() -> DaemonConfig {
+        DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: "thread_waiting".to_string(), // narrow on purpose: results must ignore it
+            telegram: None,
+            claude: None,
+            projects: vec![],
+        }
+    }
 
-        let first = json!({
-            "type": "thread_completed",
-            "threadId": "thr_two",
-            "updatedAt": 1500
-        });
-        assert_eq!(
-            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&first), 2000)
-                .expect("first answer"),
-            1
+    /// Core scenario that Stop-hook attribution got wrong in production: the
+    /// answer comes from the turn's own log, away off, and survives /back.
+    #[test]
+    fn bridge_turn_result_is_pushed_from_its_log_and_survives_back() {
+        let conn = create_state_db_in_memory().expect("db");
+        let log = write_turn_log(
+            "sess-log-1000",
+            &[
+                "some stderr noise",
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"校验仍在跑，十来分钟后终报。"}"#,
+            ],
         );
-        let second = json!({
-            "type": "thread_completed",
-            "threadId": "thr_two",
-            "updatedAt": 2500
-        });
+        crate::state::register_bridge_turn(
+            &conn,
+            "sess-log-1000",
+            "sess-log",
+            &log.display().to_string(),
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+
+        let summary =
+            process_bridge_turns(&conn, &bridge_test_config(), 2000).expect("process");
+        assert_eq!(summary["answered"], 1, "{summary}");
+        assert_eq!(pending_outbound_count(&conn).expect("pending"), 1);
+        let (payload, origin): (String, String) = conn
+            .query_row(
+                "SELECT payload_json, origin FROM outbound_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("outbound row");
+        assert_eq!(origin, "bridge");
+        assert!(payload.contains("校验仍在跑"), "payload: {payload}");
+
+        // Turn is done: a second poll neither re-pushes nor errors.
+        let again = process_bridge_turns(&conn, &bridge_test_config(), 3000).expect("repoll");
+        assert_eq!(again["answered"], 0);
+        assert_eq!(pending_outbound_count(&conn).expect("pending"), 1);
+
+        // /back clears only the away backlog; the answer stays queued.
+        set_away_mode(&conn, false, 4000).expect("back");
+        assert_eq!(pending_outbound_count(&conn).expect("pending after back"), 1);
+    }
+
+    /// Two concurrent replies to one session = two registered turns with two
+    /// logs; both answers must be pushed, each with its own text.
+    #[test]
+    fn concurrent_bridge_turns_each_push_their_own_answer() {
+        let conn = create_state_db_in_memory().expect("db");
+        for (turn_id, text) in [
+            ("sess-c-1000", r#"{"type":"result","subtype":"success","result":"answer one"}"#),
+            ("sess-c-1100", r#"{"type":"result","subtype":"success","result":"answer two"}"#),
+        ] {
+            let log = write_turn_log(turn_id, &[text]);
+            crate::state::register_bridge_turn(
+                &conn,
+                turn_id,
+                "sess-c",
+                &log.display().to_string(),
+                Some(0),
+                None,
+                None,
+                None,
+                None,
+                None,
+                1000,
+            )
+            .expect("register");
+        }
+
+        let summary =
+            process_bridge_turns(&conn, &bridge_test_config(), 2000).expect("process");
+        assert_eq!(summary["answered"], 2, "{summary}");
+        let payloads: Vec<String> = conn
+            .prepare("SELECT payload_json FROM outbound_events ORDER BY event_id")
+            .expect("stmt")
+            .query_map([], |row| row.get(0))
+            .expect("rows")
+            .collect::<rusqlite::Result<_>>()
+            .expect("payloads");
+        assert_eq!(payloads.len(), 2);
+        assert!(payloads.iter().any(|payload| payload.contains("answer one")));
+        assert!(payloads.iter().any(|payload| payload.contains("answer two")));
+    }
+
+    /// A dead process without a result must produce a loud failure notice,
+    /// not an eternal silent wait.
+    #[test]
+    fn dead_bridge_turn_without_result_notifies_failure() {
+        let conn = create_state_db_in_memory().expect("db");
+        let log = write_turn_log("sess-dead-1000", &["Error: model exploded"]);
+        crate::state::register_bridge_turn(
+            &conn,
+            "sess-dead-1000",
+            "sess-dead",
+            &log.display().to_string(),
+            Some(4_000_000_000), // no such pid
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+
+        // Within the grace window: still counted as running, no notice yet.
+        let early = process_bridge_turns(&conn, &bridge_test_config(), 5000).expect("early");
+        assert_eq!(early["failed"], 0);
+        assert_eq!(early["running"], 1);
+
+        let late = process_bridge_turns(&conn, &bridge_test_config(), 20_000).expect("late");
+        assert_eq!(late["failed"], 1, "{late}");
+        let payload: String = conn
+            .query_row("SELECT payload_json FROM outbound_events", [], |row| {
+                row.get(0)
+            })
+            .expect("failure row");
+        assert!(payload.contains("exited without producing an answer"));
+        assert!(payload.contains("model exploded"), "payload: {payload}");
+    }
+
+    /// A reaped child exit is authoritative: even when the PID looks alive
+    /// (reuse), the turn must fail loudly with the recorded exit status.
+    #[test]
+    fn reaped_exit_marks_turn_failed_even_if_pid_looks_alive() {
+        let conn = create_state_db_in_memory().expect("db");
+        let log = write_turn_log("sess-exit-1000", &["Error: model exploded"]);
+        let own_pid = std::process::id(); // definitely passes `kill -0`
+        crate::state::register_bridge_turn(
+            &conn,
+            "sess-exit-1000",
+            "sess-exit",
+            &log.display().to_string(),
+            Some(own_pid),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        crate::state::record_bridge_turn_exit(&conn, own_pid, Some(1)).expect("record exit");
+
+        let summary =
+            process_bridge_turns(&conn, &bridge_test_config(), 20_000).expect("process");
+        assert_eq!(summary["failed"], 1, "{summary}");
+        let payload: String = conn
+            .query_row("SELECT payload_json FROM outbound_events", [], |row| {
+                row.get(0)
+            })
+            .expect("failure row");
+        assert!(payload.contains("status 1"), "payload: {payload}");
+    }
+
+    /// PID reuse after a daemon restart can make `kill -0` lie forever; the
+    /// hard timeout is the backstop.
+    #[test]
+    fn bridge_turn_hard_timeout_fails_alive_looking_turns() {
+        let conn = create_state_db_in_memory().expect("db");
+        let log = write_turn_log("sess-timeout-1000", &["still nothing"]);
+        crate::state::register_bridge_turn(
+            &conn,
+            "sess-timeout-1000",
+            "sess-timeout",
+            &log.display().to_string(),
+            Some(std::process::id()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+
+        let before = process_bridge_turns(
+            &conn,
+            &bridge_test_config(),
+            1000 + BRIDGE_TURN_MAX_RUNTIME_MS,
+        )
+        .expect("before timeout");
+        assert_eq!(before["running"], 1);
+
+        let _ = crate::claude::test_kill::take();
+        let after = process_bridge_turns(
+            &conn,
+            &bridge_test_config(),
+            1000 + BRIDGE_TURN_MAX_RUNTIME_MS + 1,
+        )
+        .expect("after timeout");
+        assert_eq!(after["failed"], 1, "{after}");
+        let payload: String = conn
+            .query_row("SELECT payload_json FROM outbound_events", [], |row| {
+                row.get(0)
+            })
+            .expect("timeout row");
+        assert!(payload.contains("hard timeout"), "payload: {payload}");
         assert_eq!(
-            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&second), 3000)
-                .expect("second answer"),
-            1,
-            "both concurrent replies are owed an answer"
-        );
-        let third = json!({
-            "type": "thread_completed",
-            "threadId": "thr_two",
-            "updatedAt": 3500
-        });
-        assert_eq!(
-            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&third), 4000)
-                .expect("third completion"),
-            0,
-            "marker count exhausted after both answers were enqueued"
+            crate::claude::test_kill::take(),
+            vec![std::process::id()],
+            "a timed-out turn must actually be terminated, not just untracked"
         );
     }
 
+    /// The Stop hook can wake the daemon a cycle BEFORE the result JSON hits
+    /// the turn log; the away push from that earlier cycle must still count
+    /// as this answer's delivery.
     #[test]
-    fn bridge_turn_marker_survives_waiting_events_and_expires() {
+    fn bridge_turn_skips_push_when_away_pushed_in_earlier_cycle() {
         let conn = create_state_db_in_memory().expect("db");
-        crate::state::mark_bridge_turn(&conn, "thr_wait", 1000).expect("mark");
+        let log = write_turn_log(
+            "sess-early-1000",
+            &[r#"{"type":"result","subtype":"success","result":"the answer"}"#],
+        );
+        crate::state::register_bridge_turn(
+            &conn,
+            "sess-early-1000",
+            "sess-early",
+            &log.display().to_string(),
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        // Away sync pushed the completion at an earlier cycle (1500), the
+        // result JSON is only read at 3000.
+        enqueue_outbound_event(
+            &conn,
+            &json!({
+                "type": "thread_completed",
+                "threadId": "sess-early",
+                "updatedAt": 1500,
+                "lastPreview": "the answer"
+            }),
+            1500,
+            "away",
+        )
+        .expect("away enqueue");
 
-        let waiting = json!({
-            "type": "thread_waiting",
-            "threadId": "thr_wait",
-            "updatedAt": 1500
-        });
+        let summary =
+            process_bridge_turns(&conn, &bridge_test_config(), 3000).expect("process");
+        assert_eq!(summary["answered"], 1);
         assert_eq!(
-            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&waiting), 2000)
-                .expect("waiting enqueue"),
+            pending_outbound_count(&conn).expect("pending"),
             1,
-            "a bridge turn that needs input must notify"
+            "the answer already went out in the earlier cycle"
         );
+    }
 
-        // waiting does not consume the marker: the completion is still owed.
-        let completed = json!({
-            "type": "thread_completed",
-            "threadId": "thr_wait",
-            "updatedAt": 2500
-        });
-        assert_eq!(
-            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&completed), 3000)
-                .expect("completed enqueue"),
-            1
+    /// The away-duplicate check is bound to the answer content: someone
+    /// else's completion (terminal turn, another reply) in the same cycle
+    /// must not swallow this turn's distinct answer.
+    #[test]
+    fn bridge_turn_pushes_answer_when_away_completion_is_someone_elses() {
+        let conn = create_state_db_in_memory().expect("db");
+        let log = write_turn_log(
+            "sess-mix-1000",
+            &[r#"{"type":"result","subtype":"success","result":"my distinct answer"}"#],
         );
+        crate::state::register_bridge_turn(
+            &conn,
+            "sess-mix-1000",
+            "sess-mix",
+            &log.display().to_string(),
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        // Same session, same cycle, but a DIFFERENT completion (e.g. the
+        // session's own terminal activity while away).
+        enqueue_outbound_event(
+            &conn,
+            &json!({
+                "type": "thread_completed",
+                "threadId": "sess-mix",
+                "updatedAt": 2000,
+                "lastPreview": "the agent's own loop report"
+            }),
+            2000,
+            "away",
+        )
+        .expect("away enqueue");
 
-        // A stale marker (turn never completed) expires after the TTL.
-        crate::state::mark_bridge_turn(&conn, "thr_stale", 1000).expect("mark stale");
-        let stale = json!({
-            "type": "thread_completed",
-            "threadId": "thr_stale",
-            "updatedAt": 2000
-        });
-        let after_ttl = 1000 + crate::state::BRIDGE_TURN_TTL_MS + 1;
+        let summary =
+            process_bridge_turns(&conn, &bridge_test_config(), 2000).expect("process");
+        assert_eq!(summary["answered"], 1);
         assert_eq!(
-            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&stale), after_ttl)
-                .expect("stale enqueue"),
-            0,
-            "expired bridge-turn markers must not notify"
+            pending_outbound_count(&conn).expect("pending"),
+            2,
+            "a mismatched away completion must not swallow the reply's answer"
+        );
+    }
+
+    /// While away, the Stop-hook sync path may enqueue the same completion in
+    /// the same cycle; the bridge push must then stand down.
+    #[test]
+    fn bridge_turn_skips_push_when_away_sync_already_enqueued_it() {
+        let conn = create_state_db_in_memory().expect("db");
+        let log = write_turn_log(
+            "sess-dup-1000",
+            &[r#"{"type":"result","subtype":"success","result":"the answer"}"#],
+        );
+        crate::state::register_bridge_turn(
+            &conn,
+            "sess-dup-1000",
+            "sess-dup",
+            &log.display().to_string(),
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        // Simulate the away sync having enqueued this completion at `now`.
+        enqueue_outbound_event(
+            &conn,
+            &json!({
+                "type": "thread_completed",
+                "threadId": "sess-dup",
+                "updatedAt": 2000,
+                "lastPreview": "the answer"
+            }),
+            2000,
+            "away",
+        )
+        .expect("away enqueue");
+
+        let summary =
+            process_bridge_turns(&conn, &bridge_test_config(), 2000).expect("process");
+        assert_eq!(summary["answered"], 1);
+        assert_eq!(
+            pending_outbound_count(&conn).expect("pending"),
+            1,
+            "the same answer must not be queued twice"
         );
     }
 

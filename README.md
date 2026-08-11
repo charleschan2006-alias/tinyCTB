@@ -46,7 +46,14 @@ Code surfaces together:
    `claude -p "<text>" --resume <session-id> --output-format json
    --permission-mode <configured>`. `/new` generates a session UUID locally and
    passes `--session-id`, so reply routing works before the first token is
-   produced. Turn output is logged to `~/.tinyctb/logs/turns/`.
+   produced. The injected text is prefixed with `telegram：` so it is
+   recognizable inside the session transcript. Each turn's output goes to its
+   own log under `~/.tinyctb/logs/turns/`, and **the answer pushed back to
+   Telegram is read from that log** — never attributed from Stop hooks, so a
+   session that is concurrently active in a terminal cannot mislabel its own
+   output as the answer. If the turn's process dies without producing a
+   result, a failure notice (with the log tail) is pushed instead, and the
+   chat shows a typing indicator while the turn is queued or running.
 
 The daemon loop (systemd user service / macOS LaunchAgent): ingest spooled hook events → refresh
 the session cache → process Telegram updates (commands + reply routing) →
@@ -131,8 +138,10 @@ config.
 - **通知源**：Claude Code 的 `Stop` / `Notification` / `SessionStart` hooks 把
   事件写进 `~/.tinyctb/events/` spool，daemon 轮询消化，away 模式下推送 Telegram。
 - **回复路由**：Telegram 里对某条通知使用 Reply，桥会派生一个独立的
-  `claude -p --resume <会话ID>` 无头进程续写该会话；答案由该进程触发的 Stop
-  hook 事件送回 Telegram。从 Telegram 发起的回合（Reply 或 `/new`）无论
+  `claude -p --resume <会话ID>` 无头进程续写该会话，注入的文本带 `telegram：`
+  前缀（转录内可辨识）；**答案从该回合专属的 turn log 读回**（归属精确，
+  目标会话即使同时在终端活跃也不会张冠李戴），排队/运行期间聊天窗口持续显示
+  typing，进程崩溃无结果则推送响亮的失败通知。从 Telegram 发起的回合无论
   away 开关与否都会推回答案；away 只门控本地终端会话的通知。
 - **新会话**：`/new` 在项目注册表指定的目录下用本地生成的 UUID
   （`--session-id`）启动无头会话，因此确认消息可以立刻用于回复路由。
@@ -144,6 +153,12 @@ config.
 - The session JSONL format is internal to Claude Code and may change between
   versions; the parser skips anything it does not recognize, and hooks (a
   stable, documented interface) carry the load-bearing signals.
+- Killing a timed-out headless turn after a **daemon restart** requires the
+  Linux process-identity chain (boot id + process group + starttime ticks).
+  On macOS this cannot be verified, so such turns are reported and marked
+  expired but deliberately NOT signalled — killing on weak identity risks
+  hitting an innocent reused PID. (Turns owned by the current daemon process
+  are killed and reaped normally on both platforms.)
 - The Telegram bot token is stored in the local config only and redacted from
   command output. Use a bot dedicated to this bridge.
 - `tinyctb doctor` is the fastest way to check that the claude binary, hooks,

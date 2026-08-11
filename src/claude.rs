@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::config::{ClaudeConfig, DaemonConfig};
 use crate::state::{
-    bridge_turn_pending, clear_pending_outbound_events, get_setting_number, get_setting_text,
+    clear_pending_outbound_events, get_setting_number, get_setting_text,
     reconcile_thread_snapshots, remote_mode_status_path, set_setting, set_setting_text,
     state_dir_path, thread_snapshot_json, upsert_thread_snapshot, BridgeThreadSnapshot,
     PendingPrompt,
@@ -54,8 +54,6 @@ pub(crate) fn events_spool_dir() -> Result<PathBuf> {
     Ok(state_dir_path()?.join("events"))
 }
 
-// Only referenced from the non-test spawn path; the test build stubs spawning.
-#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn turn_logs_dir() -> Result<PathBuf> {
     Ok(state_dir_path()?.join("logs").join("turns"))
 }
@@ -920,28 +918,7 @@ pub(crate) fn sync_state_from_sessions(
         "spoolConsumed": consumed
     });
     let filter = parse_event_filter(Some(&config.events));
-    let mut notifiable = Vec::new();
-    for event in watch_events_from_sync_result(&result, None) {
-        let event_type = event.get("type").and_then(Value::as_str);
-        let passes_filter = filter.as_ref().map_or(true, |filter| {
-            event_type
-                .map(|event_type| filter.contains(event_type))
-                .unwrap_or(false)
-        });
-        // The events filter is an away-notification preference. Events owed to
-        // a bridge-initiated turn bypass it: a narrow filter (e.g. only
-        // thread_waiting) must not swallow a promised answer — that would also
-        // leave the marker unconsumed to mis-match a later completion.
-        let bridge_owed = !passes_filter
-            && matches!(event_type, Some("thread_completed") | Some("thread_waiting"))
-            && match crate::event_thread_id(&event) {
-                Some(thread_id) => bridge_turn_pending(conn, &thread_id, now)?,
-                None => false,
-            };
-        if passes_filter || bridge_owed {
-            notifiable.push(event);
-        }
-    }
+    let notifiable = watch_events_from_sync_result(&result, filter.as_ref());
     let enqueued =
         crate::daemon::enqueue_daemon_notification_events(conn, &notifiable, now)?;
     if let Some(object) = result.as_object_mut() {
@@ -1106,6 +1083,248 @@ pub(crate) mod test_spawn {
     }
 }
 
+/// Live handles of spawned headless turns. The daemon reaps these every cycle
+/// so finished children never linger as zombies — a zombie still answers
+/// `kill -0`, which would make crash detection report "running" forever.
+#[cfg(not(test))]
+mod turn_children {
+    use std::process::Child;
+    use std::sync::Mutex;
+
+    pub(super) static RUNNING: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+}
+
+#[cfg(test)]
+pub(crate) mod test_kill {
+    use std::sync::Mutex;
+
+    pub(crate) static KILLED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+    pub(crate) fn take() -> Vec<u32> {
+        std::mem::take(&mut KILLED.lock().expect("test kill lock"))
+    }
+}
+
+fn ps_value(pid: u32, field: &str) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-o", field, "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+/// The RESOLVED executable path of a running process (`/proc/<pid>/exe`).
+/// Diagnostics only (racy across a wrapper's `exec`, absent on macOS); it
+/// takes no part in the restart-kill decision.
+fn process_exe_path(pid: u32) -> Option<String> {
+    fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|path| path.display().to_string())
+}
+
+/// starttime ticks from `/proc/<pid>/stat` (field 22). Invariant across
+/// `exec` and unique per PID incarnation — the authoritative identity for
+/// the restart-kill check. Linux only.
+fn process_start_ticks(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) may contain spaces/parens; fields resume after last ')'.
+    let rest = stat.rsplit_once(')')?.1;
+    rest.split_whitespace().nth(19).map(str::to_string)
+}
+
+/// This boot's unique id. starttime ticks restart from zero on reboot, so
+/// ticks are only meaningful within one boot — the boot id scopes them.
+fn current_boot_id() -> Option<String> {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProcessIdentity {
+    pub(crate) lstart: Option<String>,
+    pub(crate) pgid: Option<u32>,
+    pub(crate) exe: Option<String>,
+    pub(crate) start_ticks: Option<String>,
+    pub(crate) boot_id: Option<String>,
+}
+
+/// Identity of a just-spawned turn, persisted so a restarted daemon can later
+/// verify the PID still belongs to the turn before signalling it. Best
+/// effort: missing components make verification refuse to kill.
+pub(crate) fn capture_process_identity(pid: Option<u32>) -> ProcessIdentity {
+    let Some(pid) = pid.filter(|pid| *pid > 0) else {
+        return ProcessIdentity::default();
+    };
+    ProcessIdentity {
+        lstart: ps_value(pid, "lstart="),
+        pgid: ps_value(pid, "pgid=").and_then(|value| value.trim().parse::<u32>().ok()),
+        exe: process_exe_path(pid),
+        start_ticks: process_start_ticks(pid),
+        boot_id: current_boot_id(),
+    }
+}
+
+/// Identity check for the restart case (no Child handle). Requires the full
+/// Linux identity chain of boot id (scopes ticks to one boot), process group,
+/// and starttime ticks (exec-invariant, unique per PID incarnation: a
+/// `CLAUDE_BIN` wrapper exec'ing the real program keeps its identity, while
+/// a reused PID gets new ticks). Anything less fails closed — including all
+/// of macOS, where /proc does not exist: there a timed-out turn after a
+/// daemon restart is abandoned as 'expired' WITHOUT being signalled, because
+/// killing on weak identity is worse than leaking a process.
+pub(crate) fn verified_restart_identity(turn: &crate::state::BridgeTurn, pid: u32) -> bool {
+    let (Some(stored_pgid), Some(stored_ticks), Some(stored_boot)) = (
+        turn.pgid,
+        turn.proc_start_ticks.as_deref(),
+        turn.boot_id.as_deref(),
+    ) else {
+        return false;
+    };
+    let Some(current_pgid) =
+        ps_value(pid, "pgid=").and_then(|value| value.trim().parse::<u32>().ok())
+    else {
+        return false;
+    };
+    if current_pgid != stored_pgid {
+        return false;
+    }
+    let Some(current_boot) = current_boot_id() else {
+        return false;
+    };
+    if current_boot != stored_boot.trim() {
+        return false;
+    }
+    process_start_ticks(pid).as_deref() == Some(stored_ticks)
+}
+
+/// TERM the whole process group, give the main child a short grace to exit
+/// cleanly, then KILL the group UNCONDITIONALLY — a grandchild that ignores
+/// TERM must not survive just because the main process exited politely.
+/// Returns whether the supplied main child was reaped (true when no handle
+/// was supplied); an unreaped child must go back to the registry so a later
+/// cycle can collect it.
+pub(crate) fn terminate_process_group(pid: u32, child: Option<&mut std::process::Child>) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    let group = format!("-{pid}");
+    // Returns whether the signal was actually delivered; PATH, permission or
+    // resource problems must degrade gracefully, never wedge the daemon.
+    let signal_group = |signal: &str| -> bool {
+        Command::new("kill")
+            .args([signal, "--", &group])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    };
+    let termed = signal_group("-TERM");
+    match child {
+        Some(child) => {
+            if termed {
+                let started = std::time::Instant::now();
+                while started.elapsed() < Duration::from_secs(2) {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            if !signal_group("-KILL") {
+                // External kill unavailable: at least SIGKILL the main child
+                // directly through the handle (no PATH involved).
+                let _ = child.kill();
+            }
+            // Bounded reap — never block the daemon indefinitely on a child
+            // that could not be signalled.
+            let started = std::time::Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => return true,
+                    _ if started.elapsed() >= Duration::from_secs(2) => return false,
+                    _ => std::thread::sleep(Duration::from_millis(100)),
+                }
+            }
+        }
+        None => {
+            std::thread::sleep(Duration::from_millis(500));
+            signal_group("-KILL");
+            true
+        }
+    }
+}
+
+/// Terminate a timed-out headless turn. With a live handle the child is
+/// killed and reaped directly; after a daemon restart the stored identity
+/// must fully match, otherwise we refuse to signal (PID reuse).
+pub(crate) fn kill_turn_process(turn: &crate::state::BridgeTurn) {
+    #[cfg(test)]
+    {
+        test_kill::KILLED
+            .lock()
+            .expect("test kill lock")
+            .push(turn.pid.unwrap_or(0));
+    }
+    #[cfg(not(test))]
+    {
+        let Some(pid) = turn.pid.filter(|pid| *pid > 0) else {
+            return;
+        };
+        let mut running = turn_children::RUNNING.lock().expect("turn children lock");
+        if let Some(index) = running.iter().position(|child| child.id() == pid) {
+            let mut child = running.remove(index);
+            drop(running);
+            if !terminate_process_group(pid, Some(&mut child)) {
+                // Not reaped within the bound: hand the child back so the
+                // per-cycle reaper can collect it later instead of leaking a
+                // forever-unreapable zombie.
+                turn_children::RUNNING
+                    .lock()
+                    .expect("turn children lock")
+                    .push(child);
+            }
+        } else {
+            drop(running);
+            if verified_restart_identity(turn, pid) {
+                terminate_process_group(pid, None);
+            }
+        }
+    }
+}
+
+/// Reap finished headless children. Returns (pid, exit_code) per finished
+/// child; exit_code is None if the status is unavailable.
+pub(crate) fn reap_finished_turn_processes() -> Vec<(u32, Option<i32>)> {
+    #[cfg(test)]
+    {
+        Vec::new()
+    }
+    #[cfg(not(test))]
+    {
+        let mut running = turn_children::RUNNING.lock().expect("turn children lock");
+        let mut finished = Vec::new();
+        running.retain_mut(|child| match child.try_wait() {
+            Ok(Some(status)) => {
+                finished.push((child.id(), status.code()));
+                false
+            }
+            Ok(None) => true,
+            Err(_) => {
+                finished.push((child.id(), None));
+                false
+            }
+        });
+        finished
+    }
+}
+
 #[cfg_attr(test, allow(clippy::needless_return))]
 fn spawn_detached_headless(
     binary: &Path,
@@ -1128,11 +1347,13 @@ fn spawn_detached_headless(
         let logs_dir = turn_logs_dir()?;
         fs::create_dir_all(&logs_dir)?;
         let log_path = logs_dir.join(format!("{log_name}.log"));
+        // create_new: every turn owns its log exclusively — two turns writing
+        // one file would interleave and corrupt result attribution.
         let log_file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
+            .create_new(true)
+            .write(true)
             .open(&log_path)
-            .with_context(|| format!("failed to open turn log at {}", log_path.display()))?;
+            .with_context(|| format!("failed to create turn log at {}", log_path.display()))?;
         let err_file = log_file.try_clone()?;
         let mut command = Command::new(binary);
         command
@@ -1151,7 +1372,12 @@ fn spawn_detached_headless(
         let child = command
             .spawn()
             .with_context(|| format!("failed to spawn {} for headless turn", binary.display()))?;
-        Ok(Some(child.id()))
+        let pid = child.id();
+        turn_children::RUNNING
+            .lock()
+            .expect("turn children lock")
+            .push(child);
+        Ok(Some(pid))
     }
 }
 
@@ -1177,13 +1403,16 @@ pub(crate) fn send_user_message(
                 .and_then(|info| parse_transcript_summary(&info.path).ok())
                 .and_then(|summary| summary.cwd)
         });
+    // The random suffix keeps turn ids unique even for two replies to the
+    // same session in one update batch (which share `now`).
+    let turn_id = format!(
+        "{session_id}-{now}-{}",
+        &generate_session_uuid()?[..8]
+    );
+    let log_path = turn_logs_dir()?.join(format!("{turn_id}.log"));
     let args = headless_command_args(&claude, &message, SessionRef::Resume(session_id));
-    let pid = spawn_detached_headless(
-        &binary.path,
-        &args,
-        cwd.as_deref(),
-        &format!("{session_id}-{now}"),
-    )?;
+    let pid = spawn_detached_headless(&binary.path, &args, cwd.as_deref(), &turn_id)?;
+    let identity = capture_process_identity(pid);
     Ok(json!({
         "ok": true,
         "action": "reply_started",
@@ -1195,7 +1424,14 @@ pub(crate) fn send_user_message(
             "binary": binary.path.display().to_string(),
             "binarySource": binary.source,
             "pid": pid,
-            "permissionMode": claude.permission_mode
+            "procStart": identity.lstart,
+            "pgid": identity.pgid,
+            "procExe": identity.exe,
+            "procStartTicks": identity.start_ticks,
+            "procBootId": identity.boot_id,
+            "permissionMode": claude.permission_mode,
+            "turnId": turn_id,
+            "logPath": log_path.display().to_string()
         },
         "delivery": {
             "mode": "hook_notification",
@@ -1218,13 +1454,14 @@ pub(crate) fn start_thread_in_cwd(
     let claude = claude_config(config);
     let binary = resolve_claude_binary()?;
     let session_id = generate_session_uuid()?;
+    let turn_id = format!(
+        "{session_id}-{now}-{}",
+        &generate_session_uuid()?[..8]
+    );
+    let log_path = turn_logs_dir()?.join(format!("{turn_id}.log"));
     let args = headless_command_args(&claude, &message, SessionRef::New(&session_id));
-    let pid = spawn_detached_headless(
-        &binary.path,
-        &args,
-        cwd,
-        &format!("{session_id}-{now}"),
-    )?;
+    let pid = spawn_detached_headless(&binary.path, &args, cwd, &turn_id)?;
+    let identity = capture_process_identity(pid);
     Ok(json!({
         "ok": true,
         "action": "new",
@@ -1236,7 +1473,14 @@ pub(crate) fn start_thread_in_cwd(
             "binary": binary.path.display().to_string(),
             "binarySource": binary.source,
             "pid": pid,
-            "permissionMode": claude.permission_mode
+            "procStart": identity.lstart,
+            "pgid": identity.pgid,
+            "procExe": identity.exe,
+            "procStartTicks": identity.start_ticks,
+            "procBootId": identity.boot_id,
+            "permissionMode": claude.permission_mode,
+            "turnId": turn_id,
+            "logPath": log_path.display().to_string()
         },
         "delivery": {
             "mode": "hook_notification",
@@ -1244,6 +1488,64 @@ pub(crate) fn start_thread_in_cwd(
         },
         "sentAt": now
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Bridge turn results (read back from the turn's own log file)
+
+#[derive(Debug, Clone)]
+pub(crate) struct BridgeTurnResult {
+    pub(crate) is_error: bool,
+    pub(crate) text: String,
+}
+
+/// Parse the final `--output-format json` result out of a turn log. The log
+/// mixes stderr lines with the single result JSON object, so scan from the
+/// end for the first line that parses as a `"type":"result"` object. Returns
+/// None while the turn is still running (no result line yet).
+pub(crate) fn read_bridge_turn_result(log_path: &Path) -> Option<BridgeTurnResult> {
+    let raw = fs::read_to_string(log_path).ok()?;
+    for line in raw.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("result") {
+            continue;
+        }
+        let is_error = record.get("is_error").and_then(Value::as_bool).unwrap_or(false)
+            || record.get("subtype").and_then(Value::as_str) != Some("success");
+        let text = record
+            .get("result")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                format!(
+                    "(turn ended with subtype `{}` and no result text)",
+                    record.get("subtype").and_then(Value::as_str).unwrap_or("unknown")
+                )
+            });
+        return Some(BridgeTurnResult { is_error, text });
+    }
+    None
+}
+
+/// Last chars of a turn log, for failure notices.
+pub(crate) fn turn_log_tail(log_path: &Path, max_chars: usize) -> String {
+    let Ok(raw) = fs::read_to_string(log_path) else {
+        return String::new();
+    };
+    let trimmed = raw.trim();
+    let count = trimmed.chars().count();
+    if count <= max_chars {
+        return trimmed.to_string();
+    }
+    trimmed.chars().skip(count - max_chars).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1689,80 +1991,9 @@ mod tests {
         );
     }
 
-    /// The full target scenario for bridge-initiated turns: user is NOT away,
-    /// replied from Telegram (marker set), the headless turn's Stop hook lands
-    /// in the spool. The answer must reach the outbox through the real
-    /// ingest -> reconcile -> enqueue chain, and must survive /back.
-    #[test]
-    fn bridge_turn_answer_flows_from_stop_hook_when_not_away() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
-        let temp = TempDirGuard::new("bridge-turn-flow");
-        std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
-        let projects_root = temp.path.join("projects");
-        let project = projects_root.join("-home-user-project");
-        fs::create_dir_all(&project).expect("projects dir");
-        std::env::set_var(
-            "TINYCTB_CLAUDE_PROJECTS_DIR",
-            projects_root.display().to_string(),
-        );
-        write_transcript(
-            &project,
-            "sess-bridge",
-            &[
-                json!({"type": "assistant", "cwd": "/home/user/project", "message": {"role": "assistant", "content": [
-                    {"type": "text", "text": "bridge answer"}
-                ]}}),
-            ],
-        );
-        let conn = create_state_db_in_memory().expect("db");
-        let config = DaemonConfig {
-            version: 1,
-            bridge_command: "tinyctb".to_string(),
-            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
-            telegram: None,
-            claude: Some(ClaudeConfig::default()),
-            projects: vec![],
-        };
-        // Away is OFF; the Telegram reply marked the turn.
-        crate::state::mark_bridge_turn(&conn, "sess-bridge", 500).expect("mark");
-        let mut stop_payload = std::io::Cursor::new(
-            json!({
-                "hook_event_name": "Stop",
-                "session_id": "sess-bridge",
-                "cwd": "/home/user/project"
-            })
-            .to_string(),
-        );
-        write_hook_event_from_reader(&mut stop_payload, 1000).expect("spool stop");
-
-        // Daemon-path sync (record_deliveries = true), exactly what daemon_cycle runs.
-        let result = sync_state_from_sessions(&conn, &config, 2000, 50, true).expect("sync");
-        std::env::remove_var("TINYCTB_STATE_DIR");
-        std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
-
-        assert_eq!(
-            result["enqueued"], 1,
-            "bridge answer must be enqueued while the user is present: {result}"
-        );
-        assert_eq!(
-            crate::state::pending_outbound_count(&conn).expect("pending"),
-            1
-        );
-
-        // /back clears only the away backlog, not the owed bridge answer.
-        let disabled = set_away_mode(&conn, false, 2500).expect("back");
-        assert_eq!(disabled["clearedPendingNotifications"], 0);
-        assert_eq!(
-            crate::state::pending_outbound_count(&conn).expect("pending after /back"),
-            1,
-            "an undelivered bridge answer must survive /back"
-        );
-    }
-
-    /// Two concurrent Telegram replies to one session can both finish before a
-    /// single daemon poll: two Stop spool files, one sync, and BOTH answers
-    /// must reach the outbox (with their own previews), fully consuming the
-    /// two-count marker.
+    /// Two turns of one session can both finish before a single daemon poll:
+    /// two Stop spool files, one sync, and BOTH away notifications must reach
+    /// the outbox with their own previews (no by-session collapse).
     #[test]
     fn two_stops_in_one_cycle_push_two_answers() {
         let _guard = crate::state::test_env_lock().lock().expect("env lock");
@@ -1793,9 +2024,7 @@ mod tests {
             claude: Some(ClaudeConfig::default()),
             projects: vec![],
         };
-        // Away OFF; two Telegram replies were sent before either finished.
-        crate::state::mark_bridge_turn(&conn, "sess-two", 400).expect("mark 1");
-        crate::state::mark_bridge_turn(&conn, "sess-two", 500).expect("mark 2");
+        set_away_mode(&conn, true, 500).expect("away on");
         for (received_at, answer) in [(1000u64, "answer one"), (1100, "answer two")] {
             let mut stop_payload = std::io::Cursor::new(
                 json!({
@@ -1821,11 +2050,6 @@ mod tests {
             crate::state::pending_outbound_count(&conn).expect("pending"),
             2
         );
-        assert!(
-            !crate::state::bridge_turn_pending(&conn, "sess-two", 2500).expect("marker"),
-            "both outstanding turns must be consumed"
-        );
-        // Each event keeps its own answer text.
         let events = result["events"].as_array().expect("events");
         let previews = events
             .iter()
@@ -1858,8 +2082,7 @@ mod tests {
             claude: Some(ClaudeConfig::default()),
             projects: vec![],
         };
-        crate::state::mark_bridge_turn(&conn, "sess-samems", 400).expect("mark 1");
-        crate::state::mark_bridge_turn(&conn, "sess-samems", 500).expect("mark 2");
+        set_away_mode(&conn, true, 500).expect("away on");
         // Two spool files with identical receivedAt, distinct (fake) PIDs —
         // exactly what write_hook_event_from_reader produces in two processes.
         let spool = events_spool_dir().expect("spool dir");
@@ -1895,10 +2118,6 @@ mod tests {
             crate::state::pending_outbound_count(&conn).expect("pending"),
             2
         );
-        assert!(
-            !crate::state::bridge_turn_pending(&conn, "sess-samems", 2500).expect("marker"),
-            "both outstanding turns must be consumed"
-        );
 
         // End to end: each rendered Telegram message must carry its own
         // answer, not the other snapshot's preview (uid-exact enrichment).
@@ -1924,63 +2143,6 @@ mod tests {
                 "message must not show the other snapshot's answer: {text}"
             );
         }
-    }
-
-    /// A narrow events filter (user only wants thread_waiting pushes) must not
-    /// swallow the answer to a turn started from Telegram.
-    #[test]
-    fn narrow_events_filter_does_not_swallow_bridge_answers() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
-        let temp = TempDirGuard::new("narrow-filter-bridge");
-        std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
-        let projects_root = temp.path.join("projects");
-        let project = projects_root.join("-home-user-project");
-        fs::create_dir_all(&project).expect("projects dir");
-        std::env::set_var(
-            "TINYCTB_CLAUDE_PROJECTS_DIR",
-            projects_root.display().to_string(),
-        );
-        write_transcript(
-            &project,
-            "sess-filtered",
-            &[
-                json!({"type": "assistant", "cwd": "/home/user/project", "message": {"role": "assistant", "content": [
-                    {"type": "text", "text": "filtered answer"}
-                ]}}),
-            ],
-        );
-        let conn = create_state_db_in_memory().expect("db");
-        let config = DaemonConfig {
-            version: 1,
-            bridge_command: "tinyctb".to_string(),
-            events: "thread_waiting".to_string(),
-            telegram: None,
-            claude: Some(ClaudeConfig::default()),
-            projects: vec![],
-        };
-        crate::state::mark_bridge_turn(&conn, "sess-filtered", 500).expect("mark");
-        let mut stop_payload = std::io::Cursor::new(
-            json!({
-                "hook_event_name": "Stop",
-                "session_id": "sess-filtered",
-                "cwd": "/home/user/project"
-            })
-            .to_string(),
-        );
-        write_hook_event_from_reader(&mut stop_payload, 1000).expect("spool stop");
-
-        let result = sync_state_from_sessions(&conn, &config, 2000, 50, true).expect("sync");
-        std::env::remove_var("TINYCTB_STATE_DIR");
-        std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
-
-        assert_eq!(
-            result["enqueued"], 1,
-            "bridge answer must bypass the events filter: {result}"
-        );
-        assert!(
-            !crate::state::bridge_turn_pending(&conn, "sess-filtered", 2500).expect("marker"),
-            "marker must be consumed so it cannot mis-match a later completion"
-        );
     }
 
     #[test]
@@ -2013,6 +2175,208 @@ mod tests {
         assert!(args.contains(&"sess-reply".to_string()));
         assert!(args.contains(&"bypassPermissions".to_string()));
         assert!(args.contains(&"json".to_string()));
+    }
+
+    /// Two replies in one Telegram update batch share `now`; turn ids and
+    /// log files must still be unique or the answers get interleaved.
+    #[test]
+    fn concurrent_replies_same_timestamp_get_unique_turn_ids_and_logs() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        let _ = test_spawn::take();
+        if resolve_claude_binary().is_err() {
+            return;
+        }
+
+        let first =
+            send_user_message(&config, "sess-uid", "one", None, 4000).expect("first reply");
+        let second =
+            send_user_message(&config, "sess-uid", "two", None, 4000).expect("second reply");
+        let first_turn = first
+            .pointer("/claude/turnId")
+            .and_then(Value::as_str)
+            .expect("first turnId");
+        let second_turn = second
+            .pointer("/claude/turnId")
+            .and_then(Value::as_str)
+            .expect("second turnId");
+        assert!(first_turn.starts_with("sess-uid-4000-"));
+        assert!(second_turn.starts_with("sess-uid-4000-"));
+        assert_ne!(first_turn, second_turn, "turn ids must be unique");
+        assert_ne!(
+            first.pointer("/claude/logPath"),
+            second.pointer("/claude/logPath"),
+            "each turn must own its log file"
+        );
+        let _ = test_spawn::take();
+    }
+
+    /// The captured identity must be the real resolved executable of the
+    /// running process — this is what makes restart-kill verification safe.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capture_process_identity_resolves_own_executable() {
+        let identity = capture_process_identity(Some(std::process::id()));
+        assert!(identity.lstart.is_some(), "lstart must be captured");
+        assert!(identity.pgid.is_some(), "pgid must be captured");
+        assert!(
+            identity.start_ticks.is_some(),
+            "starttime ticks must be captured on Linux"
+        );
+        let exe = identity.exe.expect("exe path must be captured");
+        assert!(
+            exe.contains("tinyctb"),
+            "resolved exe should be this test binary: {exe}"
+        );
+        assert!(
+            std::path::Path::new(&exe).is_absolute(),
+            "exe must be an absolute resolved path: {exe}"
+        );
+    }
+
+    /// A CLAUDE_BIN wrapper that `exec`s the real program changes
+    /// /proc/<pid>/exe after our capture; the starttime-ticks identity must
+    /// keep recognizing the process so a restarted daemon can still kill it.
+    /// The wrapper is held BEFORE its exec by a sync file, so the test
+    /// deterministically captures the pre-exec incarnation, releases it, and
+    /// observes the exe change.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn restart_identity_survives_wrapper_exec() {
+        use std::os::unix::process::CommandExt;
+        let sync_dir =
+            std::env::temp_dir().join(format!("tinyctb-exec-sync-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&sync_dir);
+        fs::create_dir_all(&sync_dir).expect("sync dir");
+        let go_file = sync_dir.join("go");
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            "until [ -e \"$0\" ]; do sleep 0.05; done; exec sleep 30",
+            &go_file.display().to_string(),
+        ]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().expect("spawn wrapper");
+        let pid = child.id();
+
+        // Captured while the wrapper is provably still the shell.
+        let identity = capture_process_identity(Some(pid));
+        let pre_exec_exe = identity.exe.clone().expect("pre-exec exe");
+        assert!(
+            !pre_exec_exe.contains("sleep"),
+            "capture must happen before exec: {pre_exec_exe}"
+        );
+
+        // Release the wrapper and wait for the exec to be observable.
+        fs::write(&go_file, b"go").expect("write go file");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match process_exe_path(pid) {
+                Some(exe) if exe.contains("sleep") => break,
+                _ if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("wrapper never exec'd sleep");
+                }
+                _ => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        // The exe changed but the ticks did not: the incarnation persists.
+        assert_eq!(
+            process_start_ticks(pid),
+            identity.start_ticks,
+            "starttime ticks must be exec-invariant"
+        );
+
+        let turn = crate::state::BridgeTurn {
+            turn_id: "wrapper-test".to_string(),
+            thread_id: "wrapper-thread".to_string(),
+            log_path: String::new(),
+            pid: Some(pid),
+            started_at: 0,
+            exited: false,
+            exit_code: None,
+            pgid: identity.pgid,
+            proc_start_ticks: identity.start_ticks,
+            boot_id: identity.boot_id,
+        };
+        let recognized = verified_restart_identity(&turn, pid);
+        // A record without a boot id must fail closed even for the right pid.
+        let mut without_boot = turn.clone();
+        without_boot.boot_id = None;
+        let recognized_without_boot = verified_restart_identity(&without_boot, pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&sync_dir);
+        assert!(
+            recognized,
+            "exec inside the wrapper must not break identity (ticks are exec-invariant)"
+        );
+        assert!(
+            !recognized_without_boot,
+            "legacy records without boot_id must fail closed"
+        );
+        // And a different incarnation must fail closed: our own pid has
+        // different ticks/pgid than the recorded turn.
+        assert!(!verified_restart_identity(&turn, std::process::id()));
+    }
+
+    /// Real process-group termination: the main process exits politely on
+    /// TERM, a grandchild ignores TERM — the unconditional group KILL must
+    /// still sweep it so the whole PGID disappears.
+    #[test]
+    #[cfg(unix)]
+    fn terminate_process_group_sweeps_term_ignoring_grandchildren() {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            // grandchild ignores TERM; main traps TERM and exits cleanly
+            "sh -c 'trap \"\" TERM; sleep 30' & trap 'exit 0' TERM; sleep 30 & wait",
+        ]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().expect("spawn test group");
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(300));
+        let group_alive = |pid: u32| {
+            std::process::Command::new("kill")
+                .args(["-0", "--", &format!("-{pid}")])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        };
+        assert!(group_alive(pid), "test group should be running before kill");
+
+        assert!(
+            terminate_process_group(pid, Some(&mut child)),
+            "main child should be reaped within the bound"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while group_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process group survived TERM+KILL (a TERM-ignoring grandchild leaked)"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     #[test]
