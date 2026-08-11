@@ -25,6 +25,23 @@ const TELEGRAM_THREAD_SNAPSHOT_DETAIL_LIMIT: usize = 3000;
 /// The preview never shrinks below this, so a very long question cannot
 /// squeeze out Claude's actual answer entirely.
 const TELEGRAM_THREAD_SNAPSHOT_MIN_PREVIEW: usize = 600;
+/// Roughly how much label a Telegram row shows before buttons get squeezed.
+/// Wide (CJK/emoji) characters count double, which is what actually fills the
+/// row.
+const BUTTON_ROW_WIDTH_BUDGET: usize = 32;
+const MAX_BUTTONS_PER_ROW: usize = 3;
+
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| {
+            if (ch as u32) > 0x1100 && !ch.is_ascii() {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedTelegramDelivery {
@@ -32,6 +49,12 @@ pub(crate) struct PreparedTelegramDelivery {
     pub(crate) thread_id: Option<String>,
     pub(crate) event_id: String,
     pub(crate) callback_routes: Vec<TelegramCallbackRoute>,
+    /// Set for a question: delivery records which message carries it so a
+    /// text reply can be matched back to the waiting hook.
+    pub(crate) question_id: Option<String>,
+    /// Same, for an approval request — used to catch a text reply that was
+    /// meant as an answer and tell the user to use the buttons.
+    pub(crate) approval_id: Option<String>,
 }
 
 fn telegram_event_title(event_type: &str, event: &Value) -> &'static str {
@@ -45,6 +68,7 @@ fn telegram_event_title(event_type: &str, event: &Value) -> &'static str {
         "thread_error" => "⚠️ Bridge error",
         "bridge_notice" => "ℹ️ tinyCTB",
         "approval_request" => "🔐 需要你批准",
+        "question_request" => "❓ Claude 在问你",
         _ => "🧵 Claude update",
     }
 }
@@ -250,13 +274,19 @@ pub(crate) fn prepare_telegram_delivery(
     // registered by the hook that is blocking on the answer; they are returned
     // here so delivery can stamp them with the message id.
     let mut callback_routes = Vec::new();
-    if event_type == "approval_request" {
+    if event_type == "approval_request" || event_type == "question_request" {
         let buttons = event
             .get("buttons")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let mut keyboard_row = Vec::new();
+        // Layout follows label length, not button count: two or three short
+        // labels read well side by side (two especially), while a long label
+        // gets squeezed until the row stops looking tappable. So pack
+        // greedily within a width budget, at most three per row.
+        let mut rows: Vec<Value> = Vec::new();
+        let mut current_row: Vec<Value> = Vec::new();
+        let mut current_width = 0usize;
         for button in &buttons {
             let (Some(text), Some(callback_id)) = (
                 button.get("text").and_then(Value::as_str),
@@ -264,10 +294,19 @@ pub(crate) fn prepare_telegram_delivery(
             ) else {
                 continue;
             };
-            keyboard_row.push(json!({
+            let width = display_width(text);
+            if !current_row.is_empty()
+                && (current_row.len() >= MAX_BUTTONS_PER_ROW
+                    || current_width + width > BUTTON_ROW_WIDTH_BUDGET)
+            {
+                rows.push(json!(std::mem::take(&mut current_row)));
+                current_width = 0;
+            }
+            current_row.push(json!({
                 "text": text,
                 "callback_data": format!("claude:{callback_id}")
             }));
+            current_width += width;
             if let Some(action) = button
                 .get("action")
                 .and_then(Value::as_str)
@@ -283,15 +322,26 @@ pub(crate) fn prepare_telegram_delivery(
                         .get("approvalId")
                         .and_then(Value::as_str)
                         .map(str::to_string),
+                    question_id: event
+                        .get("questionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    answer: button
+                        .get("answer")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                 });
             }
         }
-        if !keyboard_row.is_empty() {
+        if !current_row.is_empty() {
+            rows.push(json!(current_row));
+        }
+        if !rows.is_empty() {
             // Buttons ride on the LAST chunk so they sit under the full text.
             if let Some(last) = payloads.last_mut().and_then(Value::as_object_mut) {
                 last.insert(
                     "reply_markup".to_string(),
-                    json!({ "inline_keyboard": [keyboard_row] }),
+                    json!({ "inline_keyboard": rows }),
                 );
             }
         }
@@ -306,6 +356,14 @@ pub(crate) fn prepare_telegram_delivery(
         thread_id,
         event_id,
         callback_routes,
+        question_id: event
+            .get("questionId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        approval_id: event
+            .get("approvalId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -629,6 +687,81 @@ mod tests {
         assert!(text.contains("Approve or deny this in the terminal"));
         assert!(prepared.callback_routes.is_empty());
         assert!(prepared.payloads[0].get("reply_markup").is_none());
+    }
+
+    /// Layout follows label length: short labels share a row (two side by
+    /// side reads best), long ones get a row each so they stay legible.
+    #[test]
+    fn button_rows_follow_label_length() {
+        let question = json!({
+            "type": "question_request",
+            "threadId": "t",
+            "questionId": "q1",
+            "lastPreview": "选哪个?",
+            "buttons": [
+                {"text": "A. 交给 Sol 再审", "callbackId": "c1", "action": "answer_question", "answer": "交给 Sol 再审"},
+                {"text": "B. 先关 away 休息", "callbackId": "c2", "action": "answer_question", "answer": "先关 away 休息"},
+                {"text": "C. 继续做 /stop 中断", "callbackId": "c3", "action": "answer_question", "answer": "继续做"}
+            ]
+        });
+        let prepared = prepare_telegram_delivery("999", &question).expect("prepared");
+        let keyboard = prepared.payloads.last().expect("payload")["reply_markup"]
+            ["inline_keyboard"]
+            .as_array()
+            .expect("keyboard")
+            .clone();
+        assert_eq!(
+            keyboard.len(),
+            3,
+            "long options get a row each: {keyboard:?}"
+        );
+        for row in &keyboard {
+            assert_eq!(row.as_array().expect("row").len(), 1, "{keyboard:?}");
+        }
+
+        // Two short options belong side by side.
+        let short = json!({
+            "type": "question_request",
+            "threadId": "t",
+            "questionId": "q2",
+            "lastPreview": "继续吗?",
+            "buttons": [
+                {"text": "🔴A 是", "callbackId": "s1", "action": "answer_question", "answer": "是"},
+                {"text": "🟠B 否", "callbackId": "s2", "action": "answer_question", "answer": "否"}
+            ]
+        });
+        let prepared = prepare_telegram_delivery("999", &short).expect("prepared");
+        let keyboard = prepared.payloads.last().expect("payload")["reply_markup"]
+            ["inline_keyboard"]
+            .as_array()
+            .expect("keyboard")
+            .clone();
+        assert_eq!(
+            keyboard.len(),
+            1,
+            "two short options share a row: {keyboard:?}"
+        );
+        assert_eq!(keyboard[0].as_array().expect("row").len(), 2);
+
+        let approval = json!({
+            "type": "approval_request",
+            "threadId": "t",
+            "approvalId": "a1",
+            "lastPreview": "Bash: ls",
+            "buttons": [
+                {"text": "✅ 允许", "callbackId": "d1", "action": "approve"},
+                {"text": "🔁 本会话都允许", "callbackId": "d2", "action": "approve_session"},
+                {"text": "❌ 拒绝", "callbackId": "d3", "action": "deny"}
+            ]
+        });
+        let prepared = prepare_telegram_delivery("999", &approval).expect("prepared");
+        let keyboard = prepared.payloads.last().expect("payload")["reply_markup"]
+            ["inline_keyboard"]
+            .as_array()
+            .expect("keyboard")
+            .clone();
+        assert_eq!(keyboard.len(), 1, "approval buttons stay on one row");
+        assert_eq!(keyboard[0].as_array().expect("row").len(), 3);
     }
 
     /// Regression for the "🟡 Claude needs you with no content" report: the

@@ -85,6 +85,8 @@ pub(crate) struct RoutedTelegramCallback {
     pub(crate) thread_id: String,
     pub(crate) action: TelegramCallbackAction,
     pub(crate) approval_id: Option<String>,
+    pub(crate) question_id: Option<String>,
+    pub(crate) answer: Option<String>,
 }
 
 pub(crate) fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result<Value> {
@@ -470,7 +472,8 @@ pub(crate) fn extract_telegram_callback_route(
     };
     let route = conn
         .query_row(
-            "SELECT thread_id, action, approval_id FROM telegram_callback_routes
+            "SELECT thread_id, action, approval_id, question_id, answer
+             FROM telegram_callback_routes
              WHERE callback_id = ?1 AND used_at IS NULL",
             params![callback_id],
             |row| {
@@ -478,19 +481,25 @@ pub(crate) fn extract_telegram_callback_route(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .optional()?;
-    Ok(route.and_then(|(thread_id, action, approval_id)| {
-        TelegramCallbackAction::from_str(&action).map(|action| RoutedTelegramCallback {
-            callback_query_id: callback_query_id.to_string(),
-            callback_id: callback_id.to_string(),
-            thread_id,
-            action,
-            approval_id,
-        })
-    }))
+    Ok(
+        route.and_then(|(thread_id, action, approval_id, question_id, answer)| {
+            TelegramCallbackAction::from_str(&action).map(|action| RoutedTelegramCallback {
+                callback_query_id: callback_query_id.to_string(),
+                callback_id: callback_id.to_string(),
+                thread_id,
+                action,
+                approval_id,
+                question_id,
+                answer,
+            })
+        }),
+    )
 }
 
 pub(crate) fn deliver_telegram_event(
@@ -528,14 +537,43 @@ fn deliver_prepared_telegram_delivery(
                 now,
             )?;
         }
+        // Remember which message carries a question, so a text reply to it
+        // is recognised as the answer.
+        // Record EVERY chunk, so a reply to any part of a long dialog is
+        // recognised as belonging to it.
+        if let Some(question_id) = prepared.question_id.as_deref() {
+            crate::state::attach_question_message_id(conn, question_id, message_id)?;
+            crate::state::record_dialog_message(
+                conn,
+                &telegram.chat_id,
+                message_id,
+                "question",
+                question_id,
+                now,
+            )?;
+        }
+        if let Some(approval_id) = prepared.approval_id.as_deref() {
+            crate::state::attach_approval_message_id(conn, approval_id, message_id)?;
+            crate::state::record_dialog_message(
+                conn,
+                &telegram.chat_id,
+                message_id,
+                "approval",
+                approval_id,
+                now,
+            )?;
+        }
         message_ids.push(message_id);
     }
     let first_message_id = *message_ids
         .first()
         .context("Telegram delivery did not send any messages")?;
+    // The keyboard rides on the LAST chunk, so that is the message a button
+    // belongs to.
+    let keyboard_message_id = *message_ids.last().unwrap_or(&first_message_id);
     for route in &mut prepared.callback_routes {
-        route.message_id = Some(first_message_id);
-        update_telegram_callback_message_id(conn, &route.callback_id, first_message_id)?;
+        route.message_id = Some(keyboard_message_id);
+        update_telegram_callback_message_id(conn, &route.callback_id, keyboard_message_id)?;
     }
     if let Some(thread_id) = prepared.thread_id.as_deref() {
         clear_telegram_typing_indicator(conn, telegram, thread_id)?;
@@ -1481,6 +1519,29 @@ fn record_callback_answer(
     route: &RoutedTelegramCallback,
     now: u64,
 ) -> Result<Value> {
+    // A question button carries the chosen option rather than a permission
+    // decision; the blocked hook is waiting on the answer text.
+    if let (Some(question_id), Some(answer)) =
+        (route.question_id.as_deref(), route.answer.as_deref())
+    {
+        let outcome = crate::state::record_question_answer(conn, question_id, answer, now)?;
+        let toast = match outcome {
+            ApprovalAnswer::Recorded => format!("已作答：{answer}"),
+            ApprovalAnswer::AlreadyAnswered => "这个问题已经回答过了。".to_string(),
+            ApprovalAnswer::Expired => "这个问题已超时，会话已回到终端等待作答。".to_string(),
+            ApprovalAnswer::Unknown => "这个按钮已经失效了。".to_string(),
+        };
+        return Ok(json!({
+            "ok": true,
+            "action": "telegram_question_answer",
+            "questionId": question_id,
+            "threadId": route.thread_id,
+            "answer": answer,
+            "outcome": format!("{outcome:?}"),
+            "recorded": outcome == ApprovalAnswer::Recorded,
+            "toast": toast
+        }));
+    }
     let Some(approval_id) = route.approval_id.as_deref() else {
         return Ok(json!({
             "ok": true,
@@ -1492,6 +1553,15 @@ fn record_callback_answer(
         TelegramCallbackAction::Approve => "allow",
         TelegramCallbackAction::ApproveSession => "allow_session",
         TelegramCallbackAction::Deny => "deny",
+        // Reached only if a question button lost its answer text; refuse
+        // rather than guess a permission decision from it.
+        TelegramCallbackAction::AnswerQuestion => {
+            return Ok(json!({
+                "ok": true,
+                "action": "telegram_callback_incomplete",
+                "toast": "这个按钮已经失效了。"
+            }))
+        }
     };
     let outcome = crate::state::record_approval_decision(conn, approval_id, decision, now)?;
     let tool_name = crate::state::pending_approval_row(conn, approval_id)?
@@ -1506,7 +1576,9 @@ fn record_callback_answer(
             TelegramCallbackAction::ApproveSession => {
                 format!("已允许，本会话内 {tool_name} 不再询问。")
             }
-            TelegramCallbackAction::Deny => "已拒绝。".to_string(),
+            TelegramCallbackAction::Deny | TelegramCallbackAction::AnswerQuestion => {
+                "已拒绝。".to_string()
+            }
         },
         ApprovalAnswer::AlreadyAnswered => "这条请求已经处理过了。".to_string(),
         ApprovalAnswer::Expired => "这条请求已超时，会话已回到终端等待处理。".to_string(),
@@ -1522,6 +1594,87 @@ fn record_callback_answer(
         "recorded": outcome == ApprovalAnswer::Recorded,
         "toast": toast
     }))
+}
+
+/// Handle a reply that targets something the session is blocked on: a
+/// question (the text IS the answer) or an approval (text is refused —
+/// permission needs a button). Returns None for an ordinary reply so normal
+/// routing continues.
+fn answer_pending_question_from_reply(
+    conn: &Connection,
+    message: &Value,
+    telegram: &TelegramConfig,
+    now: u64,
+    timeout: Duration,
+) -> Result<Option<Value>> {
+    let chat_id = telegram_chat_id(message);
+    let user_id = telegram_from_user_id(message);
+    if !telegram_authorized(telegram, chat_id.as_deref(), user_id.as_deref()) {
+        return Ok(None);
+    }
+    let Some(reply_to) = message
+        .get("reply_to_message")
+        .and_then(telegram_message_id)
+    else {
+        return Ok(None);
+    };
+    let Some(text) = message
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(chat_id) = chat_id else {
+        return Ok(None);
+    };
+    // Recognition is by message, NOT by pending state: a reply to a dialog
+    // that has already been answered or timed out is still a reply to that
+    // dialog. Treating it as ordinary chat would inject it into the session
+    // and leave the user thinking they answered something.
+    let Some((kind, ref_id)) = crate::state::dialog_for_message(conn, &chat_id, reply_to)? else {
+        return Ok(None);
+    };
+
+    if kind == "approval" {
+        // Granting permission must stay a deliberate, unambiguous act: a
+        // button. Free text can mean anything ("ok", "算了", "不要删"), and
+        // mis-reading it as consent is exactly the mistake this feature must
+        // never make.
+        let notice = match crate::state::approval_decision(conn, &ref_id)? {
+            None => "这条是审批请求，文字回复不算授权。请点消息下面的按钮作答（允许 / 本会话都允许 / 拒绝）。",
+            Some(decision) if decision == "expired" => {
+                "这条审批已超时，会话已回到终端等待处理。文字回复不算授权。"
+            }
+            Some(_) => "这条审批已经处理过了。文字回复不算授权。",
+        };
+        let sent = send_telegram_command_text(telegram, notice, timeout)?;
+        return Ok(Some(json!({
+            "ok": true,
+            "action": "telegram_approval_needs_button",
+            "approvalId": ref_id,
+            "sent": sent
+        })));
+    }
+
+    let question_id = ref_id;
+    let outcome = crate::state::record_question_answer(conn, &question_id, text, now)?;
+    let notice = match outcome {
+        ApprovalAnswer::Recorded => format!("已作答：{text}"),
+        ApprovalAnswer::AlreadyAnswered => "这个问题已经回答过了。".to_string(),
+        ApprovalAnswer::Expired => "这个问题已超时，会话已回到终端等待作答。".to_string(),
+        ApprovalAnswer::Unknown => "这个问题已经失效了。".to_string(),
+    };
+    let sent = send_telegram_command_text(telegram, &notice, timeout)?;
+    Ok(Some(json!({
+        "ok": true,
+        "action": "telegram_question_reply",
+        "questionId": question_id,
+        "answer": text,
+        "outcome": format!("{outcome:?}"),
+        "sent": sent
+    })))
 }
 
 pub(crate) fn process_telegram_updates(
@@ -1601,7 +1754,29 @@ fn process_telegram_update_batch(
                 let route_message_id = message
                     .get("reply_to_message")
                     .and_then(telegram_message_id);
-                if let Some(route) = extract_telegram_reply_route(conn, message, telegram)? {
+                // A reply to a question the session is blocked on IS the
+                // answer — injecting it as a new user message would leave
+                // the question hanging.
+                if let Some(result) =
+                    answer_pending_question_from_reply(conn, message, telegram, now, timeout)?
+                {
+                    if let Some(update_id) = update_id {
+                        record_telegram_inbound_processed(
+                            conn,
+                            bot_id,
+                            update_id,
+                            "telegram_question_reply",
+                            &result,
+                            TelegramInboundLogContext {
+                                route_message_id,
+                                result_action: result.get("action").and_then(Value::as_str),
+                                ..TelegramInboundLogContext::default()
+                            },
+                            now,
+                        )?;
+                    }
+                    replies += 1;
+                } else if let Some(route) = extract_telegram_reply_route(conn, message, telegram)? {
                     let result = send_claude_reply_to_thread(
                         conn,
                         config,
@@ -2142,6 +2317,8 @@ mod tests {
             thread_id: "sess-toast".to_string(),
             action,
             approval_id: Some(approval_id.to_string()),
+            question_id: None,
+            answer: None,
         };
 
         crate::state::create_pending_approval(
@@ -2199,6 +2376,287 @@ mod tests {
         )
         .expect("unknown");
         assert_eq!(unknown["outcome"], "Unknown");
+    }
+
+    /// Permission is granted by a button and nothing else. A text reply to
+    /// an approval must NOT count as consent, and must not be injected into
+    /// the session either — that would look like an answer to the user while
+    /// the approval quietly timed out.
+    #[test]
+    fn text_reply_never_authorises_an_approval() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = CommandEnv::new("text-not-consent");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("config");
+        let telegram = config.telegram.clone().expect("telegram");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::create_pending_approval(
+            &conn,
+            "ap-text",
+            "sess-x",
+            "Bash",
+            "Bash: rm -rf /",
+            1000,
+            9000,
+        )
+        .expect("create");
+        crate::state::attach_approval_message_id(&conn, "ap-text", 77).expect("attach");
+        crate::state::record_dialog_message(&conn, "456", 77, "approval", "ap-text", 1000)
+            .expect("dialog message");
+        // The approval message is also a routable thread message, which is
+        // exactly how a text reply used to get injected instead.
+        crate::state::insert_telegram_message_route(&conn, "456", 77, "sess-x", "e", 1000)
+            .expect("route");
+        let _ = crate::claude::test_spawn::take();
+
+        let reply = json!({
+            "message_id": 78,
+            "chat": { "id": "456" },
+            "from": { "id": "789" },
+            "reply_to_message": { "message_id": 77 },
+            "text": "允许"
+        });
+        let result = answer_pending_question_from_reply(
+            &conn,
+            &reply,
+            &telegram,
+            2000,
+            Duration::from_secs(1),
+        )
+        .expect("handled")
+        .expect("an approval reply must be intercepted");
+
+        assert_eq!(result["action"], "telegram_approval_needs_button");
+        assert_eq!(
+            crate::state::approval_decision(&conn, "ap-text").expect("decision"),
+            None,
+            "text must never grant permission"
+        );
+        assert!(
+            crate::claude::test_spawn::take().is_empty(),
+            "and must not be injected into the session as a message"
+        );
+    }
+
+    /// The same text, replying to a QUESTION, is a legitimate answer — it
+    /// carries information, never permission.
+    #[test]
+    fn text_reply_answers_a_question_but_only_ever_as_content() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = CommandEnv::new("text-is-answer");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("config");
+        let telegram = config.telegram.clone().expect("telegram");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::create_pending_question(
+            &conn,
+            "q-text",
+            "sess-x",
+            "按优先级排列这几项",
+            &[],
+            1000,
+            9000,
+        )
+        .expect("create");
+        crate::state::attach_question_message_id(&conn, "q-text", 88).expect("attach");
+        crate::state::record_dialog_message(&conn, "456", 88, "question", "q-text", 1000)
+            .expect("dialog message");
+
+        let reply = json!({
+            "message_id": 89,
+            "chat": { "id": "456" },
+            "from": { "id": "789" },
+            "reply_to_message": { "message_id": 88 },
+            "text": "3,1,2"
+        });
+        let result = answer_pending_question_from_reply(
+            &conn,
+            &reply,
+            &telegram,
+            2000,
+            Duration::from_secs(1),
+        )
+        .expect("handled")
+        .expect("a question reply must be taken as the answer");
+
+        assert_eq!(result["action"], "telegram_question_reply");
+        assert_eq!(
+            crate::state::question_answer(&conn, "q-text").expect("answer"),
+            Some("3,1,2".to_string()),
+            "free text is how an ordering is given"
+        );
+    }
+
+    /// A dialog that is already settled is still a dialog: replying to it
+    /// must be consumed with an honest status, never leak into the session
+    /// as chat.
+    #[test]
+    fn reply_to_a_settled_dialog_is_still_recognised() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = CommandEnv::new("settled-dialog");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("config");
+        let telegram = config.telegram.clone().expect("telegram");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_spawn::take();
+
+        // An approval that already timed out, and an answered question.
+        crate::state::create_pending_approval(
+            &conn, "ap-done", "sess-x", "Bash", "Bash: ls", 1000, 5000,
+        )
+        .expect("create");
+        crate::state::record_dialog_message(&conn, "456", 10, "approval", "ap-done", 1000)
+            .expect("dialog");
+        crate::state::insert_telegram_message_route(&conn, "456", 10, "sess-x", "e", 1000)
+            .expect("route");
+        crate::state::expire_or_take_decision(&conn, "ap-done", 6000).expect("expire");
+
+        crate::state::create_pending_question(&conn, "q-done", "sess-x", "哪个?", &[], 1000, 9000)
+            .expect("create");
+        crate::state::record_dialog_message(&conn, "456", 20, "question", "q-done", 1000)
+            .expect("dialog");
+        crate::state::insert_telegram_message_route(&conn, "456", 20, "sess-x", "e", 1000)
+            .expect("route");
+        crate::state::record_question_answer(&conn, "q-done", "SQLite", 2000).expect("answer");
+
+        for (message_id, expected, needle) in [
+            (10, "telegram_approval_needs_button", "超时"),
+            (20, "telegram_question_reply", ""),
+        ] {
+            let reply = json!({
+                "message_id": message_id + 1,
+                "chat": { "id": "456" },
+                "from": { "id": "789" },
+                "reply_to_message": { "message_id": message_id },
+                "text": "随便说点什么"
+            });
+            let result = answer_pending_question_from_reply(
+                &conn,
+                &reply,
+                &telegram,
+                7000,
+                Duration::from_secs(1),
+            )
+            .expect("handled")
+            .expect("a settled dialog must still be recognised");
+            assert_eq!(result["action"], expected, "{result}");
+            if !needle.is_empty() {
+                assert!(
+                    result["sent"]["result"]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains(needle),
+                    "the notice must state the real status: {result}"
+                );
+            }
+        }
+        // The answered question keeps its first answer.
+        assert_eq!(
+            crate::state::question_answer(&conn, "q-done").expect("answer"),
+            Some("SQLite".to_string())
+        );
+        assert!(
+            crate::claude::test_spawn::take().is_empty(),
+            "no reply to a dialog may be injected into the session"
+        );
+    }
+
+    /// A long question is split across several Telegram messages; replying to
+    /// ANY chunk must still count as replying to that dialog.
+    #[test]
+    fn reply_to_any_chunk_of_a_split_dialog_is_recognised() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = CommandEnv::new("split-dialog");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("config");
+        let telegram = config.telegram.clone().expect("telegram");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::create_pending_question(
+            &conn,
+            "q-split",
+            "sess-x",
+            "很长的问题",
+            &[],
+            1000,
+            9000,
+        )
+        .expect("create");
+        // Delivery records every chunk; the keyboard rides the last one.
+        for message_id in [31, 32, 33] {
+            crate::state::record_dialog_message(
+                &conn, "456", message_id, "question", "q-split", 1000,
+            )
+            .expect("dialog");
+            crate::state::insert_telegram_message_route(
+                &conn, "456", message_id, "sess-x", "e", 1000,
+            )
+            .expect("route");
+        }
+
+        // Reply to the FIRST chunk — the one that used to fall through.
+        let reply = json!({
+            "message_id": 40,
+            "chat": { "id": "456" },
+            "from": { "id": "789" },
+            "reply_to_message": { "message_id": 31 },
+            "text": "3,1,2"
+        });
+        let result = answer_pending_question_from_reply(
+            &conn,
+            &reply,
+            &telegram,
+            2000,
+            Duration::from_secs(1),
+        )
+        .expect("handled")
+        .expect("a reply to the first chunk must answer the dialog");
+        assert_eq!(result["action"], "telegram_question_reply");
+        assert_eq!(
+            crate::state::question_answer(&conn, "q-split").expect("answer"),
+            Some("3,1,2".to_string())
+        );
+    }
+
+    /// A reply from the wrong chat or user answers nothing.
+    #[test]
+    fn unauthorised_reply_cannot_answer_anything() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = CommandEnv::new("text-unauthorised");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("config");
+        let telegram = config.telegram.clone().expect("telegram");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::create_pending_question(&conn, "q-auth", "sess-x", "哪个?", &[], 1000, 9000)
+            .expect("create");
+        crate::state::attach_question_message_id(&conn, "q-auth", 90).expect("attach");
+        crate::state::record_dialog_message(&conn, "456", 90, "question", "q-auth", 1000)
+            .expect("dialog message");
+
+        for (chat, user) in [("999", "789"), ("456", "111")] {
+            let reply = json!({
+                "message_id": 91,
+                "chat": { "id": chat },
+                "from": { "id": user },
+                "reply_to_message": { "message_id": 90 },
+                "text": "SQLite"
+            });
+            assert!(
+                answer_pending_question_from_reply(
+                    &conn,
+                    &reply,
+                    &telegram,
+                    2000,
+                    Duration::from_secs(1)
+                )
+                .expect("handled")
+                .is_none(),
+                "chat {chat} / user {user} must not be able to answer"
+            );
+        }
+        assert_eq!(
+            crate::state::question_answer(&conn, "q-auth").expect("answer"),
+            None
+        );
     }
 
     #[test]
@@ -2582,6 +3040,8 @@ mod tests {
                 thread_id: "thr_1".to_string(),
                 action: TelegramCallbackAction::Approve,
                 approval_id: None,
+                question_id: None,
+                answer: None,
             },
             1000,
         )

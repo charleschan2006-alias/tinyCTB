@@ -19,6 +19,12 @@ pub(crate) const HOOKED_EVENTS: &[&str] = &["Stop", "Notification", "SessionStar
 /// enough to outlast a human reaching for their phone.
 pub(crate) const APPROVAL_HOOK_EVENT: &str = "PermissionRequest";
 const APPROVAL_HOOK_MARKER: &str = "approval-gate";
+/// Answering an `AskUserQuestion` needs `PreToolUse` (no hook can take over
+/// the question dialog), but the matcher pins it to that one tool so it does
+/// not run on every tool call.
+pub(crate) const QUESTION_HOOK_EVENT: &str = "PreToolUse";
+const QUESTION_HOOK_MATCHER: &str = "AskUserQuestion";
+const QUESTION_HOOK_MARKER: &str = "question-gate";
 const HOOK_MARKER: &str = "hook-event";
 const HOOK_TIMEOUT_SECONDS: u64 = 10;
 
@@ -52,7 +58,9 @@ fn is_tinyctb_hook(entry: &Value) -> bool {
         .and_then(Value::as_str)
         .map(|command| {
             command.contains("tinyctb")
-                && (command.contains(HOOK_MARKER) || command.contains(APPROVAL_HOOK_MARKER))
+                && (command.contains(HOOK_MARKER)
+                    || command.contains(APPROVAL_HOOK_MARKER)
+                    || command.contains(QUESTION_HOOK_MARKER))
         })
         .unwrap_or(false)
 }
@@ -172,6 +180,31 @@ pub(crate) fn install_hooks(bridge_command: &str, dry_run: bool) -> Result<Value
     }));
     installed.push(APPROVAL_HOOK_EVENT.to_string());
 
+    let question_command = format!(
+        "{} question-gate",
+        shell_quote(
+            &resolve_bridge_binary_for_hooks(bridge_command)?
+                .display()
+                .to_string()
+        )
+    );
+    let groups_value = hooks
+        .entry(QUESTION_HOOK_EVENT.to_string())
+        .or_insert_with(|| json!([]));
+    let groups = groups_value
+        .as_array_mut()
+        .with_context(|| format!("Claude settings hooks.{QUESTION_HOOK_EVENT} must be an array"))?;
+    strip_tinyctb_entries(groups);
+    groups.push(json!({
+        "matcher": QUESTION_HOOK_MATCHER,
+        "hooks": [{
+            "type": "command",
+            "command": question_command,
+            "timeout": approval_timeout
+        }]
+    }));
+    installed.push(format!("{QUESTION_HOOK_EVENT}({QUESTION_HOOK_MATCHER})"));
+
     if !dry_run {
         write_settings(&path, &settings)?;
         fs::create_dir_all(events_spool_dir()?)?;
@@ -183,6 +216,7 @@ pub(crate) fn install_hooks(bridge_command: &str, dry_run: bool) -> Result<Value
         "settingsPath": path.display().to_string(),
         "command": command,
         "approvalCommand": approval_command,
+        "questionCommand": question_command,
         "approvalTimeoutSeconds": approval_timeout,
         "events": installed,
         "note": "Restart running interactive Claude Code sessions so they pick up the new hooks."
@@ -196,6 +230,7 @@ pub(crate) fn uninstall_hooks(dry_run: bool) -> Result<Value> {
         for event in HOOKED_EVENTS
             .iter()
             .chain(std::iter::once(&APPROVAL_HOOK_EVENT))
+            .chain(std::iter::once(&QUESTION_HOOK_EVENT))
         {
             if let Some(groups) = hooks.get_mut(*event).and_then(Value::as_array_mut) {
                 removed += strip_tinyctb_entries(groups);
@@ -227,6 +262,7 @@ pub(crate) fn hooks_status() -> Result<Value> {
     for event in HOOKED_EVENTS
         .iter()
         .chain(std::iter::once(&APPROVAL_HOOK_EVENT))
+        .chain(std::iter::once(&QUESTION_HOOK_EVENT))
     {
         let installed = settings
             .get("hooks")
@@ -345,6 +381,15 @@ mod tests {
         assert_eq!(status["installed"], true);
         // The approval gate is installed as its own PreToolUse entry, with a
         // timeout long enough to outlast a human tapping a Telegram button.
+        // The question gate is pinned to AskUserQuestion so it does not run
+        // on every tool call.
+        let question = settings["hooks"][QUESTION_HOOK_EVENT][0].clone();
+        assert_eq!(question["matcher"], QUESTION_HOOK_MATCHER);
+        assert!(question["hooks"][0]["command"]
+            .as_str()
+            .expect("question command")
+            .ends_with("question-gate"));
+
         let approval = settings["hooks"][APPROVAL_HOOK_EVENT][0]["hooks"][0].clone();
         assert!(approval["command"]
             .as_str()
@@ -358,8 +403,8 @@ mod tests {
         let uninstalled = uninstall_hooks(false).expect("uninstall");
         assert_eq!(
             uninstalled["removed"],
-            (HOOKED_EVENTS.len() + 1) as i64,
-            "the spool hooks plus the PreToolUse approval gate"
+            (HOOKED_EVENTS.len() + 2) as i64,
+            "the spool hooks plus the PermissionRequest approval gate and the              PreToolUse question gate"
         );
         let settings: Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings"))

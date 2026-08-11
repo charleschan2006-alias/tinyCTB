@@ -95,6 +95,11 @@ pub(crate) enum Commands {
         about = "PreToolUse hook: confirm a gated tool call from Telegram while away"
     )]
     ApprovalGate,
+    #[command(
+        hide = true,
+        about = "PreToolUse hook: answer an AskUserQuestion from Telegram while away"
+    )]
+    QuestionGate,
     #[command(about = "Manage the curated project registry for Telegram-created sessions")]
     Projects {
         #[command(subcommand)]

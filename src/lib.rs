@@ -359,6 +359,13 @@ fn run() -> Result<i32> {
                 approvals::run_approval_gate(&mut stdin.lock(), now).unwrap_or_else(|_| json!({}));
             println!("{}", serde_json::to_string(&result)?);
         }
+        Commands::QuestionGate => {
+            let now = now_millis().unwrap_or(0);
+            let stdin = std::io::stdin();
+            let result =
+                approvals::run_question_gate(&mut stdin.lock(), now).unwrap_or_else(|_| json!({}));
+            println!("{}", serde_json::to_string(&result)?);
+        }
         Commands::Projects { command } => match command {
             ProjectCommands::List { observed_limit } => {
                 let result = projects_list_result(observed_limit)?;

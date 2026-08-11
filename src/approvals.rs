@@ -178,6 +178,8 @@ pub(crate) fn run_approval_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
                 thread_id: thread_id.clone(),
                 action,
                 approval_id: Some(approval_id.clone()),
+                question_id: None,
+                answer: None,
             },
             now,
         )?;
@@ -227,6 +229,275 @@ pub(crate) fn run_approval_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         // dialog.
         None => Ok(no_opinion()),
     }
+}
+
+/// `AskUserQuestion` asked from Telegram. Registered as a `PreToolUse` hook
+/// with `matcher: "AskUserQuestion"`, because no hook can take over the
+/// question dialog itself and `PermissionRequest` never fires for it (asking
+/// is not a permission-gated action).
+///
+/// The answer goes back through the tool's own contract — `allow` plus an
+/// `updatedInput` carrying an `answers` map — so the call completes with the
+/// answer as its result. The `allow` grants nothing: asking has no side
+/// effect, and permission still requires an approval button.
+///
+/// The tool's own dialog offers buttons AND a free-text box, so Telegram
+/// mirrors both: one button per option, plus "reply with text" for anything
+/// else — a custom answer, a skip, an ordering like `3,1,2`, or the
+/// comma-separated form a multi-select question needs.
+pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Value> {
+    let mut raw = String::new();
+    reader
+        .take(1024 * 1024)
+        .read_to_string(&mut raw)
+        .context("failed to read PreToolUse payload")?;
+    let payload: Value =
+        serde_json::from_str(raw.trim()).context("PreToolUse payload is not valid JSON")?;
+
+    if !away_mode_active() {
+        return Ok(no_opinion());
+    }
+    if payload.get("tool_name").and_then(Value::as_str) != Some("AskUserQuestion") {
+        return Ok(no_opinion());
+    }
+    if payload.get("permission_mode").and_then(Value::as_str) == Some("bypassPermissions") {
+        return Ok(no_opinion());
+    }
+    let Ok(config) = load_daemon_config() else {
+        return Ok(no_opinion());
+    };
+    let Some(telegram) = config.telegram.clone() else {
+        return Ok(no_opinion());
+    };
+    let thread_id = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if thread_id.is_empty() {
+        return Ok(no_opinion());
+    }
+    // Several questions in one call would need several round trips; that is
+    // not worth the complexity here, so leave those to the terminal dialog.
+    let questions = payload
+        .pointer("/tool_input/questions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if questions.len() != 1 {
+        return Ok(no_opinion());
+    }
+    // The answers map is keyed by the question text EXACTLY as the tool sent
+    // it; a trimmed key would not match and the tool would still consider the
+    // question unanswered. Trimming is for display only.
+    let question_raw = questions[0]
+        .get("question")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let question_text = question_raw.trim().to_string();
+    if question_text.is_empty() {
+        return Ok(no_opinion());
+    }
+    // A multi-select question cannot be answered by a single tap — the first
+    // button press would submit and lose the rest. Those are answered by a
+    // comma-separated reply instead (which is the shape the tool wants).
+    let multi_select = questions[0]
+        .get("multiSelect")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let options = questions[0]
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(|option| option.get("label").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let claude = config.claude.clone().unwrap_or_default();
+    let wait = Duration::from_secs(claude.approval_timeout_seconds.clamp(5, 3600));
+    let conn = create_state_db(&state_db_path()?)?;
+    let question_id = format!("q{}", generate_session_uuid()?.replace('-', ""));
+    crate::state::create_pending_question(
+        &conn,
+        &question_id,
+        &thread_id,
+        &question_text,
+        &options,
+        now,
+        now + wait.as_millis() as u64,
+    )?;
+
+    let mut buttons = Vec::new();
+    for (index, label) in options.iter().enumerate().take(8) {
+        if multi_select {
+            break;
+        }
+        let callback_id = format!(
+            "qa{}",
+            generate_session_uuid()?
+                .replace('-', "")
+                .chars()
+                .take(16)
+                .collect::<String>()
+        );
+        insert_telegram_callback_route(
+            &conn,
+            &TelegramCallbackRoute {
+                callback_id: callback_id.clone(),
+                chat_id: telegram.chat_id.clone(),
+                message_id: None,
+                thread_id: thread_id.clone(),
+                action: TelegramCallbackAction::AnswerQuestion,
+                approval_id: None,
+                question_id: Some(question_id.clone()),
+                answer: Some(label.clone()),
+            },
+            now,
+        )?;
+        // Colour makes a row read as a button; the letter makes options
+        // distinguishable at a glance (and is what a text reply can name).
+        // Unicode has no full A–Z coloured-letter set — 🅰️🅱️ stop at B and
+        // regional indicators (🇦🇧🇨) render flat on some clients — so a
+        // saturated dot supplies the colour and the letter follows it.
+        const MARKERS: [&str; 8] = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "🟤", "⚫"];
+        let marker = MARKERS[index.min(MARKERS.len() - 1)];
+        let letter = (b'A' + index as u8) as char;
+        buttons.push(json!({
+            "text": format!("{marker}{letter} {}", truncate_tool_detail(label)),
+            "callbackId": callback_id,
+            "action": TelegramCallbackAction::AnswerQuestion.as_str(),
+            "answer": label
+        }));
+    }
+
+    let cwd = payload.get("cwd").and_then(Value::as_str);
+    // When the options are buttons, listing them in the body too makes the
+    // buttons read as a duplicate block of text — the body keeps just the
+    // question. Only the no-button paths spell the options out.
+    let body = if options.is_empty() {
+        question_text.clone()
+    } else if multi_select {
+        let listed = options
+            .iter()
+            .enumerate()
+            .map(|(index, label)| format!("{}. {label}", (b'A' + index as u8) as char))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{question_text}\n\n{listed}\n\n（多选）回复本消息，逗号分隔，例如 A,C")
+    } else {
+        question_text.clone()
+    };
+    let event = json!({
+        "type": "question_request",
+        "threadId": thread_id,
+        "questionId": question_id,
+        "observedAt": now,
+        "eventKey": format!("question:{question_id}"),
+        "lastPreview": body,
+        "buttons": buttons,
+        "thread": {
+            "threadId": thread_id,
+            "cwd": cwd,
+            "project": crate::projects::derive_project_label(cwd),
+            "lastPreview": body
+        }
+    });
+    enqueue_outbound_event(&conn, &event, now, "bridge")?;
+
+    let deadline = std::time::Instant::now() + wait;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(POLL_INTERVAL);
+        if let Some(answer) = crate::state::question_answer(&conn, &question_id)? {
+            if answer != crate::state::QUESTION_EXPIRED {
+                return Ok(answered(
+                    &questions,
+                    &question_raw,
+                    &resolve_answer(&answer, &options),
+                ));
+            }
+        }
+    }
+    match crate::state::expire_or_take_answer(&conn, &question_id, now)? {
+        Some(answer) => Ok(answered(
+            &questions,
+            &question_raw,
+            &resolve_answer(&answer, &options),
+        )),
+        None => Ok(no_opinion()),
+    }
+}
+
+/// Hand the user's choice back through the tool's own contract: the question
+/// tool accepts an `answers` map (question text -> answer string), so the
+/// call is allowed to complete WITH the answer already filled in. The model
+/// then receives it as a tool result rather than having to infer it from a
+/// refusal message.
+///
+/// The `allow` here is not a permission grant — asking a question has no side
+/// effect. Granting permission still requires an approval button.
+/// Let the user answer with option letters ("A", "a,c") as well as full
+/// labels — the letters are what the message shows, so typing them is the
+/// obvious thing to do. Multi-part answers come back comma-separated, the
+/// shape the tool documents for multi-select.
+///
+/// Everything else must survive **byte for byte**. Two ways an earlier
+/// version corrupted answers, both guarded below: a tapped label that itself
+/// contains a comma (`Washington, D.C.`) got split and rejoined without the
+/// space, and a sentence that merely opens with a letter (`A, but only
+/// locally`) had that letter swapped for an option label.
+fn resolve_answer(answer: &str, options: &[String]) -> String {
+    let trimmed = answer.trim();
+    // A tapped button sends its label verbatim, and a typed answer may equally
+    // well be one. Labels are free text, commas included, so recognise them
+    // before any splitting happens.
+    if options.iter().any(|option| option == trimmed) {
+        return trimmed.to_string();
+    }
+    let parts = trimmed
+        .split([',', '，', '、'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    // Expand letter codes only when the answer is *nothing but* codes.
+    // Rewriting one token of a sentence would put words in the user's mouth.
+    let resolved = parts
+        .iter()
+        .map(|part| letter_option(part, options))
+        .collect::<Option<Vec<_>>>();
+    match resolved {
+        Some(labels) if !labels.is_empty() => labels.join(","),
+        _ => trimmed.to_string(),
+    }
+}
+
+/// `"a"` / `"C"` -> the option at that position, when there is one.
+fn letter_option(part: &str, options: &[String]) -> Option<String> {
+    let mut chars = part.chars();
+    let letter = match (chars.next(), chars.next()) {
+        (Some(letter), None) if letter.is_ascii_alphabetic() => letter,
+        _ => return None,
+    };
+    let index = usize::from(letter.to_ascii_uppercase() as u8 - b'A');
+    options.get(index).cloned()
+}
+
+fn answered(questions: &[Value], question_text: &str, answer: &str) -> Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": "Answered from Telegram",
+            "updatedInput": {
+                "questions": questions,
+                "answers": { question_text: answer }
+            }
+        }
+    })
 }
 
 /// Turn a recorded answer into the hook's reply. Kept in one place so the
@@ -659,6 +930,371 @@ mod tests {
         assert_eq!(
             crate::state::record_approval_decision(&conn, "race-2", "allow", 5002)
                 .expect("late tap"),
+            crate::state::ApprovalAnswer::Expired
+        );
+    }
+
+    fn question_payload() -> Value {
+        json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "sess-q",
+            "tool_name": "AskUserQuestion",
+            "permission_mode": "default",
+            "cwd": "/home/user/project",
+            "tool_input": { "questions": [{
+                "question": "这个项目用哪个数据库？",
+                "options": [
+                    {"label": "Postgres", "description": "关系型"},
+                    {"label": "SQLite", "description": "嵌入式"}
+                ]
+            }]}
+        })
+    }
+
+    fn question_gate(payload: Value) -> Value {
+        let mut reader = std::io::Cursor::new(payload.to_string());
+        run_question_gate(&mut reader, 1000).expect("question gate")
+    }
+
+    /// Tapping an option answers the blocked question; the choice reaches the
+    /// model as the tool's own result.
+    #[test]
+    fn question_gate_returns_the_option_the_user_tapped() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("question-option", true, 30);
+        let handle = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                let Ok(question_id) = conn.query_row(
+                    "SELECT question_id FROM pending_questions WHERE answer IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) else {
+                    continue;
+                };
+                if matches!(
+                    crate::state::record_question_answer(&conn, &question_id, "SQLite", 2000),
+                    Ok(crate::state::ApprovalAnswer::Recorded)
+                ) {
+                    return;
+                }
+            }
+            panic!("question row never appeared");
+        });
+        let result = question_gate(question_payload());
+        handle.join().expect("answering thread");
+
+        // The official contract: the call is allowed to complete with the
+        // answer filled into the tool's own `answers` map, so the model
+        // receives it as a tool result rather than inferring it from a
+        // refusal message.
+        let out = &result["hookSpecificOutput"];
+        assert_eq!(out["permissionDecision"], "allow", "{result}");
+        assert_eq!(
+            out["updatedInput"]["answers"]["这个项目用哪个数据库？"], "SQLite",
+            "{result}"
+        );
+        // The original questions must be passed through untouched.
+        assert_eq!(
+            out["updatedInput"]["questions"][0]["options"][1]["label"], "SQLite",
+            "{result}"
+        );
+
+        // Single-select options live on the buttons only: repeating them in
+        // the body made the buttons read as one more block of text.
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let payload: String = conn
+            .query_row("SELECT payload_json FROM outbound_events", [], |row| {
+                row.get(0)
+            })
+            .expect("outbound");
+        assert!(payload.contains("question_request"), "{payload}");
+        assert!(
+            !payload.contains("\\nA. Postgres"),
+            "options must not be duplicated in the body: {payload}"
+        );
+        // Each option carries a distinct, saturated colour marker — that is
+        // what makes a row read as a button rather than as text.
+        assert!(payload.contains("🔴A Postgres"), "{payload}");
+        assert!(payload.contains("🟠B SQLite"), "{payload}");
+        assert!(payload.contains("这个项目用哪个数据库？"));
+    }
+
+    /// The free-text path — the same one that carries an ordering like
+    /// `3,1,2`, which is why phases 2 and 3 are one feature.
+    #[test]
+    fn question_gate_accepts_a_free_text_answer() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("question-text", true, 30);
+        let handle = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                let Ok(question_id) = conn.query_row(
+                    "SELECT question_id FROM pending_questions WHERE answer IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) else {
+                    continue;
+                };
+                // Simulate the daemon matching a text reply to the message
+                // that carries the question.
+                crate::state::attach_question_message_id(&conn, &question_id, 4242)
+                    .expect("attach");
+                crate::state::record_dialog_message(
+                    &conn,
+                    "456",
+                    4242,
+                    "question",
+                    &question_id,
+                    1000,
+                )
+                .expect("dialog message");
+                let (kind, matched) = crate::state::dialog_for_message(&conn, "456", 4242)
+                    .expect("lookup")
+                    .expect("dialog");
+                assert_eq!(kind, "question");
+                assert_eq!(matched, question_id);
+                if matches!(
+                    crate::state::record_question_answer(&conn, &matched, "3,1,2", 2000),
+                    Ok(crate::state::ApprovalAnswer::Recorded)
+                ) {
+                    return;
+                }
+            }
+            panic!("question row never appeared");
+        });
+        let result = question_gate(question_payload());
+        handle.join().expect("answering thread");
+        assert_eq!(
+            result["hookSpecificOutput"]["updatedInput"]["answers"]["这个项目用哪个数据库？"],
+            "3,1,2",
+            "a free-text answer rides the same contract: {result}"
+        );
+    }
+
+    /// A tapped label reaches the model exactly as the tool wrote it. Labels
+    /// are free text and commas are ordinary punctuation in them, so the
+    /// letter-code shortcut must not treat one as a separator.
+    #[test]
+    fn a_label_containing_a_comma_survives_a_tap_unchanged() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("question-comma-label", true, 30);
+        let handle = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                let Ok(question_id) = conn.query_row(
+                    "SELECT question_id FROM pending_questions WHERE answer IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) else {
+                    continue;
+                };
+                if matches!(
+                    crate::state::record_question_answer(
+                        &conn,
+                        &question_id,
+                        "Washington, D.C.",
+                        2000
+                    ),
+                    Ok(crate::state::ApprovalAnswer::Recorded)
+                ) {
+                    return;
+                }
+            }
+            panic!("question row never appeared");
+        });
+        let mut payload = question_payload();
+        payload["tool_input"]["questions"][0]["options"] =
+            json!([{"label": "Washington, D.C."}, {"label": "Seattle"}]);
+        let result = question_gate(payload);
+        handle.join().expect("answering thread");
+
+        assert_eq!(
+            result["hookSpecificOutput"]["updatedInput"]["answers"]["这个项目用哪个数据库？"],
+            "Washington, D.C.",
+            "the label must arrive byte for byte, space included: {result}"
+        );
+    }
+
+    /// Prose that merely opens with a letter is prose. Swapping that letter
+    /// for an option label would put words in the user's mouth — and the
+    /// qualifier ("but only locally") is the part that carries the meaning.
+    #[test]
+    fn free_text_starting_with_a_letter_is_not_rewritten() {
+        let options = vec!["Postgres".to_string(), "SQLite".to_string()];
+        assert_eq!(
+            resolve_answer("A, but only locally", &options),
+            "A, but only locally"
+        );
+        // Whole-answer letter codes still expand, single or multiple.
+        assert_eq!(resolve_answer("a", &options), "Postgres");
+        assert_eq!(resolve_answer(" A , b ", &options), "Postgres,SQLite");
+        // A letter with no option behind it is not a code.
+        assert_eq!(resolve_answer("Z", &options), "Z");
+        // An ordering keeps its digits and its separators.
+        assert_eq!(resolve_answer("3,1,2", &options), "3,1,2");
+    }
+
+    /// A multi-select question must not get one-tap buttons: the first tap
+    /// would submit and silently drop the other choices. It is answered by a
+    /// comma-separated reply, the shape the tool documents.
+    #[test]
+    fn multi_select_question_asks_for_a_comma_separated_reply() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("question-multi", true, 30);
+        let handle = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                let Ok(question_id) = conn.query_row(
+                    "SELECT question_id FROM pending_questions WHERE answer IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) else {
+                    continue;
+                };
+                // The user replies with option letters.
+                if matches!(
+                    crate::state::record_question_answer(&conn, &question_id, "A,C", 2000),
+                    Ok(crate::state::ApprovalAnswer::Recorded)
+                ) {
+                    return;
+                }
+            }
+            panic!("question row never appeared");
+        });
+        let mut payload = question_payload();
+        payload["tool_input"]["questions"][0]["multiSelect"] = json!(true);
+        payload["tool_input"]["questions"][0]["options"] = json!([
+            {"label": "Postgres"}, {"label": "MySQL"}, {"label": "SQLite"}
+        ]);
+        let result = question_gate(payload);
+        handle.join().expect("answering thread");
+
+        // Letters are resolved to labels and joined the way the tool expects.
+        assert_eq!(
+            result["hookSpecificOutput"]["updatedInput"]["answers"]["这个项目用哪个数据库？"],
+            "Postgres,SQLite",
+            "{result}"
+        );
+
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let payload_json: String = conn
+            .query_row("SELECT payload_json FROM outbound_events", [], |row| {
+                row.get(0)
+            })
+            .expect("outbound");
+        let event: Value = serde_json::from_str(&payload_json).expect("json");
+        assert!(
+            event["buttons"].as_array().expect("buttons").is_empty(),
+            "a multi-select question must not offer one-tap buttons: {event}"
+        );
+        assert!(
+            event["lastPreview"]
+                .as_str()
+                .expect("body")
+                .contains("逗号分隔"),
+            "and must say how to answer: {event}"
+        );
+    }
+
+    /// The answers map is keyed by the question text exactly as the tool sent
+    /// it — a trimmed key would not match `questions[].question`.
+    #[test]
+    fn answers_key_preserves_the_original_question_text() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("question-key", true, 30);
+        let handle = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                let Ok(question_id) = conn.query_row(
+                    "SELECT question_id FROM pending_questions WHERE answer IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) else {
+                    continue;
+                };
+                if matches!(
+                    crate::state::record_question_answer(&conn, &question_id, "SQLite", 2000),
+                    Ok(crate::state::ApprovalAnswer::Recorded)
+                ) {
+                    return;
+                }
+            }
+            panic!("question row never appeared");
+        });
+        let mut payload = question_payload();
+        payload["tool_input"]["questions"][0]["question"] = json!("  带空白的问题  ");
+        let result = question_gate(payload);
+        handle.join().expect("answering thread");
+
+        let answers = &result["hookSpecificOutput"]["updatedInput"]["answers"];
+        assert_eq!(
+            answers["  带空白的问题  "], "SQLite",
+            "the key must be the raw question text: {result}"
+        );
+        assert!(
+            answers.get("带空白的问题").is_none(),
+            "a trimmed key would not match questions[].question: {result}"
+        );
+    }
+
+    #[test]
+    fn question_gate_stays_out_of_the_way() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("question-skip", true, 30);
+
+        // Not the question tool.
+        let mut other = question_payload();
+        other["tool_name"] = json!("Bash");
+        assert_eq!(question_gate(other), json!({}));
+
+        // A bridge-started turn must not block on a question nobody sees.
+        let mut bypass = question_payload();
+        bypass["permission_mode"] = json!("bypassPermissions");
+        assert_eq!(question_gate(bypass), json!({}));
+
+        // Several questions at once would need several round trips; leave
+        // those to the terminal dialog.
+        let mut many = question_payload();
+        many["tool_input"]["questions"] = json!([
+            {"question": "一?", "options": []},
+            {"question": "二?", "options": []}
+        ]);
+        assert_eq!(question_gate(many), json!({}));
+
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_questions", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(rows, 0, "none of these may create a pending question");
+    }
+
+    /// Unanswered questions fall back to the terminal dialog, and a late tap
+    /// is refused rather than reported as accepted.
+    #[test]
+    fn question_gate_timeout_falls_back_to_the_terminal() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("question-timeout", true, 5);
+        let started = std::time::Instant::now();
+        assert_eq!(question_gate(question_payload()), json!({}));
+        assert!(started.elapsed() >= Duration::from_secs(4));
+
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let question_id: String = conn
+            .query_row("SELECT question_id FROM pending_questions", [], |row| {
+                row.get(0)
+            })
+            .expect("question");
+        assert_eq!(
+            crate::state::record_question_answer(&conn, &question_id, "SQLite", 9_000_000)
+                .expect("late"),
             crate::state::ApprovalAnswer::Expired
         );
     }

@@ -173,10 +173,16 @@ pub(crate) struct TelegramCallbackRoute {
     pub(crate) thread_id: String,
     pub(crate) action: TelegramCallbackAction,
     pub(crate) approval_id: Option<String>,
+    /// Set for question buttons: which pending question this answers, and
+    /// the literal option text the button stands for.
+    pub(crate) question_id: Option<String>,
+    pub(crate) answer: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TelegramCallbackAction {
+    /// One option of a question the session is blocked on.
+    AnswerQuestion,
     Approve,
     /// Approve and stop asking for this tool in this session.
     ApproveSession,
@@ -186,6 +192,7 @@ pub(crate) enum TelegramCallbackAction {
 impl TelegramCallbackAction {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::AnswerQuestion => "answer_question",
             Self::Approve => "approve",
             Self::ApproveSession => "approve_session",
             Self::Deny => "deny",
@@ -194,6 +201,7 @@ impl TelegramCallbackAction {
 
     pub(crate) fn from_str(value: &str) -> Option<Self> {
         match value {
+            "answer_question" => Some(Self::AnswerQuestion),
             "approve" => Some(Self::Approve),
             "approve_session" => Some(Self::ApproveSession),
             "deny" => Some(Self::Deny),
@@ -469,7 +477,13 @@ pub(crate) fn prune_state_logs(conn: &Connection, now: u64) -> Result<usize> {
         params![sql_cutoff],
     )?;
     let injections = prune_live_injections(conn, now, retention_ms)?;
-    Ok(inbound + actions + injections)
+    // Dialog message ids are only useful while a reply to that dialog is
+    // plausible; without pruning the table grows for the life of the install.
+    let dialogs = conn.execute(
+        "DELETE FROM dialog_messages WHERE created_at < ?1",
+        params![sql_cutoff],
+    )?;
+    Ok(inbound + actions + injections + dialogs)
 }
 
 /// Injection debts are short-lived by design: settled ones are history and
@@ -623,7 +637,27 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
           created_at INTEGER NOT NULL,
           decision TEXT,
           decided_at INTEGER,
-          expires_at INTEGER NOT NULL DEFAULT 0
+          expires_at INTEGER NOT NULL DEFAULT 0,
+          message_id INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS pending_questions (
+          question_id TEXT PRIMARY KEY,
+          thread_id TEXT NOT NULL,
+          question TEXT NOT NULL,
+          options_json TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          message_id INTEGER,
+          answer TEXT,
+          answered_at INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS dialog_messages (
+          chat_id TEXT NOT NULL,
+          message_id INTEGER NOT NULL,
+          kind TEXT NOT NULL,
+          ref_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY(chat_id, message_id)
         );
         CREATE TABLE IF NOT EXISTS live_injections (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -662,12 +696,15 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "threads_cache", "socket_boot_id", "TEXT")?;
     ensure_column(conn, "telegram_command_routes", "payload_json", "TEXT")?;
     ensure_column(conn, "telegram_callback_routes", "approval_id", "TEXT")?;
+    ensure_column(conn, "telegram_callback_routes", "question_id", "TEXT")?;
+    ensure_column(conn, "telegram_callback_routes", "answer", "TEXT")?;
     ensure_column(
         conn,
         "pending_approvals",
         "expires_at",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_column(conn, "pending_approvals", "message_id", "INTEGER")?;
     ensure_column(
         conn,
         "outbound_events",
@@ -1888,6 +1925,58 @@ pub(crate) fn expire_or_take_decision(
     Ok(approval_decision(conn, approval_id)?.filter(|decision| decision != "expired"))
 }
 
+/// Remember which Telegram message carries an approval request, so a text
+/// reply to it can be recognised as "you meant to answer this" instead of
+/// being injected into the session as an ordinary message.
+pub(crate) fn attach_approval_message_id(
+    conn: &Connection,
+    approval_id: &str,
+    message_id: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_approvals SET message_id = ?2 WHERE approval_id = ?1",
+        params![approval_id, message_id],
+    )?;
+    Ok(())
+}
+
+/// Every chunk of a dialog message maps back to its dialog. Recorded per
+/// chunk because a long question is split across several Telegram messages
+/// and the user may reply to ANY of them; recognition must not depend on
+/// which chunk they picked, nor on the dialog still being open — a reply to
+/// a settled dialog is still a reply to that dialog, not chat for the
+/// session.
+pub(crate) fn record_dialog_message(
+    conn: &Connection,
+    chat_id: &str,
+    message_id: i64,
+    kind: &str,
+    ref_id: &str,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO dialog_messages(chat_id, message_id, kind, ref_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![chat_id, message_id, kind, ref_id, to_sql_i64(now)?],
+    )?;
+    Ok(())
+}
+
+/// (kind, ref_id) of the dialog a message belongs to, whatever its state.
+pub(crate) fn dialog_for_message(
+    conn: &Connection,
+    chat_id: &str,
+    message_id: i64,
+) -> Result<Option<(String, String)>> {
+    conn.query_row(
+        "SELECT kind, ref_id FROM dialog_messages WHERE chat_id = ?1 AND message_id = ?2",
+        params![chat_id, message_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 pub(crate) fn approval_decision(conn: &Connection, approval_id: &str) -> Result<Option<String>> {
     let decision: Option<Option<String>> = conn
         .query_row(
@@ -1982,6 +2071,127 @@ pub(crate) fn pending_approval_row(
     )
     .optional()
     .map_err(Into::into)
+}
+
+// --- questions the session is blocked on -----------------------------------
+
+pub(crate) fn create_pending_question(
+    conn: &Connection,
+    question_id: &str,
+    thread_id: &str,
+    question: &str,
+    options: &[String],
+    now: u64,
+    expires_at: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO pending_questions(
+            question_id, thread_id, question, options_json, created_at, expires_at,
+            message_id, answer, answered_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL)",
+        params![
+            question_id,
+            thread_id,
+            question,
+            serde_json::to_string(options)?,
+            to_sql_i64(now)?,
+            to_sql_i64(expires_at)?
+        ],
+    )?;
+    Ok(())
+}
+
+/// Remember which Telegram message carries this question, so a text reply to
+/// it can be recognised as the answer instead of being injected into the
+/// session as a new user message.
+pub(crate) fn attach_question_message_id(
+    conn: &Connection,
+    question_id: &str,
+    message_id: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_questions SET message_id = ?2 WHERE question_id = ?1",
+        params![question_id, message_id],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn question_answer(conn: &Connection, question_id: &str) -> Result<Option<String>> {
+    let answer: Option<Option<String>> = conn
+        .query_row(
+            "SELECT answer FROM pending_questions WHERE question_id = ?1",
+            params![question_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(answer.flatten())
+}
+
+/// Same one-answer-only contract as approvals: the first answer wins, and an
+/// answer after the deadline is refused because the blocked hook has already
+/// given up and the terminal dialog has taken over.
+pub(crate) fn record_question_answer(
+    conn: &Connection,
+    question_id: &str,
+    answer: &str,
+    now: u64,
+) -> Result<ApprovalAnswer> {
+    let row: Option<(Option<String>, i64)> = conn
+        .query_row(
+            "SELECT answer, expires_at FROM pending_questions WHERE question_id = ?1",
+            params![question_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((existing, expires_at)) = row else {
+        return Ok(ApprovalAnswer::Unknown);
+    };
+    match existing.as_deref() {
+        Some(QUESTION_EXPIRED) => return Ok(ApprovalAnswer::Expired),
+        Some(_) => return Ok(ApprovalAnswer::AlreadyAnswered),
+        None => {}
+    }
+    if timestamp_to_millis(now) > timestamp_to_millis(from_sql_i64(expires_at)?) {
+        conn.execute(
+            "UPDATE pending_questions SET answer = ?2, answered_at = ?3
+             WHERE question_id = ?1 AND answer IS NULL",
+            params![question_id, QUESTION_EXPIRED, to_sql_i64(now)?],
+        )?;
+        return Ok(ApprovalAnswer::Expired);
+    }
+    let changed = conn.execute(
+        "UPDATE pending_questions SET answer = ?2, answered_at = ?3
+         WHERE question_id = ?1 AND answer IS NULL",
+        params![question_id, answer, to_sql_i64(now)?],
+    )?;
+    if changed > 0 {
+        return Ok(ApprovalAnswer::Recorded);
+    }
+    Ok(match question_answer(conn, question_id)?.as_deref() {
+        Some(QUESTION_EXPIRED) => ApprovalAnswer::Expired,
+        Some(_) => ApprovalAnswer::AlreadyAnswered,
+        None => ApprovalAnswer::Unknown,
+    })
+}
+
+/// Sentinel stored in `answer` for a question nobody answered in time.
+pub(crate) const QUESTION_EXPIRED: &str = "\u{0}expired";
+
+/// Atomic counterpart of `expire_or_take_decision` for questions.
+pub(crate) fn expire_or_take_answer(
+    conn: &Connection,
+    question_id: &str,
+    now: u64,
+) -> Result<Option<String>> {
+    let changed = conn.execute(
+        "UPDATE pending_questions SET answer = ?2, answered_at = ?3
+         WHERE question_id = ?1 AND answer IS NULL",
+        params![question_id, QUESTION_EXPIRED, to_sql_i64(now)?],
+    )?;
+    if changed > 0 {
+        return Ok(None);
+    }
+    Ok(question_answer(conn, question_id)?.filter(|answer| answer != QUESTION_EXPIRED))
 }
 
 fn approval_auto_allow_key(thread_id: &str, tool_name: &str) -> String {
@@ -2148,8 +2358,8 @@ pub(crate) fn insert_telegram_callback_route(
     now: u64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO telegram_callback_routes(callback_id, chat_id, message_id, thread_id, action, created_at, used_at, approval_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+        "INSERT OR REPLACE INTO telegram_callback_routes(callback_id, chat_id, message_id, thread_id, action, created_at, used_at, approval_id, question_id, answer)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9)",
         params![
             route.callback_id,
             route.chat_id,
@@ -2157,7 +2367,9 @@ pub(crate) fn insert_telegram_callback_route(
             route.thread_id,
             route.action.as_str(),
             to_sql_i64(now)?,
-            route.approval_id
+            route.approval_id,
+            route.question_id,
+            route.answer
         ],
     )?;
     Ok(())
@@ -2605,6 +2817,38 @@ mod tests {
         );
     }
 
+    /// The dialog-message index must not grow for the life of the install.
+    #[test]
+    fn prune_removes_only_old_dialog_messages() {
+        let conn = create_state_db_in_memory().expect("db");
+        let retention_ms: u64 = 30 * 24 * 60 * 60 * 1000;
+        let now: u64 = 1_786_400_000_000;
+        record_dialog_message(
+            &conn,
+            "456",
+            1,
+            "question",
+            "q-old",
+            now - retention_ms - 60_000,
+        )
+        .expect("old");
+        record_dialog_message(&conn, "456", 2, "approval", "ap-new", now - 60_000).expect("new");
+
+        prune_state_logs(&conn, now).expect("prune");
+
+        assert!(
+            dialog_for_message(&conn, "456", 1)
+                .expect("lookup")
+                .is_none(),
+            "an old dialog message is pruned"
+        );
+        assert_eq!(
+            dialog_for_message(&conn, "456", 2).expect("lookup"),
+            Some(("approval".to_string(), "ap-new".to_string())),
+            "a recent one is kept so replies still resolve"
+        );
+    }
+
     #[test]
     fn create_state_db_migrates_legacy_live_injections_table() {
         let path = std::env::temp_dir().join(format!(
@@ -2761,6 +3005,8 @@ mod tests {
                 thread_id: "thr_approval".to_string(),
                 action: TelegramCallbackAction::Deny,
                 approval_id: None,
+                question_id: None,
+                answer: None,
             },
             1000,
         )
