@@ -139,9 +139,35 @@ pub(crate) fn enqueue_daemon_notification_events(
 ) -> Result<usize> {
     let mut enqueued = 0usize;
     for event in events {
-        if should_enqueue_away_notification(conn, event)?
-            && enqueue_outbound_event(conn, event, now, "away")?
+        // An answer owed to a Telegram message injected into a live session
+        // is bridge traffic: it bypasses the away gate and survives /back,
+        // like any other reply the user asked for from their phone.
+        let thread_id = crate::event_thread_id(event);
+        let event_at = event_observed_at(event);
+        let owed = match thread_id.as_deref() {
+            Some(thread_id) => {
+                crate::state::live_injection_pending(conn, thread_id, event_at, now)?
+            }
+            None => false,
+        };
+        if !owed && !should_enqueue_away_notification(conn, event)? {
+            continue;
+        }
+        // Queueing the answer and settling the debt must be one unit: a crash
+        // between them would leave the answer queued and the debt open, so
+        // the next completion would be pushed as a second "answer" too.
+        let tx = conn.unchecked_transaction()?;
+        let inserted = enqueue_outbound_event(&tx, event, now, if owed { "bridge" } else { "away" })?;
+        if inserted
+            && owed
+            && event.get("type").and_then(Value::as_str) == Some("thread_completed")
         {
+            if let Some(thread_id) = thread_id.as_deref() {
+                crate::state::consume_live_injection(&tx, thread_id, event_at, now)?;
+            }
+        }
+        tx.commit()?;
+        if inserted {
             enqueued += 1;
         }
     }
@@ -424,6 +450,21 @@ fn daemon_cycle(
 ) -> Result<Value> {
     let deadline = Instant::now() + daemon_cycle_budget(timeout);
     let filter = parse_event_filter(Some(&config.events));
+    // Learn where live sessions listen BEFORE handling Telegram updates: a
+    // reply arriving in the same cycle as that session's first hook event
+    // must already find the mapping, or it would fall back to a headless
+    // `--resume` and fork the session this feature exists to protect.
+    // Non-destructive — the spool is still consumed by the sync below.
+    if let Err(error) = crate::claude::peek_session_sockets(conn, now) {
+        println!(
+            "{}",
+            json!({
+                "ok": false,
+                "action": "session_socket_peek_error",
+                "error": format!("{error:#}")
+            })
+        );
+    }
     let telegram_updates = match config.telegram.as_ref() {
         Some(telegram) => {
             let mut result =

@@ -759,8 +759,51 @@ fn send_claude_reply_to_thread(
     // The `telegram：` prefix makes remote-injected messages recognizable in
     // the session transcript (and tells the model the user is on the phone).
     let prefixed = format!("telegram：{message}");
-    let result = send_user_message(config, thread_id, &prefixed, cwd_hint.as_deref(), now)?;
-    register_bridge_turn_from_result(conn, &result, now)?;
+    // Prefer delivering into the session while it is LIVE: a headless
+    // `--resume` would fork the transcript from the state it saw at spawn,
+    // so the terminal the user is sitting at would never see the message and
+    // the two branches would edit the same files unaware of each other.
+    let live_socket = crate::state::session_messaging_socket(conn, thread_id)?;
+    let injected = match live_socket.as_ref() {
+        Some(socket) => crate::claude::inject_into_live_session(
+            &socket.path,
+            (socket.inode, socket.boot_id.clone()),
+            &prefixed,
+        )
+        .unwrap_or(false)
+        .then(|| socket.path.clone()),
+        None => None,
+    };
+    if injected.is_some() {
+        // The live session now owes an answer to Telegram; it is claimed by
+        // that session's next completion (there is no per-turn log to read,
+        // unlike the headless path).
+        crate::state::record_live_injection(conn, thread_id, now)?;
+    }
+    let result = match injected.as_deref() {
+        Some(socket) => json!({
+            "ok": true,
+            "action": "reply_injected",
+            "threadId": thread_id,
+            "message": prefixed,
+            "cwd": cwd_hint,
+            "claude": {
+                "transport": "live-session-socket",
+                "socket": socket
+            },
+            "delivery": {
+                "mode": "live_injection",
+                "status": "delivered_to_live_session"
+            },
+            "sentAt": now
+        }),
+        None => {
+            let result =
+                send_user_message(config, thread_id, &prefixed, cwd_hint.as_deref(), now)?;
+            register_bridge_turn_from_result(conn, &result, now)?;
+            result
+        }
+    };
     record_action(
         conn,
         thread_id,
@@ -1957,6 +2000,67 @@ mod tests {
         );
         assert_eq!(turns[0].thread_id, "sess-1");
         assert!(turns[0].log_path.ends_with(&format!("{}.log", turns[0].turn_id)));
+    }
+
+    /// A reply to a LIVE session goes in over its socket — no headless
+    /// process is spawned, so the transcript never forks.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn telegram_reply_injects_into_live_session_instead_of_forking() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let config = test_daemon_config();
+        let dir = std::env::temp_dir().join(format!("tinyctb-live-reply-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join(format!("{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).expect("bind");
+        let accepted = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).expect("read");
+            line
+        });
+        let socket_path = path.display().to_string();
+        let (inode, boot_id) = crate::claude::socket_identity(&socket_path);
+        crate::state::record_session_messaging_socket(
+            &conn,
+            "sess-live",
+            &crate::claude::SessionSocket {
+                path: socket_path,
+                inode,
+                boot_id,
+            },
+            1000,
+        )
+        .expect("record socket");
+        let _ = crate::claude::test_spawn::take();
+
+        let result = send_claude_reply_to_thread(&conn, &config, "sess-live", "在跑什么", 1000)
+            .expect("reply");
+
+        assert_eq!(result["action"], "telegram_reply");
+        assert_eq!(
+            result.pointer("/claude/transport").and_then(Value::as_str),
+            Some("live-session-socket")
+        );
+        assert!(
+            crate::claude::test_spawn::take().is_empty(),
+            "a live session must not be forked with a headless resume"
+        );
+        assert!(
+            crate::state::list_running_bridge_turns(&conn)
+                .expect("turns")
+                .is_empty(),
+            "injected replies produce no headless turn to watch"
+        );
+        let line = accepted.join().expect("join");
+        let parsed: Value = serde_json::from_str(line.trim()).expect("json line");
+        assert_eq!(parsed["message"]["content"], "telegram：在跑什么");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

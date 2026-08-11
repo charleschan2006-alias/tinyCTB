@@ -604,10 +604,27 @@ pub(crate) fn write_hook_event_from_reader<R: Read>(reader: &mut R, now: u64) ->
         .to_string();
     let spool = events_spool_dir()?;
     fs::create_dir_all(&spool)?;
+    // Hooks are children of the Claude session process, so they inherit its
+    // messaging socket. Recording it here is how the bridge learns, from the
+    // session itself, where to deliver a reply while that session is live —
+    // no pid guessing, no ambiguity.
+    let messaging_socket = env::var("CLAUDE_CODE_MESSAGING_SOCKET")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    // Captured here so a later injection can prove the socket is still THIS
+    // session's (the path embeds a pid and can be rebound after pid reuse).
+    let (socket_inode, socket_boot_id) = messaging_socket
+        .as_deref()
+        .map(socket_identity)
+        .unwrap_or((None, None));
     let envelope = json!({
         "receivedAt": now,
         "hookEventName": event_name,
         "sessionId": session_id,
+        "messagingSocket": messaging_socket,
+        "socketInode": socket_inode,
+        "socketBootId": socket_boot_id,
         "payload": payload
     });
     let file_name = format!("{now:015}-{}-{}.json", std::process::id(), event_name);
@@ -657,11 +674,16 @@ fn pending_prompt_from_notification(
 }
 
 /// Consume spooled hook events and turn them into per-session snapshots that
-/// are allowed to generate notifications. Returns (snapshots, consumed_count).
-pub(crate) fn ingest_spool_events(now: u64) -> Result<(Vec<BridgeThreadSnapshot>, usize)> {
+/// are allowed to generate notifications. Also returns the session ->
+/// messaging-socket mappings the hooks reported, so replies can be delivered
+/// into a live session instead of forking it with a headless `--resume`.
+/// Returns (snapshots, sockets, consumed_count).
+/// Spool files in chronological order (the name starts with the timestamp),
+/// skipping partial writes and non-events.
+fn spool_event_files() -> Result<Vec<PathBuf>> {
     let spool = events_spool_dir()?;
     let Ok(entries) = fs::read_dir(&spool) else {
-        return Ok((Vec::new(), 0));
+        return Ok(Vec::new());
     };
     let mut files = entries
         .filter_map(Result::ok)
@@ -676,9 +698,80 @@ pub(crate) fn ingest_spool_events(now: u64) -> Result<(Vec<BridgeThreadSnapshot>
         })
         .collect::<Vec<_>>();
     files.sort();
+    Ok(files)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionSocket {
+    pub(crate) path: String,
+    pub(crate) inode: Option<u64>,
+    pub(crate) boot_id: Option<String>,
+}
+
+fn session_socket_from_envelope(envelope: &Value) -> Option<SessionSocket> {
+    let path = envelope
+        .get("messagingSocket")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(SessionSocket {
+        path: path.to_string(),
+        inode: envelope.get("socketInode").and_then(Value::as_u64),
+        boot_id: envelope
+            .get("socketBootId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+/// Read the session -> messaging-socket mappings out of the spool WITHOUT
+/// consuming it. The daemon runs this before handling Telegram updates: a
+/// reply that arrives in the same cycle as the session's first hook event
+/// must already see the mapping, otherwise it would fall back to a headless
+/// `--resume` and fork the very session we can now deliver into.
+pub(crate) fn peek_session_sockets(conn: &Connection, now: u64) -> Result<usize> {
+    // Same file selection as ingestion (sorted, .json only, no temp files,
+    // bounded per cycle) so a large backlog cannot make this unbounded. The
+    // spool name starts with the timestamp, so sorting is chronological and
+    // the NEWEST mapping per session wins deterministically — read_dir order
+    // would otherwise decide which socket a session ends up with.
+    let mut files = spool_event_files()?;
+    if files.len() > MAX_SPOOL_EVENTS_PER_CYCLE {
+        files = files.split_off(files.len() - MAX_SPOOL_EVENTS_PER_CYCLE);
+    }
+    let mut latest: BTreeMap<String, SessionSocket> = BTreeMap::new();
+    for path in files {
+        let Some(envelope) = fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        else {
+            continue;
+        };
+        let session_id = envelope
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if session_id.is_empty() || session_id == "unknown" {
+            continue;
+        }
+        if let Some(socket) = session_socket_from_envelope(&envelope) {
+            latest.insert(session_id.to_string(), socket);
+        }
+    }
+    for (session_id, socket) in &latest {
+        crate::state::record_session_messaging_socket(conn, session_id, socket, now)?;
+    }
+    Ok(latest.len())
+}
+
+pub(crate) fn ingest_spool_events(
+    now: u64,
+) -> Result<(Vec<BridgeThreadSnapshot>, BTreeMap<String, SessionSocket>, usize)> {
+    let mut files = spool_event_files()?;
     files.truncate(MAX_SPOOL_EVENTS_PER_CYCLE);
 
     let mut consumed = 0usize;
+    let mut sockets: BTreeMap<String, SessionSocket> = BTreeMap::new();
     // Snapshots that already carry a completed answer and were about to be
     // overwritten by a later event in the same batch. Flushing them keeps
     // every answer: two concurrent replies can both finish within one poll
@@ -718,6 +811,9 @@ pub(crate) fn ingest_spool_events(now: u64) -> Result<(Vec<BridgeThreadSnapshot>
             .to_string();
         if session_id.is_empty() || session_id == "unknown" {
             continue;
+        }
+        if let Some(socket) = session_socket_from_envelope(&envelope) {
+            sockets.insert(session_id.clone(), socket);
         }
         let received_at = envelope
             .get("receivedAt")
@@ -819,7 +915,7 @@ pub(crate) fn ingest_spool_events(now: u64) -> Result<(Vec<BridgeThreadSnapshot>
     // Flushed completed snapshots first (chronologically earlier), then the
     // final per-session state, so later upserts win in the DB.
     completed.extend(by_session.into_values());
-    Ok((completed, consumed))
+    Ok((completed, sockets, consumed))
 }
 
 // ---------------------------------------------------------------------------
@@ -879,7 +975,10 @@ pub(crate) fn sync_state_from_sessions(
     limit: u64,
     record_deliveries: bool,
 ) -> Result<Value> {
-    let (hook_snapshots, consumed) = ingest_spool_events(now)?;
+    let (hook_snapshots, sockets, consumed) = ingest_spool_events(now)?;
+    for (session_id, socket) in &sockets {
+        crate::state::record_session_messaging_socket(conn, session_id, socket, now)?;
+    }
     let hook_thread_ids = hook_snapshots
         .iter()
         .map(|snapshot| snapshot.thread_id.clone())
@@ -918,7 +1017,32 @@ pub(crate) fn sync_state_from_sessions(
         "spoolConsumed": consumed
     });
     let filter = parse_event_filter(Some(&config.events));
-    let notifiable = watch_events_from_sync_result(&result, filter.as_ref());
+    let mut notifiable = Vec::new();
+    for event in watch_events_from_sync_result(&result, None) {
+        let event_type = event.get("type").and_then(Value::as_str);
+        let passes_filter = filter.as_ref().map_or(true, |filter| {
+            event_type
+                .map(|event_type| filter.contains(event_type))
+                .unwrap_or(false)
+        });
+        // The events filter is an away-notification preference; it must not
+        // swallow an answer owed to a message the user injected from
+        // Telegram (the headless path bypasses it for the same reason).
+        let owed = !passes_filter
+            && event_type == Some("thread_completed")
+            && match crate::event_thread_id(&event) {
+                Some(thread_id) => crate::state::live_injection_pending(
+                    conn,
+                    &thread_id,
+                    event.get("updatedAt").and_then(Value::as_u64),
+                    now,
+                )?,
+                None => false,
+            };
+        if passes_filter || owed {
+            notifiable.push(event);
+        }
+    }
     let enqueued =
         crate::daemon::enqueue_daemon_notification_events(conn, &notifiable, now)?;
     if let Some(object) = result.as_object_mut() {
@@ -1381,6 +1505,144 @@ fn spawn_detached_headless(
     }
 }
 
+/// Deliver a message straight into a LIVE Claude session over its unix
+/// messaging socket (one JSON line, the interface Claude Code documents for
+/// injection). This is what keeps a Telegram reply from forking the session:
+/// a headless `--resume` would branch the transcript from whatever the state
+/// was when it started, invisible to the terminal the user is sitting at.
+/// Returns Ok(false) when the session has no live socket, so the caller can
+/// fall back to the headless path.
+/// Identity of a messaging socket at the moment a hook reported it. The
+/// socket path is `cc-socks/<pid>.sock`, so a later session that reuses the
+/// pid rebinds the SAME path — the inode is what distinguishes the two
+/// (a rebind always creates a fresh socket), scoped by boot id because
+/// tmpfs inode numbers restart with the machine.
+pub(crate) fn socket_identity(socket_path: &str) -> (Option<u64>, Option<String>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Some(inode) = fs::metadata(socket_path).ok().map(|meta| meta.ino()) else {
+            return (None, None);
+        };
+        // The inode alone is NOT enough: tmpfs hands the same inode number
+        // straight back after unlink+rebind (proven by test). The owning
+        // session is identified by the pid embedded in the socket name plus
+        // that pid's exec-invariant start ticks; boot id scopes both.
+        let owner_ticks = Path::new(socket_path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.parse::<u32>().ok())
+            .and_then(process_start_ticks);
+        // Fail closed when the owner cannot be identified (custom
+        // --messaging-socket-path with no pid in the name): an inode is not
+        // proof of anything here, so such sessions simply fall back to the
+        // headless path instead of risking delivery into a stranger.
+        let stamp = match (current_boot_id(), owner_ticks) {
+            (Some(boot), Some(ticks)) => Some(format!("{boot}:{ticks}")),
+            _ => None,
+        };
+        (Some(inode), stamp)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket_path;
+        (None, None)
+    }
+}
+
+const INJECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Deliver a message straight into a LIVE Claude session over its unix
+/// messaging socket (one JSON line, the interface Claude Code documents for
+/// injection). Returns Ok(false) when the session is not live or is not the
+/// one we recorded, so the caller falls back to the headless path.
+///
+/// `expected` is the (inode, boot_id) captured when the session reported the
+/// socket; both must still match or we refuse — otherwise a rebound path
+/// would send the user's message into a different session.
+pub(crate) fn inject_into_live_session(
+    socket_path: &str,
+    expected: (Option<u64>, Option<String>),
+    message: &str,
+) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+
+        if !Path::new(socket_path).exists() {
+            return Ok(false);
+        }
+        // Fail closed on identity: an unverifiable socket is treated as not
+        // live rather than risking delivery into someone else's session.
+        let (Some(expected_inode), Some(expected_boot)) = (expected.0, expected.1) else {
+            return Ok(false);
+        };
+        let (current_inode, current_boot) = socket_identity(socket_path);
+        if current_inode != Some(expected_inode) || current_boot.as_deref() != Some(&expected_boot)
+        {
+            return Ok(false);
+        }
+
+        // `UnixStream::connect` blocks with no timeout: a socket whose owner
+        // is alive but no longer accepting (full backlog) would wedge the
+        // daemon. Connect on a worker thread with a deadline; on timeout the
+        // receiver drops, the eventual stream is closed unwritten, so a late
+        // connect can never duplicate the message.
+        // A connect that outlives the deadline cannot be cancelled, so the
+        // number of such threads is hard-capped: past the cap we report "not
+        // live" and fall back to the headless path rather than accumulating
+        // one stuck thread per reply.
+        static IN_FLIGHT: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        const MAX_IN_FLIGHT_CONNECTS: usize = 2;
+        struct InFlightGuard;
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        if IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_IN_FLIGHT_CONNECTS {
+            IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            eprintln!(
+                "tinyctb: {socket_path} has {MAX_IN_FLIGHT_CONNECTS} connects still pending; treating as not live"
+            );
+            return Ok(false);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = socket_path.to_string();
+        std::thread::spawn(move || {
+            let _guard = InFlightGuard;
+            let _ = tx.send(UnixStream::connect(&path));
+        });
+        let mut stream = match rx.recv_timeout(INJECT_CONNECT_TIMEOUT) {
+            Ok(Ok(stream)) => stream,
+            // Stale socket file for an exited session, or a connect that did
+            // not answer in time: not an error, just "not live".
+            Ok(Err(_)) | Err(_) => return Ok(false),
+        };
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .context("failed to set messaging socket write timeout")?;
+        let payload = json!({
+            "type": "user",
+            "message": { "role": "user", "content": message }
+        });
+        let mut line = serde_json::to_vec(&payload)?;
+        line.push(b'\n');
+        stream
+            .write_all(&line)
+            .with_context(|| format!("failed to write to messaging socket {socket_path}"))?;
+        stream.flush().ok();
+        Ok(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (socket_path, expected, message);
+        Ok(false)
+    }
+}
+
 /// Start a headless turn that continues an existing session. Returns
 /// immediately; the answer is delivered later through the Stop hook event.
 pub(crate) fn send_user_message(
@@ -1761,7 +2023,7 @@ mod tests {
         );
         write_hook_event_from_reader(&mut notify_payload, 1000).expect("spool notify");
 
-        let (snapshots, _) = ingest_spool_events(2000).expect("ingest");
+        let (snapshots, _, _) = ingest_spool_events(2000).expect("ingest");
         std::env::remove_var("TINYCTB_STATE_DIR");
         std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
 
@@ -1846,7 +2108,7 @@ mod tests {
         );
         write_hook_event_from_reader(&mut notify_payload, 1001).expect("spool notify");
 
-        let (snapshots, consumed) = ingest_spool_events(2000).expect("ingest");
+        let (snapshots, _, consumed) = ingest_spool_events(2000).expect("ingest");
         std::env::remove_var("TINYCTB_STATE_DIR");
         std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
 
@@ -2377,6 +2639,325 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    /// Hooks inherit CLAUDE_CODE_MESSAGING_SOCKET from the session process,
+    /// which is how the bridge learns where a live session listens.
+    #[test]
+    fn hook_event_records_the_sessions_messaging_socket() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let temp = TempDirGuard::new("hook-socket-capture");
+        std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
+        std::env::set_var("CLAUDE_CODE_MESSAGING_SOCKET", "/run/user/1000/cc-socks/4242.sock");
+        let mut payload = std::io::Cursor::new(
+            json!({"hook_event_name": "Stop", "session_id": "sess-sock"}).to_string(),
+        );
+        write_hook_event_from_reader(&mut payload, 1000).expect("spool");
+        let (_, sockets, _) = ingest_spool_events(2000).expect("ingest");
+        std::env::remove_var("CLAUDE_CODE_MESSAGING_SOCKET");
+        std::env::remove_var("TINYCTB_STATE_DIR");
+
+        assert_eq!(
+            sockets.get("sess-sock").map(|s| s.path.as_str()),
+            Some("/run/user/1000/cc-socks/4242.sock")
+        );
+    }
+
+    /// End-to-end over a real unix socket: the injected line must arrive as
+    /// the exact JSON shape Claude Code accepts for message injection.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn injection_writes_one_json_line_to_a_live_socket() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("tinyctb-uds-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("socket dir");
+        // Named after a live pid, like cc-socks/<pid>.sock, so the owning
+        // process identity is derivable (unnamed paths fail closed).
+        let path = dir.join(format!("{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).expect("bind");
+        let accepted = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).expect("read");
+            line
+        });
+
+        let socket_path = path.display().to_string();
+        let delivered =
+            inject_into_live_session(&socket_path, socket_identity(&socket_path), "telegram：hi")
+                .expect("inject");
+        assert!(delivered, "a live socket must accept the message");
+
+        let line = accepted.join().expect("join");
+        let parsed: Value = serde_json::from_str(line.trim()).expect("valid json line");
+        assert_eq!(parsed["type"], "user");
+        assert_eq!(parsed["message"]["role"], "user");
+        assert_eq!(parsed["message"]["content"], "telegram：hi");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A missing or stale socket is not an error: the caller falls back to a
+    /// headless resume, which is correct for an idle or closed session.
+    #[test]
+    fn injection_reports_not_delivered_for_missing_or_stale_socket() {
+        assert!(!inject_into_live_session("/nonexistent/tinyctb.sock", (Some(1), Some("boot".into())), "hi").expect("missing"));
+
+        let dir = std::env::temp_dir().join(format!("tinyctb-uds-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let stale = dir.join("stale.sock");
+        fs::write(&stale, b"not a socket").expect("write stale file");
+        assert!(
+            !inject_into_live_session(
+                &stale.display().to_string(),
+                socket_identity(&stale.display().to_string()),
+                "hi"
+            )
+            .expect("stale"),
+            "a leftover socket file must not be treated as a live session"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The socket path is `<pid>.sock`, so after the owning session exits the
+    /// path can be rebound by a different session that reused the pid.
+    /// Delivering there would put the user's message into the WRONG session,
+    /// so identity is checked against the owning process, not the file.
+    /// (An inode check alone is not enough: tmpfs reuses inode numbers
+    /// immediately after unlink+rebind — asserted below.)
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn injection_refuses_when_the_owning_session_is_gone() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("tinyctb-uds-rebind-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+
+        // A helper process stands in for the owning Claude session; the
+        // socket is named after its pid, exactly like cc-socks/<pid>.sock.
+        let mut owner = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn owner");
+        let path = dir.join(format!("{}.sock", owner.id()));
+        let socket_path = path.display().to_string();
+        let listener = UnixListener::bind(&path).expect("bind");
+        let recorded = socket_identity(&socket_path);
+        assert!(
+            recorded.1.is_some(),
+            "the owning process identity must be captured"
+        );
+        // While the owner lives, delivery is allowed.
+        assert!(inject_into_live_session(&socket_path, recorded.clone(), "hi").expect("live"));
+
+        // Owner exits; the socket file survives and a new listener rebinds it.
+        owner.kill().ok();
+        owner.wait().ok();
+        drop(listener);
+        fs::remove_file(&path).expect("unlink");
+        // NB: the inode may or may not be recycled here (observed both ways
+        // on tmpfs), which is exactly why identity is anchored to the owning
+        // process rather than to the socket file.
+        let _rebound = UnixListener::bind(&path).expect("rebind");
+
+        assert!(
+            !inject_into_live_session(&socket_path, recorded, "hi").expect("rebound"),
+            "must refuse once the session that reported this socket is gone"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P1 regression: an answer owed to an injected message must reach
+    /// Telegram even with away off — the user asked from their phone.
+    #[test]
+    fn injected_reply_answer_is_pushed_even_when_not_away() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let temp = TempDirGuard::new("injected-answer-push");
+        std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
+        let projects_root = temp.path.join("projects");
+        fs::create_dir_all(projects_root.join("-home-user-project")).expect("projects dir");
+        std::env::set_var(
+            "TINYCTB_CLAUDE_PROJECTS_DIR",
+            projects_root.display().to_string(),
+        );
+        let conn = create_state_db_in_memory().expect("db");
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        // Away is OFF; a Telegram message was injected into the live session.
+        crate::state::record_live_injection(&conn, "sess-inj", 500).expect("record injection");
+        let mut stop = std::io::Cursor::new(
+            json!({
+                "hook_event_name": "Stop",
+                "session_id": "sess-inj",
+                "cwd": "/home/user/project",
+                "last_assistant_message": "answered from the live session"
+            })
+            .to_string(),
+        );
+        write_hook_event_from_reader(&mut stop, 1000).expect("spool");
+
+        let result = sync_state_from_sessions(&conn, &config, 2000, 50, true).expect("sync");
+        std::env::remove_var("TINYCTB_STATE_DIR");
+        std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
+
+        assert_eq!(result["enqueued"], 1, "{result}");
+        let origin: String = conn
+            .query_row("SELECT origin FROM outbound_events", [], |row| row.get(0))
+            .expect("outbound row");
+        assert_eq!(origin, "bridge", "owed answers survive /back");
+        assert!(
+            !crate::state::live_injection_pending(&conn, "sess-inj", Some(1000), 2500)
+                .expect("pending"),
+            "the answer consumed the owed record"
+        );
+    }
+
+    /// A socket path with no pid in its name (custom --messaging-socket-path)
+    /// cannot be tied to an owning process, so injection must refuse rather
+    /// than trust an inode that tmpfs may hand back after a rebind.
+    #[test]
+    #[cfg(unix)]
+    fn injection_fails_closed_when_the_owner_cannot_be_identified() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("tinyctb-uds-anon-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("custom-name.sock");
+        let socket_path = path.display().to_string();
+        let _listener = UnixListener::bind(&path).expect("bind");
+
+        let identity = socket_identity(&socket_path);
+        assert!(identity.0.is_some(), "the inode is still observable");
+        assert!(
+            identity.1.is_none(),
+            "an unidentifiable owner must produce no usable identity"
+        );
+        assert!(
+            !inject_into_live_session(&socket_path, identity, "hi").expect("anon"),
+            "must not inject into a socket whose owning session cannot be proven"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P1 regression: a Stop that happened BEFORE the injection must not be
+    /// pushed as its answer (and must not burn the debt) — only a completion
+    /// that postdates the injection can settle it.
+    #[test]
+    fn older_completion_cannot_claim_a_later_injection() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let temp = TempDirGuard::new("injection-ordering");
+        std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
+        let projects_root = temp.path.join("projects");
+        fs::create_dir_all(projects_root.join("-home-user-project")).expect("projects dir");
+        std::env::set_var(
+            "TINYCTB_CLAUDE_PROJECTS_DIR",
+            projects_root.display().to_string(),
+        );
+        let conn = create_state_db_in_memory().expect("db");
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        // A Stop was already spooled BEFORE the Telegram message arrived.
+        let mut stale = std::io::Cursor::new(
+            json!({
+                "hook_event_name": "Stop",
+                "session_id": "sess-order",
+                "last_assistant_message": "answer to something else"
+            })
+            .to_string(),
+        );
+        write_hook_event_from_reader(&mut stale, 1000).expect("spool stale");
+        // Then the reply is injected into the live session (away is OFF).
+        crate::state::record_live_injection(&conn, "sess-order", 2000).expect("inject record");
+
+        let first = sync_state_from_sessions(&conn, &config, 2500, 50, true).expect("sync 1");
+        assert_eq!(
+            first["enqueued"], 0,
+            "a pre-injection Stop must not be pushed as the reply: {first}"
+        );
+        assert!(
+            crate::state::live_injection_pending(&conn, "sess-order", Some(3000), 2500)
+                .expect("pending"),
+            "the debt must survive an older completion"
+        );
+
+        // The real answer arrives after the injection.
+        let mut real = std::io::Cursor::new(
+            json!({
+                "hook_event_name": "Stop",
+                "session_id": "sess-order",
+                "last_assistant_message": "the actual reply"
+            })
+            .to_string(),
+        );
+        write_hook_event_from_reader(&mut real, 3000).expect("spool real");
+        let second = sync_state_from_sessions(&conn, &config, 3500, 50, true).expect("sync 2");
+        std::env::remove_var("TINYCTB_STATE_DIR");
+        std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
+
+        assert_eq!(second["enqueued"], 1, "{second}");
+        let payload: String = conn
+            .query_row(
+                "SELECT payload_json FROM outbound_events WHERE origin = 'bridge'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("bridge row");
+        assert!(payload.contains("the actual reply"), "payload: {payload}");
+        assert!(
+            !crate::state::live_injection_pending(&conn, "sess-order", Some(4000), 3500)
+                .expect("settled"),
+            "the post-injection answer settles the debt"
+        );
+    }
+
+    /// P1 regression: a reply arriving in the SAME daemon cycle as the
+    /// session's first hook event must already find the socket mapping,
+    /// otherwise it forks the session instead of being injected.
+    #[test]
+    fn socket_mapping_is_available_before_the_spool_is_consumed() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let temp = TempDirGuard::new("socket-peek-order");
+        std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
+        std::env::set_var("CLAUDE_CODE_MESSAGING_SOCKET", "/run/user/1000/cc-socks/77.sock");
+        let conn = create_state_db_in_memory().expect("db");
+        let mut payload = std::io::Cursor::new(
+            json!({"hook_event_name": "SessionStart", "session_id": "sess-peek"}).to_string(),
+        );
+        write_hook_event_from_reader(&mut payload, 1000).expect("spool");
+        std::env::remove_var("CLAUDE_CODE_MESSAGING_SOCKET");
+
+        // Before any sync: the peek the daemon runs first must already know.
+        assert_eq!(peek_session_sockets(&conn, 1500).expect("peek"), 1);
+        let socket = crate::state::session_messaging_socket(&conn, "sess-peek")
+            .expect("lookup")
+            .expect("socket known before spool consumption");
+        assert_eq!(socket.path, "/run/user/1000/cc-socks/77.sock");
+
+        // Peek is non-destructive: the sync still gets the event.
+        let (snapshots, _, consumed) = ingest_spool_events(2000).expect("ingest");
+        std::env::remove_var("TINYCTB_STATE_DIR");
+        assert_eq!(consumed, 1, "peek must not consume the spool");
+        assert_eq!(snapshots.len(), 1);
     }
 
     #[test]

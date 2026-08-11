@@ -42,7 +42,15 @@ Code surfaces together:
 2. **Session transcripts** — `~/.claude/projects/*/<session-id>.jsonl` are
    scanned (defensively; the format is not a stable API) for `/threads`
    listings: title, working directory, and the last assistant answer.
-3. **Headless CLI** — replies from Telegram spawn a detached
+3. **Live-session injection** — if the target session is still running, the
+   reply is written straight into its unix messaging socket
+   (`$XDG_RUNTIME_DIR/cc-socks/<pid>.sock`, one JSON line), so it appears in
+   the terminal the user is sitting at. The bridge learns that socket from
+   the session itself: hooks are children of the session process and inherit
+   `CLAUDE_CODE_MESSAGING_SOCKET`, which `hook-event` records. Without this,
+   a `--resume` of a live session forks the transcript — the terminal never
+   sees the message and both branches edit the same files unaware.
+4. **Headless CLI** (fallback, for idle or closed sessions) — replies from Telegram spawn a detached
    `claude -p "<text>" --resume <session-id> --output-format json
    --permission-mode <configured>`. `/new` generates a session UUID locally and
    passes `--session-id`, so reply routing works before the first token is
@@ -51,7 +59,10 @@ Code surfaces together:
    own log under `~/.tinyctb/logs/turns/`, and **the answer pushed back to
    Telegram is read from that log** — never attributed from Stop hooks, so a
    session that is concurrently active in a terminal cannot mislabel its own
-   output as the answer. If the turn's process dies without producing a
+   output as the answer. (A message delivered by live injection has no such
+   log: it joins the running session's own queue, so its answer is the next
+   completion that session reports **after** the injection. That answer is
+   pushed whatever the away switch or events filter say.) If the turn's process dies without producing a
    result, a failure notice (with the log tail) is pushed instead, and the
    chat shows a typing indicator while the turn is queued or running.
 
@@ -137,12 +148,20 @@ config.
 
 - **通知源**：Claude Code 的 `Stop` / `Notification` / `SessionStart` hooks 把
   事件写进 `~/.tinyctb/events/` spool，daemon 轮询消化，away 模式下推送 Telegram。
-- **回复路由**：Telegram 里对某条通知使用 Reply，桥会派生一个独立的
-  `claude -p --resume <会话ID>` 无头进程续写该会话，注入的文本带 `telegram：`
-  前缀（转录内可辨识）；**答案从该回合专属的 turn log 读回**（归属精确，
+- **回复路由**：Telegram 里对某条通知使用 Reply。若目标会话**仍在运行**（仅 Linux，
+  见下），桥直接把消息写进它的 unix 消息 socket（`cc-socks/<pid>.sock`，一行 JSON），
+  消息会出现在你正在用的终端里；socket 由会话自己上报（hook 是会话子进程，继承
+  `CLAUDE_CODE_MESSAGING_SOCKET`）。会话已空闲/关闭时才回退到派生
+  `claude -p --resume <会话ID>` 无头进程。注入文本带 `telegram：`
+  前缀（转录内可辨识）；**无头回合的答案从该回合专属的 turn log 读回**（归属精确，
   目标会话即使同时在终端活跃也不会张冠李戴），排队/运行期间聊天窗口持续显示
-  typing，进程崩溃无结果则推送响亮的失败通知。从 Telegram 发起的回合无论
-  away 开关与否都会推回答案；away 只门控本地终端会话的通知。
+  typing，进程崩溃无结果则推送响亮的失败通知。**直投的消息没有专属 log**——它进的是
+  活跃会话自己的队列，答案即该会话在注入**之后**的下一次完成，同样无视 away 开关与
+  events 过滤器推回。从 Telegram 发起的回合无论 away 开关与否都会推回答案；away
+  只门控本地终端会话的通知。
+- **直投仅限 Linux**：投递前必须证明该 socket 仍属于当初上报它的会话（路径含 pid，
+  会话退出后可能被复用重绑），判据是 boot id + 该 pid 的 starttime ticks，均取自
+  `/proc`。macOS 无从取证，因此一律 fail closed 退回无头 `--resume` 路径。
 - **新会话**：`/new` 在项目注册表指定的目录下用本地生成的 UUID
   （`--session-id`）启动无头会话，因此确认消息可以立刻用于回复路由。
 - **审批**：交互式终端里的权限确认只能在终端处理，Telegram 只做提醒；

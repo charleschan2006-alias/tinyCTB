@@ -450,7 +450,44 @@ pub(crate) fn prune_state_logs(conn: &Connection, now: u64) -> Result<usize> {
         "DELETE FROM actions_log WHERE created_at < ?1",
         params![sql_cutoff],
     )?;
-    Ok(inbound + actions)
+    let injections = prune_live_injections(conn, now, retention_ms)?;
+    Ok(inbound + actions + injections)
+}
+
+/// Injection debts are short-lived by design: settled ones are history and
+/// unclaimed ones expire with the TTL. Without pruning the table grows for
+/// the life of the install and every lookup scans more rows.
+///
+/// Ages are computed through `timestamp_to_millis` on BOTH sides, exactly
+/// like claiming does — comparing a millisecond cutoff against a raw value
+/// would delete brand-new second-granularity rows as if they were ancient.
+fn prune_live_injections(conn: &Connection, now: u64, retention_ms: u64) -> Result<usize> {
+    let now_ms = timestamp_to_millis(now);
+    let rows: Vec<(i64, i64, Option<i64>)> = {
+        let mut stmt = conn.prepare("SELECT id, injected_at, claimed_at FROM live_injections")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut removed = 0usize;
+    for (id, injected_at, claimed_at) in rows {
+        let expired = match claimed_at {
+            Some(claimed_at) => {
+                now_ms.saturating_sub(timestamp_to_millis(from_sql_i64(claimed_at)?))
+                    > retention_ms
+            }
+            None => {
+                now_ms.saturating_sub(timestamp_to_millis(from_sql_i64(injected_at)?))
+                    > LIVE_INJECTION_TTL_MS
+            }
+        };
+        if expired {
+            removed += conn.execute(
+                "DELETE FROM live_injections WHERE id = ?1",
+                params![id],
+            )?;
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -477,7 +514,10 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
           updated_at INTEGER,
           last_seen_at INTEGER NOT NULL,
           last_turn_status TEXT,
-          last_preview TEXT
+          last_preview TEXT,
+          messaging_socket TEXT,
+          socket_inode INTEGER,
+          socket_boot_id TEXT
         );
         CREATE TABLE IF NOT EXISTS pending_prompts (
           thread_id TEXT PRIMARY KEY,
@@ -561,6 +601,12 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
           payload_json TEXT NOT NULL,
           created_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS live_injections (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          thread_id TEXT NOT NULL,
+          injected_at INTEGER NOT NULL,
+          claimed_at INTEGER
+        );
         CREATE TABLE IF NOT EXISTS bridge_turns (
           turn_id TEXT PRIMARY KEY,
           thread_id TEXT NOT NULL,
@@ -587,6 +633,9 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     )?;
     ensure_column(conn, "threads_cache", "last_turn_status", "TEXT")?;
     ensure_column(conn, "threads_cache", "last_preview", "TEXT")?;
+    ensure_column(conn, "threads_cache", "messaging_socket", "TEXT")?;
+    ensure_column(conn, "threads_cache", "socket_inode", "INTEGER")?;
+    ensure_column(conn, "threads_cache", "socket_boot_id", "TEXT")?;
     ensure_column(conn, "telegram_command_routes", "payload_json", "TEXT")?;
     ensure_column(
         conn,
@@ -601,6 +650,7 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(conn, "bridge_turns", "exit_code", "INTEGER")?;
+    migrate_live_injections(conn)?;
     ensure_column(conn, "bridge_turns", "proc_start", "TEXT")?;
     ensure_column(conn, "bridge_turns", "proc_exe", "TEXT")?;
     ensure_column(conn, "bridge_turns", "pgid", "INTEGER")?;
@@ -616,6 +666,52 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
         "backend_pid",
         "INTEGER",
     )?;
+    Ok(())
+}
+
+/// The first shipped shape of `live_injections` counted owed answers per
+/// thread (`thread_id/injected_at/owed`); accounting is now per injection so
+/// an older completion cannot claim a newer one. `CREATE TABLE IF NOT
+/// EXISTS` leaves an already-deployed table untouched, so rebuild it here —
+/// otherwise every query fails with "no such column" on an upgraded install.
+fn migrate_live_injections(conn: &Connection) -> Result<()> {
+    let columns = table_columns(conn, "live_injections")?;
+    if columns.is_empty() || columns.iter().any(|column| column == "claimed_at") {
+        return Ok(());
+    }
+    // One transaction for read + DROP + CREATE + expansion: a crash midway
+    // would otherwise leave the new (partially filled) table in place, and
+    // the next startup would see `claimed_at` and consider the migration
+    // done — silently losing the debts that were never re-inserted.
+    let tx = conn.unchecked_transaction()?;
+    let legacy: Vec<(String, i64, i64)> = {
+        let mut stmt = tx.prepare("SELECT thread_id, injected_at, owed FROM live_injections")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    tx.execute_batch(
+        "DROP TABLE live_injections;
+         CREATE TABLE live_injections (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           thread_id TEXT NOT NULL,
+           injected_at INTEGER NOT NULL,
+           claimed_at INTEGER
+         );",
+    )?;
+    // Each outstanding count becomes one unclaimed row so no owed answer is
+    // silently dropped by the upgrade.
+    for (thread_id, injected_at, owed) in legacy {
+        for _ in 0..owed.max(0) {
+            tx.execute(
+                "INSERT INTO live_injections(thread_id, injected_at, claimed_at)
+                 VALUES (?1, ?2, NULL)",
+                params![thread_id, injected_at],
+            )?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -800,6 +896,141 @@ pub(crate) fn upsert_thread_snapshot(
     Ok(())
 }
 
+/// Remember where a live session listens for injected messages. Reported by
+/// the session's own hooks (they inherit CLAUDE_CODE_MESSAGING_SOCKET), so
+/// this mapping is authoritative rather than guessed from process state.
+pub(crate) fn record_session_messaging_socket(
+    conn: &Connection,
+    thread_id: &str,
+    socket: &crate::claude::SessionSocket,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO threads_cache(
+            thread_id, status_type, status_flags_json, last_seen_at,
+            messaging_socket, socket_inode, socket_boot_id
+         ) VALUES (?1, 'active', '[]', ?3, ?2, ?4, ?5)
+         ON CONFLICT(thread_id) DO UPDATE SET
+            messaging_socket = excluded.messaging_socket,
+            socket_inode = excluded.socket_inode,
+            socket_boot_id = excluded.socket_boot_id",
+        params![
+            thread_id,
+            socket.path,
+            to_sql_i64(now)?,
+            socket.inode.map(|value| value as i64),
+            socket.boot_id
+        ],
+    )?;
+    Ok(())
+}
+
+/// The socket a live session reported, with the identity captured at that
+/// moment so the caller can refuse a path that has since been rebound.
+pub(crate) fn session_messaging_socket(
+    conn: &Connection,
+    thread_id: &str,
+) -> Result<Option<crate::claude::SessionSocket>> {
+    let row: Option<(Option<String>, Option<i64>, Option<String>)> = conn
+        .query_row(
+            "SELECT messaging_socket, socket_inode, socket_boot_id
+             FROM threads_cache WHERE thread_id = ?1",
+            params![thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    Ok(row.and_then(|(path, inode, boot_id)| {
+        let path = path.filter(|value| !value.trim().is_empty())?;
+        Some(crate::claude::SessionSocket {
+            path,
+            inode: inode.map(|value| value as u64),
+            boot_id,
+        })
+    }))
+}
+
+/// A message injected into a live session owes an answer back to Telegram,
+/// exactly like a headless bridge turn does. There is no per-turn log to
+/// read here — the answer lands in the live session's own transcript — so
+/// the owed answer is claimed by that session's next completion.
+pub(crate) const LIVE_INJECTION_TTL_MS: u64 = 6 * 60 * 60 * 1000;
+
+pub(crate) fn record_live_injection(conn: &Connection, thread_id: &str, now: u64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO live_injections(thread_id, injected_at, claimed_at)
+         VALUES (?1, ?2, NULL)",
+        params![thread_id, to_sql_i64(now)?],
+    )?;
+    Ok(())
+}
+
+/// Id of the oldest unclaimed injection this completion may answer. A
+/// completion that happened BEFORE the injection cannot be its answer — a
+/// Stop already sitting in the spool would otherwise be pushed as the reply
+/// and burn the debt, leaving the real answer unsent.
+fn claimable_live_injection(
+    conn: &Connection,
+    thread_id: &str,
+    event_at: Option<u64>,
+    now: u64,
+) -> Result<Option<i64>> {
+    // No timestamp on the event: it cannot be proven to postdate the
+    // injection, so it must not claim it.
+    let Some(event_at) = event_at else {
+        return Ok(None);
+    };
+    // Both sides go through the same normalization — hook timestamps and
+    // stored timestamps can differ in unit, and comparing a normalized value
+    // against a raw one silently lets an older completion win.
+    let event_ms = timestamp_to_millis(event_at);
+    let now_ms = timestamp_to_millis(now);
+    let mut stmt = conn.prepare(
+        "SELECT id, injected_at FROM live_injections
+         WHERE thread_id = ?1 AND claimed_at IS NULL
+         ORDER BY injected_at ASC, id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![thread_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, injected_at) in rows {
+        let injected_ms = timestamp_to_millis(from_sql_i64(injected_at)?);
+        if now_ms.saturating_sub(injected_ms) > LIVE_INJECTION_TTL_MS {
+            continue;
+        }
+        if injected_ms <= event_ms {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn live_injection_pending(
+    conn: &Connection,
+    thread_id: &str,
+    event_at: Option<u64>,
+    now: u64,
+) -> Result<bool> {
+    Ok(claimable_live_injection(conn, thread_id, event_at, now)?.is_some())
+}
+
+/// Mark the injection this completion answered as settled.
+pub(crate) fn consume_live_injection(
+    conn: &Connection,
+    thread_id: &str,
+    event_at: Option<u64>,
+    now: u64,
+) -> Result<()> {
+    if let Some(id) = claimable_live_injection(conn, thread_id, event_at, now)? {
+        conn.execute(
+            "UPDATE live_injections SET claimed_at = ?2 WHERE id = ?1",
+            params![id, to_sql_i64(now)?],
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn record_action(
     conn: &Connection,
     thread_id: &str,
@@ -952,10 +1183,16 @@ pub(crate) fn reconcile_thread_snapshots(
         upsert_thread_snapshot(conn, snapshot, now)?;
         threads.push(thread_snapshot_json(snapshot));
 
-        // Hook events drive away notifications only. Answers to
-        // bridge-initiated turns are delivered from their own turn logs
-        // (see bridge_turns), not attributed from Stop hooks.
-        if !away || !should_emit_for_away_window(away_started_at, snapshot.updated_at) {
+        // Hook events drive away notifications only — EXCEPT for a session
+        // that owes an answer to a message injected from Telegram. That
+        // message went into this live session's queue, so its next
+        // completion is the reply the user was promised and must go out
+        // whatever the away switch says.
+        let owes_injected_answer =
+            live_injection_pending(conn, &snapshot.thread_id, snapshot.updated_at, now)?;
+        if !owes_injected_answer
+            && (!away || !should_emit_for_away_window(away_started_at, snapshot.updated_at))
+        {
             continue;
         }
 
@@ -2086,6 +2323,118 @@ mod tests {
         let columns = table_columns(&conn, "threads_cache").expect("columns");
         assert!(columns.contains(&"last_turn_status".to_string()));
         assert!(columns.contains(&"last_preview".to_string()));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// An install that already shipped the counting shape of
+    /// `live_injections` must be rebuilt into per-injection rows — otherwise
+    /// every query hits "no such column: claimed_at" after the upgrade.
+    /// Pruning must normalize timestamps the same way claiming does: a
+    /// second-granularity row that was just created must survive, and an old
+    /// one must go, in BOTH units.
+    #[test]
+    fn prune_live_injections_handles_second_and_millisecond_timestamps() {
+        let conn = create_state_db_in_memory().expect("db");
+        let retention_ms: u64 = 30 * 24 * 60 * 60 * 1000;
+        // "Now" as a realistic epoch in both units.
+        let now_ms: u64 = 1_786_400_000_000;
+        let now_secs: u64 = now_ms / 1000;
+
+        let insert = |thread: &str, injected_at: u64, claimed_at: Option<u64>| {
+            conn.execute(
+                "INSERT INTO live_injections(thread_id, injected_at, claimed_at)
+                 VALUES (?1, ?2, ?3)",
+                params![thread, injected_at as i64, claimed_at.map(|v| v as i64)],
+            )
+            .expect("insert");
+        };
+        // Fresh, unclaimed — must survive in both units.
+        insert("fresh_ms", now_ms - 60_000, None);
+        insert("fresh_secs", now_secs - 60, None);
+        // Just claimed — must survive in both units.
+        insert("claimed_ms", now_ms - 60_000, Some(now_ms - 60_000));
+        insert("claimed_secs", now_secs - 60, Some(now_secs - 60));
+        // Unclaimed past the TTL, and claimed past retention — must go.
+        insert("stale_ms", now_ms - LIVE_INJECTION_TTL_MS - 60_000, None);
+        insert(
+            "stale_secs",
+            now_secs - (LIVE_INJECTION_TTL_MS / 1000) - 60,
+            None,
+        );
+        insert(
+            "old_claim_ms",
+            now_ms - retention_ms - 120_000,
+            Some(now_ms - retention_ms - 60_000),
+        );
+
+        let removed = prune_live_injections(&conn, now_ms, retention_ms).expect("prune");
+        assert_eq!(removed, 3, "only the expired rows are pruned");
+
+        let surviving: Vec<String> = conn
+            .prepare("SELECT thread_id FROM live_injections ORDER BY thread_id")
+            .expect("stmt")
+            .query_map([], |row| row.get(0))
+            .expect("rows")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect");
+        assert_eq!(
+            surviving,
+            vec![
+                "claimed_ms".to_string(),
+                "claimed_secs".to_string(),
+                "fresh_ms".to_string(),
+                "fresh_secs".to_string()
+            ],
+            "a recent second-granularity row must not be mistaken for an ancient one"
+        );
+    }
+
+    #[test]
+    fn create_state_db_migrates_legacy_live_injections_table() {
+        let path = std::env::temp_dir().join(format!(
+            "tinyctb-live-injections-migrate-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("open legacy db");
+            conn.execute_batch(
+                "CREATE TABLE live_injections (
+                    thread_id TEXT PRIMARY KEY,
+                    injected_at INTEGER NOT NULL,
+                    owed INTEGER NOT NULL
+                 );
+                 INSERT INTO live_injections(thread_id, injected_at, owed)
+                 VALUES ('thr_owed', 1000, 2);",
+            )
+            .expect("seed legacy table");
+        }
+
+        let conn = create_state_db(&path).expect("migrated db");
+        let columns = table_columns(&conn, "live_injections").expect("columns");
+        assert!(columns.contains(&"id".to_string()));
+        assert!(columns.contains(&"claimed_at".to_string()));
+        assert!(!columns.contains(&"owed".to_string()));
+
+        // Both outstanding answers survive as individual debts, and the new
+        // API works against the migrated table.
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM live_injections WHERE thread_id = 'thr_owed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(rows, 2, "each owed answer becomes one unclaimed row");
+        assert!(
+            live_injection_pending(&conn, "thr_owed", Some(2000), 2000).expect("pending"),
+            "migrated debts remain claimable"
+        );
+        consume_live_injection(&conn, "thr_owed", Some(2000), 2000).expect("consume");
+        assert!(
+            live_injection_pending(&conn, "thr_owed", Some(2000), 2000).expect("second"),
+            "only one debt is settled per completion"
+        );
         let _ = std::fs::remove_file(path);
     }
 
