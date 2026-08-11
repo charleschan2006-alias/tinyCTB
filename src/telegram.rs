@@ -543,17 +543,6 @@ fn deliver_prepared_telegram_delivery(
     }))
 }
 
-fn send_recent_thread_snapshot(
-    conn: &Connection,
-    telegram: &TelegramConfig,
-    snapshot: &BridgeThreadSnapshot,
-    now: u64,
-    timeout: Duration,
-) -> Result<Value> {
-    let mut prepared = prepare_telegram_thread_snapshot_delivery(&telegram.chat_id, snapshot)?;
-    deliver_prepared_telegram_delivery(conn, telegram, &mut prepared, now, timeout)
-}
-
 /// Feedback for an authorized message that matched no route. Plain text never
 /// reaches a session on its own — say so loudly instead of dropping it.
 fn unrouted_message_hint_text(message: &Value) -> String {
@@ -1075,20 +1064,50 @@ fn execute_threads_command(
     }
 
     let mut sent = Vec::with_capacity(snapshots.len());
+    let mut render_failed = 0usize;
     for snapshot in &snapshots {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             break;
         }
-        sent.push(send_recent_thread_snapshot(
-            conn, telegram, snapshot, now, timeout,
+        // ONLY a rendering failure is isolated: it is specific to this one
+        // snapshot while the transport still works, so report it in place and
+        // keep listing the rest.
+        let mut prepared =
+            match prepare_telegram_thread_snapshot_delivery(&telegram.chat_id, snapshot) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    render_failed += 1;
+                    let notice = format!(
+                        "⚠️ Could not render session {}: {error:#}",
+                        snapshot.thread_id.chars().take(8).collect::<String>()
+                    );
+                    // Propagate if even this cannot be sent — that is a
+                    // transport failure, not a per-snapshot problem.
+                    telegram_send_text(telegram, &notice, timeout)?;
+                    sent.push(json!({
+                        "ok": false,
+                        "threadId": snapshot.thread_id,
+                        "stage": "render",
+                        "error": format!("{error:#}")
+                    }));
+                    continue;
+                }
+            };
+        // Delivery and reply-route persistence failures are transport/state
+        // level, not snapshot level: reporting them as "could not render"
+        // would be wrong, and a half-delivered snapshot (sent but unroutable)
+        // must surface as a real error rather than be swallowed here.
+        sent.push(deliver_prepared_telegram_delivery(
+            conn, telegram, &mut prepared, now, timeout,
         )?);
     }
 
     Ok(json!({
-        "ok": true,
+        "ok": render_failed == 0,
         "action": "telegram_threads",
         "limit": limit,
         "count": snapshots.len(),
+        "renderFailed": render_failed,
         "sent": sent
     }))
 }

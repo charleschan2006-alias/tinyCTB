@@ -18,7 +18,13 @@ const TELEGRAM_ANSWER_THREAD_HINT: &str =
 const TELEGRAM_APPROVAL_HINT: &str =
     "⌨️ Approve or deny this in the terminal where the session is running. Replying here sends a follow-up message instead.";
 const TELEGRAM_MESSAGE_CHAR_LIMIT: usize = 4096;
+/// Shared budget for a /threads snapshot body (question + preview together),
+/// leaving room for the title, name, project and reply-hint lines inside one
+/// Telegram message.
 const TELEGRAM_THREAD_SNAPSHOT_DETAIL_LIMIT: usize = 3000;
+/// The preview never shrinks below this, so a very long question cannot
+/// squeeze out Claude's actual answer entirely.
+const TELEGRAM_THREAD_SNAPSHOT_MIN_PREVIEW: usize = 600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedTelegramDelivery {
@@ -63,15 +69,36 @@ fn telegram_event_display_name(event: &Value) -> String {
         .to_string()
 }
 
+/// Body of a notification. A waiting prompt carries two different things and
+/// needs BOTH: the hook's question says why Claude wants you ("Claude is
+/// waiting for your input", or a permission request plus its tool detail),
+/// while the preview is what Claude actually last said. Showing only the
+/// question — which is what a plain priority chain does — renders a
+/// contentless one-liner and hides the answer sitting right next to it.
 fn telegram_event_detail(event: &Value) -> Option<String> {
-    event
+    let question = event
         .pointer("/thread/pendingPrompt/question")
         .and_then(Value::as_str)
-        .or_else(|| event.pointer("/thread/lastPreview").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let preview = event
+        .pointer("/thread/lastPreview")
+        .and_then(Value::as_str)
         .or_else(|| event.get("lastPreview").and_then(Value::as_str))
         .or_else(|| event.get("message").and_then(Value::as_str))
-        .filter(|value| !value.trim().is_empty())
-        .map(sanitize_telegram_detail)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let detail = match (question, preview) {
+        (Some(question), Some(preview)) => match redundant_pair(question, preview) {
+            // One side is the other's full text (or its truncated prefix):
+            // render the complete one only.
+            Some(complete) => complete.to_string(),
+            None => format!("{question}\n\n{preview}"),
+        },
+        (Some(value), None) | (None, Some(value)) => value.to_string(),
+        (None, None) => return None,
+    };
+    Some(sanitize_telegram_detail(&detail))
 }
 
 fn telegram_event_is_approval(event: &Value) -> bool {
@@ -83,6 +110,31 @@ fn telegram_event_is_approval(event: &Value) -> bool {
             .pointer("/thread/pendingPrompt/kind")
             .and_then(Value::as_str)
             == Some("approval")
+}
+
+/// Returns the text to show alone when two bodies really are the same text:
+/// either they are equal, or the shorter one is an EXPLICITLY TRUNCATED copy
+/// (ends in `…` / `...`) whose stem prefixes the longer one.
+///
+/// Both restrictions are load-bearing. Substring containment is not enough —
+/// a short answer ("no") often appears inside its own question ("Please
+/// answer yes or no"). Nor is a bare prefix — "No" is a genuine answer to
+/// "No changes are required", not a truncation of it. Without a truncation
+/// marker, only exact equality counts as redundant.
+fn redundant_pair<'a>(left: &'a str, right: &'a str) -> Option<&'a str> {
+    if left == right {
+        return Some(left);
+    }
+    let (shorter, longer) = if left.chars().count() <= right.chars().count() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let stem = shorter
+        .strip_suffix('…')
+        .or_else(|| shorter.strip_suffix("..."))?
+        .trim_end();
+    (!stem.is_empty() && longer.starts_with(stem)).then_some(longer)
 }
 
 fn split_telegram_text(text: &str, max_chars: usize) -> Vec<String> {
@@ -229,7 +281,7 @@ fn thread_snapshot_event_type(snapshot: &BridgeThreadSnapshot) -> &'static str {
     }
 }
 
-fn pending_prompt_value(prompt: &PendingPrompt) -> Value {
+fn pending_prompt_value(prompt: &PendingPrompt, question_budget: usize) -> Value {
     json!({
         "promptId": prompt.prompt_id,
         "promptKind": prompt.kind,
@@ -239,10 +291,7 @@ fn pending_prompt_value(prompt: &PendingPrompt) -> Value {
         "question": prompt
             .question
             .as_deref()
-            .and_then(|question| trim_for_telegram_detail(
-                question,
-                TELEGRAM_THREAD_SNAPSHOT_DETAIL_LIMIT
-            ))
+            .and_then(|question| trim_for_telegram_detail(question, question_budget))
     })
 }
 
@@ -258,9 +307,26 @@ fn thread_snapshot_event(snapshot: &BridgeThreadSnapshot) -> Value {
         &snapshot.thread_id,
     );
     let display_name = trim_for_telegram_line(&display_name, 160);
-    let last_preview = snapshot.last_preview.as_deref().and_then(|preview| {
-        trim_for_telegram_detail(preview, TELEGRAM_THREAD_SNAPSHOT_DETAIL_LIMIT)
-    });
+    // The rendered body concatenates question AND preview, so the two share
+    // one budget — /threads snapshots must stay within a single Telegram
+    // message, and two independent 3000-char fields would overflow it.
+    // The question (why Claude wants you) keeps priority; the preview takes
+    // whatever is left, and always keeps a readable minimum.
+    let question_len = snapshot
+        .pending_prompt
+        .as_ref()
+        .and_then(|prompt| prompt.question.as_deref())
+        .map(|question| question.chars().count().min(TELEGRAM_THREAD_SNAPSHOT_DETAIL_LIMIT))
+        .unwrap_or(0);
+    let preview_budget = TELEGRAM_THREAD_SNAPSHOT_DETAIL_LIMIT
+        .saturating_sub(question_len)
+        .max(TELEGRAM_THREAD_SNAPSHOT_MIN_PREVIEW);
+    let question_budget =
+        TELEGRAM_THREAD_SNAPSHOT_DETAIL_LIMIT.saturating_sub(TELEGRAM_THREAD_SNAPSHOT_MIN_PREVIEW);
+    let last_preview = snapshot
+        .last_preview
+        .as_deref()
+        .and_then(|preview| trim_for_telegram_detail(preview, preview_budget));
 
     json!({
         "type": thread_snapshot_event_type(snapshot),
@@ -278,7 +344,10 @@ fn thread_snapshot_event(snapshot: &BridgeThreadSnapshot) -> Value {
             "statusFlags": snapshot.status_flags,
             "lastTurnStatus": snapshot.last_turn_status,
             "lastPreview": last_preview,
-            "pendingPrompt": snapshot.pending_prompt.as_ref().map(pending_prompt_value)
+            "pendingPrompt": snapshot
+                .pending_prompt
+                .as_ref()
+                .map(|prompt| pending_prompt_value(prompt, question_budget))
         }
     })
 }
@@ -502,6 +571,212 @@ mod tests {
         assert!(text.contains("Approve or deny this in the terminal"));
         assert!(prepared.callback_routes.is_empty());
         assert!(prepared.payloads[0].get("reply_markup").is_none());
+    }
+
+    /// Regression for the "🟡 Claude needs you with no content" report: the
+    /// idle-notification question carries no information, so the body must
+    /// also show what Claude last said.
+    #[test]
+    fn waiting_payload_shows_last_answer_next_to_the_generic_question() {
+        let event = json!({
+            "type": "thread_waiting",
+            "threadId": "thr_idle",
+            "updatedAt": 42,
+            "lastPreview": "Here is the answer you asked for.",
+            "thread": {
+                "displayName": "Mahjong training",
+                "lastPreview": "Here is the answer you asked for.",
+                "pendingPrompt": {
+                    "promptKind": "reply",
+                    "question": "Claude is waiting for your input"
+                }
+            }
+        });
+
+        let prepared = prepare_telegram_delivery("999", &event).expect("prepared");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert!(text.starts_with("🟡 Claude needs you"));
+        assert!(
+            text.contains("Claude is waiting for your input"),
+            "the reason must stay: {text}"
+        );
+        assert!(
+            text.contains("Here is the answer you asked for."),
+            "the actual answer must be visible, not just the generic prompt: {text}"
+        );
+    }
+
+    /// Approval prompts keep the permission line and its tool detail, and
+    /// still gain the surrounding context.
+    #[test]
+    fn approval_payload_keeps_tool_detail_and_adds_context() {
+        let event = json!({
+            "type": "thread_waiting",
+            "threadId": "thr_approval",
+            "updatedAt": 42,
+            "thread": {
+                "displayName": "Deploy",
+                "lastPreview": "I will clean the build directory next.",
+                "pendingPrompt": {
+                    "promptKind": "approval",
+                    "question": "Claude needs your permission to use Bash\n\n⚙️ Bash: rm -rf build/"
+                }
+            }
+        });
+
+        let prepared = prepare_telegram_delivery("999", &event).expect("prepared");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert!(text.starts_with("🔐 Claude needs approval"));
+        assert!(text.contains("⚙️ Bash: rm -rf build/"), "{text}");
+        assert!(text.contains("I will clean the build directory next."), "{text}");
+    }
+
+    /// Regression: the body concatenates question AND preview, so a snapshot
+    /// with both fields long must still fit one Telegram message — otherwise
+    /// prepare_telegram_thread_snapshot_delivery bails and /threads dies.
+    #[test]
+    fn snapshot_with_long_question_and_long_preview_stays_one_message() {
+        let snapshot = crate::state::BridgeThreadSnapshot {
+            thread_id: "thr_long".to_string(),
+            name: Some("Very chatty session".to_string()),
+            cwd: Some("/home/user/projects/tinyCTB".to_string()),
+            updated_at: Some(42),
+            status_type: "active".to_string(),
+            status_flags: vec!["waitingOnUserInput".to_string()],
+            last_turn_status: None,
+            last_preview: Some("答".repeat(9_000)),
+            pending_prompt: Some(PendingPrompt {
+                prompt_id: "notify:1".to_string(),
+                kind: "approval".to_string(),
+                status: "pending".to_string(),
+                question: Some("问".repeat(9_000)),
+            }),
+            event_uid: None,
+        };
+
+        let prepared = prepare_telegram_thread_snapshot_delivery("999", &snapshot)
+            .expect("long snapshot must not fail to render");
+        assert_eq!(prepared.payloads.len(), 1, "snapshot must stay single-message");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert!(
+            text.chars().count() <= TELEGRAM_MESSAGE_CHAR_LIMIT,
+            "rendered {} chars",
+            text.chars().count()
+        );
+        // Both parts survive: the question keeps priority, the answer keeps a
+        // guaranteed minimum rather than being squeezed out entirely.
+        assert!(text.contains("问问问"), "question missing: {text}");
+        assert!(text.contains("答答答"), "preview squeezed out: {text}");
+    }
+
+    /// A short answer often appears verbatim inside its own question; that
+    /// must NOT count as redundant, or the real answer disappears.
+    #[test]
+    fn short_answer_contained_in_question_is_still_shown() {
+        let event = json!({
+            "type": "thread_waiting",
+            "threadId": "thr_yesno",
+            "updatedAt": 42,
+            "thread": {
+                "displayName": "Confirm",
+                "lastPreview": "no",
+                "pendingPrompt": {
+                    "promptKind": "reply",
+                    "question": "Please answer yes or no"
+                }
+            }
+        });
+
+        let prepared = prepare_telegram_delivery("999", &event).expect("prepared");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert!(text.contains("Please answer yes or no"), "{text}");
+        assert!(
+            text.contains("\nno"),
+            "the actual answer must survive containment dedup: {text}"
+        );
+    }
+
+    /// The prefix case, distinct from the containment case above: a short
+    /// answer that happens to START the question ("No" / "No changes are
+    /// required") carries no truncation marker, so it is real content and
+    /// must survive.
+    #[test]
+    fn short_answer_prefixing_question_without_ellipsis_is_still_shown() {
+        let event = json!({
+            "type": "thread_waiting",
+            "threadId": "thr_prefix",
+            "updatedAt": 42,
+            "thread": {
+                "displayName": "Review",
+                "lastPreview": "No",
+                "pendingPrompt": {
+                    "promptKind": "reply",
+                    "question": "No changes are required"
+                }
+            }
+        });
+
+        let prepared = prepare_telegram_delivery("999", &event).expect("prepared");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert!(text.contains("No changes are required"), "{text}");
+        assert!(
+            text.contains("\nNo") && text.trim_end().ends_with("Reply action on this message."),
+            "an un-truncated short answer must not be swallowed as a prefix: {text}"
+        );
+        // Belt and braces at the unit level.
+        assert_eq!(redundant_pair("No", "No changes are required"), None);
+        assert_eq!(
+            redundant_pair("No changes…", "No changes are required"),
+            Some("No changes are required")
+        );
+        assert_eq!(redundant_pair("same", "same"), Some("same"));
+    }
+
+    /// A truncated preview IS redundant against the full text: show the
+    /// complete one only.
+    #[test]
+    fn truncated_prefix_is_deduped_to_the_complete_text() {
+        let full = "Done: the parser is fixed and all tests pass.";
+        let event = json!({
+            "type": "thread_completed",
+            "threadId": "thr_trunc",
+            "updatedAt": 42,
+            "thread": {
+                "displayName": "Parser",
+                "lastPreview": "Done: the parser is fixed…",
+                "pendingPrompt": { "promptKind": "reply", "question": full }
+            }
+        });
+
+        let prepared = prepare_telegram_delivery("999", &event).expect("prepared");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert!(text.contains(full), "{text}");
+        assert!(
+            !text.contains("fixed…"),
+            "the truncated copy must not be rendered too: {text}"
+        );
+    }
+
+    /// A completed turn whose preview and question are the same text must not
+    /// be rendered twice.
+    #[test]
+    fn duplicate_question_and_preview_render_once() {
+        let answer = "Done: the parser is fixed.";
+        let event = json!({
+            "type": "thread_completed",
+            "threadId": "thr_done",
+            "updatedAt": 42,
+            "lastPreview": answer,
+            "thread": {
+                "displayName": "Parser",
+                "lastPreview": answer,
+                "pendingPrompt": { "promptKind": "reply", "question": answer }
+            }
+        });
+
+        let prepared = prepare_telegram_delivery("999", &event).expect("prepared");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert_eq!(text.matches(answer).count(), 1, "duplicated body: {text}");
     }
 
     #[test]
