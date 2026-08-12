@@ -157,6 +157,7 @@ pub(crate) fn telegram_set_my_commands(
     )
 }
 
+#[cfg_attr(test, allow(dead_code))] // test builds ack through the seam instead
 pub(crate) fn telegram_answer_callback_query(
     telegram: &TelegramConfig,
     callback_query_id: &str,

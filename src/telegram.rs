@@ -33,10 +33,9 @@ use crate::{
 };
 
 use self::api::{
-    telegram_answer_callback_query, telegram_bot_commands, telegram_chat_id,
-    telegram_delete_webhook, telegram_from_user_id, telegram_get_updates, telegram_message_id,
-    telegram_send_chat_action, telegram_send_message, telegram_send_text,
-    telegram_send_text_message_id, telegram_updates_array,
+    telegram_bot_commands, telegram_chat_id, telegram_delete_webhook, telegram_from_user_id,
+    telegram_get_updates, telegram_message_id, telegram_send_chat_action, telegram_send_message,
+    telegram_send_text, telegram_send_text_message_id, telegram_updates_array,
 };
 use self::render::{
     prepare_telegram_delivery, prepare_telegram_thread_snapshot_delivery, telegram_help_text,
@@ -440,11 +439,28 @@ pub(crate) fn extract_telegram_command_prompt_reply(
     }))
 }
 
+/// What a callback tap resolved to. The distinction the caller must not
+/// collapse: a SPENT button still deserves an `answerCallbackQuery` — without
+/// one the Telegram client spins on the tap for ~30s and then shows nothing,
+/// which reads as "the bridge hung" (observed live, 2026-08-13). Only taps
+/// that are not ours to answer stay silent.
+pub(crate) enum TelegramCallbackLookup {
+    /// An unused route: record the answer and consume it.
+    Route(RoutedTelegramCallback),
+    /// Ours and authorized, but already used (or pruned): toast the truth.
+    Spent {
+        callback_query_id: String,
+        toast: &'static str,
+    },
+    /// Unauthorized or not our data format: ignore silently, as ever.
+    Foreign,
+}
+
 pub(crate) fn extract_telegram_callback_route(
     conn: &Connection,
     callback_query: &Value,
     telegram: &TelegramConfig,
-) -> Result<Option<RoutedTelegramCallback>> {
+) -> Result<TelegramCallbackLookup> {
     let message = callback_query.get("message");
     let chat_id = message.and_then(telegram_chat_id);
     let user_id = callback_query
@@ -457,7 +473,7 @@ pub(crate) fn extract_telegram_callback_route(
                 .or_else(|| value.as_str().map(str::to_string))
         });
     if !telegram_authorized(telegram, chat_id.as_deref(), user_id.as_deref()) {
-        return Ok(None);
+        return Ok(TelegramCallbackLookup::Foreign);
     }
     let callback_query_id = callback_query
         .get("id")
@@ -468,13 +484,13 @@ pub(crate) fn extract_telegram_callback_route(
         .and_then(Value::as_str)
         .and_then(|data| data.strip_prefix("claude:"))
     else {
-        return Ok(None);
+        return Ok(TelegramCallbackLookup::Foreign);
     };
     let route = conn
         .query_row(
-            "SELECT thread_id, action, approval_id, question_id, answer
+            "SELECT thread_id, action, approval_id, question_id, answer, used_at
              FROM telegram_callback_routes
-             WHERE callback_id = ?1 AND used_at IS NULL",
+             WHERE callback_id = ?1",
             params![callback_id],
             |row| {
                 Ok((
@@ -483,23 +499,41 @@ pub(crate) fn extract_telegram_callback_route(
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             },
         )
         .optional()?;
-    Ok(
-        route.and_then(|(thread_id, action, approval_id, question_id, answer)| {
-            TelegramCallbackAction::from_str(&action).map(|action| RoutedTelegramCallback {
-                callback_query_id: callback_query_id.to_string(),
-                callback_id: callback_id.to_string(),
-                thread_id,
-                action,
-                approval_id,
-                question_id,
-                answer,
-            })
+    let Some((thread_id, action, approval_id, question_id, answer, used_at)) = route else {
+        // Never existed or pruned away: the button outlived its row.
+        return Ok(TelegramCallbackLookup::Spent {
+            callback_query_id: callback_query_id.to_string(),
+            toast: "这个按钮已经失效了。",
+        });
+    };
+    if used_at.is_some() {
+        // One answer per button (used_at) is a security rule; saying so is
+        // not optional politeness but the only feedback the tap gets.
+        return Ok(TelegramCallbackLookup::Spent {
+            callback_query_id: callback_query_id.to_string(),
+            toast: "这个按钮已经处理过了。",
+        });
+    }
+    match TelegramCallbackAction::from_str(&action) {
+        Some(action) => Ok(TelegramCallbackLookup::Route(RoutedTelegramCallback {
+            callback_query_id: callback_query_id.to_string(),
+            callback_id: callback_id.to_string(),
+            thread_id,
+            action,
+            approval_id,
+            question_id,
+            answer,
+        })),
+        None => Ok(TelegramCallbackLookup::Spent {
+            callback_query_id: callback_query_id.to_string(),
+            toast: "这个按钮已经失效了。",
         }),
-    )
+    }
 }
 
 pub(crate) fn deliver_telegram_event(
@@ -1637,6 +1671,87 @@ fn answer_pending_question_from_reply(
     })))
 }
 
+/// Answer a callback tap, retrying transient API failures WITHIN the tap's
+/// own validity window (a callback id dies on Telegram's side after ~30s).
+///
+/// Deliberately NOT retried across cycles: parking the failed update for a
+/// later retry would either wedge the whole queue behind one poison update
+/// (the batch design acks failures precisely to avoid that) or be skipped by
+/// the batch offset anyway — and by the next cycle the id is likely a corpse
+/// no answer can reach. So: three spaced attempts here, and past that the
+/// failure goes into the inbound log next to the update instead of vanishing
+/// into a discarded Result.
+fn acknowledge_callback_tap(
+    telegram: &TelegramConfig,
+    callback_query_id: &str,
+    toast: &str,
+    timeout: Duration,
+) -> std::result::Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        match send_callback_ack(telegram, callback_query_id, toast, timeout) {
+            Ok(()) => return Ok(()),
+            Err(err) => last_error = format!("{err:#}"),
+        }
+    }
+    eprintln!("tinyctb: callback ack failed after retries: {last_error}");
+    Err(last_error)
+}
+
+fn send_callback_ack(
+    telegram: &TelegramConfig,
+    callback_query_id: &str,
+    toast: &str,
+    timeout: Duration,
+) -> Result<()> {
+    #[cfg(test)]
+    {
+        let _ = (telegram, timeout);
+        test_callback_acks::attempt(callback_query_id, toast)
+    }
+    #[cfg(not(test))]
+    {
+        self::api::telegram_answer_callback_query(telegram, callback_query_id, toast, timeout)
+            .map(|_| ())
+    }
+}
+
+/// Observation seam for the dispatch layer: tests assert that a tap actually
+/// SENT an ack (and what it said), and can inject persistent API failure.
+/// Without this, deleting the send call would leave every toast test green.
+#[cfg(test)]
+pub(crate) mod test_callback_acks {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    pub(crate) static FAIL: AtomicBool = AtomicBool::new(false);
+    pub(crate) static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static RECORDED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn attempt(callback_query_id: &str, toast: &str) -> anyhow::Result<()> {
+        ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        if FAIL.load(Ordering::SeqCst) {
+            anyhow::bail!("injected ack failure");
+        }
+        RECORDED
+            .lock()
+            .expect("ack lock")
+            .push((callback_query_id.to_string(), toast.to_string()));
+        Ok(())
+    }
+
+    pub(crate) fn take() -> Vec<(String, String)> {
+        std::mem::take(&mut RECORDED.lock().expect("ack lock"))
+    }
+
+    pub(crate) fn reset_attempts() -> usize {
+        ATTEMPTS.swap(0, Ordering::SeqCst)
+    }
+}
+
 pub(crate) fn process_telegram_updates(
     conn: &Connection,
     config: &DaemonConfig,
@@ -1869,10 +1984,10 @@ fn process_telegram_update_batch(
                     .and_then(|message| message.get("message_id"))
                     .and_then(Value::as_i64);
                 match extract_telegram_callback_route(conn, callback_query, telegram)? {
-                    Some(route) => {
-                        let answer = record_callback_answer(conn, &route, now)?;
+                    TelegramCallbackLookup::Route(route) => {
+                        let mut answer = record_callback_answer(conn, &route, now)?;
                         mark_telegram_callback_route_used(conn, &route.callback_id, now)?;
-                        let _ = telegram_answer_callback_query(
+                        let ack = acknowledge_callback_tap(
                             telegram,
                             &route.callback_query_id,
                             answer
@@ -1881,6 +1996,15 @@ fn process_telegram_update_batch(
                                 .unwrap_or("已收到"),
                             timeout,
                         );
+                        // The update stays acked even when the toast could
+                        // not be delivered (queue protection), but the
+                        // failure is recorded, not discarded.
+                        if let Some(object) = answer.as_object_mut() {
+                            object.insert("ackDelivered".to_string(), json!(ack.is_ok()));
+                            if let Err(error) = &ack {
+                                object.insert("ackError".to_string(), json!(error));
+                            }
+                        }
                         if let Some(update_id) = update_id {
                             record_telegram_inbound_processed(
                                 conn,
@@ -1899,7 +2023,36 @@ fn process_telegram_update_batch(
                         }
                         callbacks += 1;
                     }
-                    None => {
+                    TelegramCallbackLookup::Spent {
+                        callback_query_id,
+                        toast,
+                    } => {
+                        // The tap gets its toast even though nothing changed;
+                        // silence here left the client spinning for ~30s and
+                        // then showing nothing at all.
+                        let ack =
+                            acknowledge_callback_tap(telegram, &callback_query_id, toast, timeout);
+                        if let Some(update_id) = update_id {
+                            record_telegram_inbound_processed(
+                                conn,
+                                bot_id,
+                                update_id,
+                                "callback_query_spent",
+                                &json!({
+                                    "toast": toast,
+                                    "ackDelivered": ack.is_ok(),
+                                    "ackError": ack.err()
+                                }),
+                                TelegramInboundLogContext {
+                                    route_message_id,
+                                    ..TelegramInboundLogContext::default()
+                                },
+                                now,
+                            )?;
+                        }
+                        ignored += 1;
+                    }
+                    TelegramCallbackLookup::Foreign => {
                         if let Some(update_id) = update_id {
                             record_telegram_inbound_processed(
                                 conn,
@@ -2983,6 +3136,151 @@ mod tests {
         );
     }
 
+    /// The dispatch layer must actually SEND the ack for both branches —
+    /// the lookup-level test alone would stay green if the send call were
+    /// deleted. Drives a real double-tap through the update batch.
+    #[test]
+    fn every_callback_tap_gets_an_ack_through_the_dispatch() {
+        let _guard = config_test_lock().lock().expect("config lock");
+        let _env = CommandEnv::new("ack-dispatch");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("write daemon config");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let telegram = config.telegram.clone().expect("telegram");
+        let bot_id = telegram_bot_id(&telegram.bot_token);
+        let _ = test_callback_acks::take();
+        test_callback_acks::reset_attempts();
+        crate::state::insert_telegram_callback_route(
+            &conn,
+            &crate::state::TelegramCallbackRoute {
+                callback_id: "cb_ack".to_string(),
+                chat_id: "456".to_string(),
+                message_id: None,
+                thread_id: "thr_ack".to_string(),
+                action: TelegramCallbackAction::Approve,
+                approval_id: None,
+                question_id: None,
+                answer: None,
+            },
+            1000,
+        )
+        .expect("insert route");
+        let tap = |update_id: i64, cq: &str| {
+            json!({
+                "update_id": update_id,
+                "callback_query": {
+                    "id": cq,
+                    "from": { "id": 789 },
+                    "message": { "message_id": 20, "chat": { "id": "456" } },
+                    "data": "claude:cb_ack"
+                }
+            })
+        };
+        let updates = vec![tap(1, "cq_first"), tap(2, "cq_second")];
+        process_telegram_update_batch(
+            &conn,
+            &config,
+            &telegram,
+            &bot_id,
+            "telegram_offset:test",
+            &updates,
+            2000,
+            Duration::from_secs(1),
+            None,
+        )
+        .expect("batch");
+
+        let acks = test_callback_acks::take();
+        assert_eq!(acks.len(), 2, "both taps must be answered: {acks:?}");
+        assert_eq!(acks[0].0, "cq_first");
+        // First tap consumed the route (no approval behind it in this
+        // fixture, so its toast is the invalid-button one) …
+        assert_eq!(acks[1].0, "cq_second");
+        // … and the SECOND tap on the now-used button gets the spent toast.
+        assert_eq!(acks[1].1, "这个按钮已经处理过了。");
+    }
+
+    /// A failing Telegram API must not fail silently: the ack is retried,
+    /// the update still advances (one poison tap must not wedge the queue),
+    /// and the failure is written into the inbound log next to the update.
+    #[test]
+    fn failed_ack_is_retried_and_logged_loudly() {
+        let _guard = config_test_lock().lock().expect("config lock");
+        let _env = CommandEnv::new("ack-fail");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("write daemon config");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let telegram = config.telegram.clone().expect("telegram");
+        let bot_id = telegram_bot_id(&telegram.bot_token);
+        let _ = test_callback_acks::take();
+        test_callback_acks::reset_attempts();
+        // A used route: the tap resolves to Spent, whose ack will fail.
+        crate::state::insert_telegram_callback_route(
+            &conn,
+            &crate::state::TelegramCallbackRoute {
+                callback_id: "cb_dead".to_string(),
+                chat_id: "456".to_string(),
+                message_id: None,
+                thread_id: "thr_dead".to_string(),
+                action: TelegramCallbackAction::Approve,
+                approval_id: None,
+                question_id: None,
+                answer: None,
+            },
+            1000,
+        )
+        .expect("insert route");
+        mark_telegram_callback_route_used(&conn, "cb_dead", 1500).expect("use");
+        let updates = vec![json!({
+            "update_id": 7,
+            "callback_query": {
+                "id": "cq_dead",
+                "from": { "id": 789 },
+                "message": { "message_id": 21, "chat": { "id": "456" } },
+                "data": "claude:cb_dead"
+            }
+        })];
+        test_callback_acks::FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = process_telegram_update_batch(
+            &conn,
+            &config,
+            &telegram,
+            &bot_id,
+            "telegram_offset:test",
+            &updates,
+            2000,
+            Duration::from_secs(1),
+            None,
+        );
+        test_callback_acks::FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
+        result.expect("batch must not error");
+
+        assert_eq!(
+            test_callback_acks::reset_attempts(),
+            3,
+            "the ack must be retried before giving up"
+        );
+        assert!(
+            telegram_inbound_processed(&conn, &bot_id, 7).expect("processed"),
+            "a poison tap must not wedge the queue"
+        );
+        let result_json: String = conn
+            .query_row(
+                "SELECT result_json FROM telegram_inbound_log WHERE update_id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .expect("log row");
+        assert!(
+            result_json.contains("injected ack failure"),
+            "the failure must be recorded, not discarded: {result_json}"
+        );
+        assert!(
+            result_json.contains("\"ackDelivered\":false"),
+            "{result_json}"
+        );
+    }
+
     #[test]
     fn telegram_callback_route_is_consumed_after_use() {
         let conn = crate::state::create_state_db_in_memory().expect("db");
@@ -3015,11 +3313,49 @@ mod tests {
 
         let route =
             extract_telegram_callback_route(&conn, &callback_query, &telegram).expect("route");
-        assert!(route.is_some());
+        assert!(matches!(route, TelegramCallbackLookup::Route(_)));
 
+        // A second tap on the SAME button must resolve to Spent so the tap
+        // can be acknowledged — resolving to silence left the Telegram
+        // client spinning for ~30s and then showing nothing (live bug,
+        // 2026-08-13). One-answer-per-button itself stays intact.
         mark_telegram_callback_route_used(&conn, "cb_1", 2000).expect("mark used");
-        let after =
-            extract_telegram_callback_route(&conn, &callback_query, &telegram).expect("after");
-        assert!(after.is_none());
+        match extract_telegram_callback_route(&conn, &callback_query, &telegram).expect("after") {
+            TelegramCallbackLookup::Spent {
+                callback_query_id,
+                toast,
+            } => {
+                assert_eq!(callback_query_id, "cq_1");
+                assert_eq!(toast, "这个按钮已经处理过了。");
+            }
+            _ => panic!("a used route must be Spent, not silent or re-routable"),
+        }
+
+        // A tap on a button whose row was pruned entirely gets the other
+        // honest answer.
+        let orphan = json!({
+            "id": "cq_2",
+            "from": { "id": 789 },
+            "message": { "message_id": 10, "chat": { "id": "456" } },
+            "data": "claude:cb_gone"
+        });
+        match extract_telegram_callback_route(&conn, &orphan, &telegram).expect("orphan") {
+            TelegramCallbackLookup::Spent { toast, .. } => {
+                assert_eq!(toast, "这个按钮已经失效了。")
+            }
+            _ => panic!("a pruned route must be Spent"),
+        }
+
+        // An unauthorized tap stays silent — Spent toasts are for the owner.
+        let stranger = json!({
+            "id": "cq_3",
+            "from": { "id": 666 },
+            "message": { "message_id": 10, "chat": { "id": "456" } },
+            "data": "claude:cb_1"
+        });
+        assert!(matches!(
+            extract_telegram_callback_route(&conn, &stranger, &telegram).expect("stranger"),
+            TelegramCallbackLookup::Foreign
+        ));
     }
 }

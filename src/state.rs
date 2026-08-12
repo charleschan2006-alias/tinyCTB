@@ -3109,8 +3109,10 @@ mod tests {
                 allowed_user_id: Some("789".to_string()),
             },
         )
-        .expect("route")
-        .expect("callback should route");
+        .expect("route");
+        let crate::telegram::TelegramCallbackLookup::Route(routed) = routed else {
+            panic!("callback should route");
+        };
 
         assert_eq!(routed.thread_id, "thr_approval");
         assert_eq!(routed.action, TelegramCallbackAction::Deny);
