@@ -1,6 +1,6 @@
 # 远程审批（Telegram 回答 Claude 的提问）
 
-**状态**：一期（是/否）与二三期（选项 / 自由文本，已合并为一个功能）**均已实现并通过交互式真机端到端验证**。
+**状态**：一期（是/否）、二三期（选项 / 自由文本，已合并为一个功能）、四期（无头 turn 的审批）**均已实现并通过真机端到端验证**。
 
 ## 目标
 
@@ -25,9 +25,11 @@ away 模式下，Claude 需要用户决策时，不只是把问题推到 Telegra
 
 **没有回答权限对话框的控制消息**。`can_use_tool` / `request_user_dialog` 是 remote-bridge（云端控制面）的 `control_request` 子类型，本地 socket 不接受。注入一条普通用户消息也无法解除一个正在等待按键的模态对话框。
 
-### 已否决：`PreToolUse` hook
+### 已否决（仅限交互式会话）：`PreToolUse` hook
 
 能返回决定，但**对每次工具调用都触发**，运行时还不知道这次是否真需要授权，因此必须自己维护"哪些工具危险"的名单、还要重新实现一遍 `permissions.allow` 的匹配规则——既啰嗦又必然与 Claude 的判定不一致（评审据此判为 P1）。
+
+**这条否决只对交互式会话成立。** 无头（`-p`）turn 里 `PermissionRequest` 根本不触发，`PreToolUse` 是唯一可用的事件，所以四期正是用它来拦无头 turn——代价（工具名单、每次调用起进程）也如实付了：靠 matcher 把它限定在会改东西的那几个工具上。见文末「四期」。
 
 ### 选定方案：`PermissionRequest` hook 返回决定
 
@@ -137,8 +139,8 @@ Telegram 里「对话框内」映射为「Reply 明确指向那条对话框消�
 
 ## 安全规则（不可妥协）
 
-- **超时绝不自动允许**：等待超时返回空对象（等价 `ask`），退回原有行为——会话停在对话框，与今天一致。宁可卡住也不能替用户点同意。
-- **只在 away 模式生效**：人在电脑前时一切照旧，终端弹框。
+- **超时绝不自动允许**。但"不允许"具体是什么，取决于 hook 下游还有没有人：交互式会话返回空对象（等价 `ask`），退回终端弹窗，与今天一致；**无头 turn 必须直接拒绝**——它跑在 `bypassPermissions` 下且背后没有终端，那里返回空对象等于放行。四期加的这条同样是"宁可卡住也不能替用户点同意"，只是换了个方向实现。
+- **away 只门控交互式网关**：人在电脑前时终端会话一切照旧，终端弹框。无头 turn 不看 away——它是 Telegram 发起的、无论用户坐在哪里都没有终端，审批永远走 Telegram（四期二审修正，初版误将 away 检查共用导致 away 关闭时无头审批整体失效）。
 - **拒绝优先**：任何解析不出的答案、过期的回调、来源不符的 chat/user，一律按未作答处理。
 - **一次一答**：回调用后即失效（`telegram_callback_routes.used_at`）。
 - **文字永不构成授权**：权限只能由按钮给出；对审批消息的文字回复被拒收且不注入会话。
@@ -161,3 +163,75 @@ Telegram 里「对话框内」映射为「Reply 明确指向那条对话框消�
 - hook 长时间阻塞（数分钟）对会话其他部分（心跳、UI）的影响。
 - 同一会话并发多个工具调用时，多条审批请求的对应关系（复用 `event_uid` 那套精确配对）。
 - ~~三期排序的交互形态~~ **已定**：一条文本回复（`3,1,2`），与选项按钮并存。
+
+## 四期：无头 turn 的审批（2026-08-12）
+
+### 起因：远程审批恰好没覆盖最需要它的那些 turn
+
+一期做的审批网关挂在 `PermissionRequest` 上，只对**用户自己开的交互式会话**生效。而你人在外面、从 Telegram 发起的那些 turn——最看不住的那批——反而一路裸奔。三个实测事实锁死了这个结论（脚本在 `~/.tinyctb/exp/headless-flow/`）：
+
+| 实验 | 结果 |
+|---|---|
+| `claude -p --resume X` 连续三轮 | **不分叉**：session_id 始终不变、单个 transcript、3 个 user turn 依次累积。无头链路本身是连续的，TG 多轮和用户后来在终端打开的是同一条会话 |
+| 无头里调 `AskUserQuestion` | **工具根本不存在**（两种 permission mode 都一样，模型 ToolSearch 明确返回 "No matching deferred tools found"）。三期做的问答网关对无头 turn 一次也不会触发 |
+| 无头 + `--permission-mode default` | 需要授权的调用被**沙箱直接拒掉**（marker 文件没生成），无头模式没有弹窗可弹。这就是 bridge turn 用 `bypassPermissions` 的原因 |
+| 无头 + `PreToolUse` hook | **触发**，payload 完整：`tool_name` / `tool_input` / `tool_use_id` / `permission_mode` / `cwd` / `session_id` |
+
+最后一行是出路：`PreToolUse` 的 `permissionDecision: allow|deny` 和问答网关用的是同一套机制。
+
+### 设计
+
+**两个网关按 `bypassPermissions` 精确二分**，互不重叠也不留缝：交互式会话（非 bypass）归 `PermissionRequest`，无头 turn（bypass）归 `PreToolUse`。交互式会话即使切进 bypass 模式也不会弹权限框，所以一期网关本来就听不到它的调用——二分没有丢东西。有测试钉住这个划分（`the_two_gates_do_not_overlap`）。
+
+**★超时语义在两侧相反，这是本期最要紧的一条**。一期的规则是"超时=不表态，回落到终端弹窗"。无头 turn 背后**没有终端**，而且跑在 `bypassPermissions` 下——在那里"不表态"等于"放行"。所以无头侧**超时必须直接拒绝**，并在拒绝理由里告诉模型"没有执行、不要重试、把你打算做的事告诉用户然后停下"。
+
+**复审后收紧的三条（2026-08-12 二审）**：
+
+1. **away 只门控交互式网关**。Telegram 的 `/new` 和 Reply 在 away 关闭时照样起无头 turn——那个 turn 无论用户坐在哪里都没有终端，所以无头网关完全不看 away。初版把 away 检查放在两个网关共用的最前面，等于 away 关闭时无头审批整个失效，`headlessApprovalTools` 里的工具直接执行。
+2. **错误也遵循同样的不对称**：交互式网关内部出错降级为"不表态"（终端弹窗兜底，安全）；无头网关一旦确认是运行中的 bridge turn，任何内部错误（配置读不了、SQLite 失败、事件入队失败）都**直接拒绝**并把错误写进拒绝理由——那里没有任何东西兜底，"不表态"就是执行。初版所有错误都降级成 `{}`，等于 fail open。
+3. **准入判定=「该会话有 status='running' 的 bridge turn」，且在建审批/推送之前最先做**。只看表成员资格会让"上周跑过一次 Telegram turn"的会话被永远纠缠；判定放在最后则会给用户自己的 `--dangerously-skip-permissions` 终端会话建审批、白等整个超时，还谎称"超时回落弹窗"（bypass 模式根本没有弹窗，超时后照样执行）。现在这类会话在任何有副作用的步骤之前就被无声放过——不建审批、不推送、不等待、也不暴露在 fail-closed 错误处理之下。首工具竞态由**spawn 前注册**根治：`bridge_turns` 行在进程存在之前就已落库（CLI 的 `tinyctb new`/`reply` 也一并走这条路，此前它们从不注册）。
+
+**工具过滤是唯一挡住热路径的东西**。`PreToolUse` 对**每一次**工具调用触发，所以 `headlessApprovalTools` 的空列表含义与 `approvalTools` **正好相反**：后者空=全都问（`PermissionRequest` 只在真需要决定时才触发，没什么可滤的），前者空=**关闭功能**（否则连 Read/Grep 都要你掏手机）。默认值 `["Bash","Write","Edit","MultiEdit","NotebookEdit"]`——只有会改东西的工具。`WebFetch` 想加可以加，默认不加是因为它太常见。
+
+实测开销：无头网关的快路径**不读 away 标记也不开数据库**——非 bypass 调用在模式分流处退出，bypass 但无令牌（用户自己的终端会话）在环境变量检查处退出。**200 次调用共 107ms，约 0.53ms/次**（三审后复测）。away 标记文件只属于交互式网关的快路径。
+
+**⚠️ 已知缺口（二审后已收窄）**：matcher 在 `hooks install` 时写死进 `settings.json`，改了 `headlessApprovalTools` 不重装则新工具不会被拦。现在 `hooks status` 按 marker 分别核对四个 hook**并比对 matcher 与当前配置**，不一致即报 `installed: false`——`/away` 复用这个判定，会自动重装。剩余缺口只在"改完配置后既不跑 status 也不碰 /away"的窗口期。matcher 取"内置默认 ∪ 配置"的并集，保证内置那批无论配置怎么改都仍然被拦。
+
+### 真机冒烟（2026-08-12 18:0x）
+
+隔离在 `TINYCTB_STATE_DIR` 里跑（子进程导出该变量，hook 继承），不碰生产库也不发 Telegram 消息。判据是 **marker 文件是否存在**，不是模型自述——本项目早先有一次实验就是因为信了模型自述而完全跑偏。
+
+| 场景 | 命令是否执行 | 落库 decision | 模型收到 |
+|---|---|---|---|
+| A 无人答复（15s 超时） | **NO** | expired | "not run — the Telegram approval timed out"，未重试 |
+| B 点 ✅ 允许 | **YES** | allow | Done |
+| C 点 ❌ 拒绝 | **NO** | deny | "denied … was not created" |
+
+推送事件带 `headless: true`、三个按钮、正文是真实命令。Telegram 提示语按此分流：无头那条明说"背后没有终端可回落——超时不答复=拒绝，任务就停在这里"，交互式那条说"超时后回落到终端弹窗"。不说清楚的话，忽略这条消息看起来是免费的。
+
+### 仍未解决
+
+- 无头 turn **没法中途提问**（工具不存在）。需要拿主意时它只能猜，或者把问题留到 turn 结尾由用户回复继续。给模型加一条"别猜、把选择题放到结尾"的提示是候选方案，尚未做。
+- ~~matcher 陈旧问题没有自动检测~~ **已解决（二审）**：`hooks status` 按 marker 分别核对并比对 matcher 与当前配置，不一致报 `installed: false`，`/away` 会自动重装。
+
+### 三审修正（2026-08-12，Sol 复审 1P1+2P2）
+
+**[P1] spawn 后身份补写失败会让活进程脱离审批边界**。初版 `let _ =` 丢弃 UPDATE 错误：pid 留空 → daemon 10 秒宽限后判 turn 失败 → turn 不再是 running → 该进程后续所有工具调用被网关放过，且 daemon 无法按 PID 回收。现在补写**重试 3 次并核对恰好更新 1 行**（针对 daemon 自身连接造成的瞬时 SQLITE_BUSY）；仍失败则**杀掉刚起的进程组、把 turn 结算为 failed、向调用方报错**——宁可这个 turn 没跑成，也不能留一个无人监管的活进程。注入式回归测试：`spawn_that_cannot_be_recorded_is_terminated`。
+
+**[P2] 准入第一层改为环境令牌，数据库退居第二层**。bridge 起的每个无头进程带 `TINYCTB_BRIDGE_TURN=<turn_id>` 环境变量（hook 是 claude 的子进程，天然继承）。网关先看令牌：**无令牌 = 非 bridge 进程，立即放过，全程不碰数据库**——状态目录烧成灰也波及不到用户自己的 bypass 终端会话（测试：把 TINYCTB_STATE_DIR 指向一个普通文件仍返回 `{}`）。有令牌才开库核对该 turn 是否仍 running：已结算（如超时被杀）的 turn 的余党调用**直接拒绝**，不再新建指向已关窗口的审批。令牌只存在于该 turn 的进程树里，"上周的 Telegram turn 纠缠今天的终端会话"从结构上不可能。⚠️ 部署瞬间已在跑的存量 turn（旧二进制起的、无令牌）不受门控，属一次性窗口。
+
+**[P2] 未知 decision 按网关分流**：交互式 `{}` 回落终端弹窗；无头侧 `{}` 即执行，故改为明确 deny 并写明原因。
+
+三处修复均按惯例回退验证过测试确实变红。
+
+### 四审残余（2026-08-12）
+
+身份补写 UPDATE 限定 `AND status='running'`（daemon 抢先结算的 turn 不可被误报成功）；结算错误经 `settle_failed_turn` 重试并折进错误链，连结算都失败时的遗留契约=行保持 running/pid NULL 由 daemon 宽限期响亮兜底；两种交错各有注入测试。
+
+### 五审修正（2026-08-12，反向竞态）
+
+四审那条竞态还有**镜像**：daemon 用快照判死。交错=daemon 读到 `pid NULL` → 身份补写成功（调用方拿到"已启动"）→ daemon 拿旧快照判"无 pid=死亡"→ 推失败通知+无条件写 failed → 令牌指向 failed 行、后续受控调用全被拒、结果永不投递。修复=**先认领后宣判**：失败转换改为条件 UPDATE（CAS），"无 pid"这一判据在写入时重新断言（`status='running' AND pid IS NULL`）；0 行=判据已失效，**既不写 failed 也不发 thread_error**，turn 照常运行。超时判死不依赖快照证据，不带 pid 条件。测试 `identity_write_landing_after_the_snapshot_averts_the_failure_verdict` 钉住该交错并断言无 thread_error；回退成无条件写立即变红。
+
+### 六审修正（2026-08-13，判死副作用的崩溃一致性）
+
+CAS 之后副作用的**顺序**还有两处崩溃窗口：①claim 提交后、kill 前 daemon 退出→turn 已是 expired、被所有后续 `list_running_bridge_turns` 扫描隐藏，**活进程永远无人回收**；②kill 后通知入队失败→turn 已终态、下一轮不重试，**用户永远收不到 thread_error**。修复=重排：**kill 在任何提交之前**（此时崩溃则 turn 仍 running，下一轮重判超时并重复幂等的 kill）；**claim 与失败通知在同一事务提交**（入队失败则 claim 一起回滚，整个判决下一轮重试；不可能出现"已结算却没人被告知"）。测试 `broken_outbox_rolls_back_the_claim_and_the_kill_is_repeatable` 用 SQLite ABORT trigger 模拟 outbox 故障，断言 claim 回滚、kill 已先落地、修复后重试恰好投递一次；回退成旧顺序立即变红。155 测试全绿。

@@ -220,6 +220,86 @@ fn bridge_turn_thread_json(conn: &Connection, turn: &BridgeTurn, preview: &str) 
     }))
 }
 
+/// Apply a "this turn is dead" verdict that was formed from a snapshot.
+///
+/// The verdict must be CLAIMED before it is announced, because the snapshot
+/// can be stale in one dangerous way: a turn read as `pid NULL` (registered,
+/// identity not yet written) whose identity write lands in between. The old
+/// order — enqueue the failure notice, then unconditionally write `failed` —
+/// would close a turn whose caller was just told "started": its token then
+/// points at a failed row, every gated call gets denied, and the eventual
+/// answer is never delivered. `claim_bridge_turn_failure` re-asserts
+/// `pid IS NULL` for exactly that verdict, so losing the race skips both the
+/// write and the notice; the turn is simply still running.
+///
+/// The verdict's side effects are ordered for CRASH consistency, because the
+/// terminal status is unrecoverable the moment it commits — a settled turn
+/// is invisible to every future `list_running_bridge_turns` scan:
+/// - the kill runs BEFORE anything commits. Dying right after it leaves the
+///   turn `running`, and the next cycle re-judges the timeout and repeats
+///   the (idempotent) kill — whereas a committed `expired` with the process
+///   alive would orphan it forever;
+/// - the claim and the failure notice commit in ONE transaction. Dying (or
+///   an enqueue error) between them can therefore not produce a settled
+///   turn whose user was never told: the claim rolls back, the turn stays
+///   `running`, and the next cycle retries the whole verdict.
+///
+/// Returns whether the failure was claimed (false = verdict dropped).
+fn settle_dead_turn(
+    conn: &Connection,
+    turn: &crate::state::BridgeTurn,
+    timed_out: bool,
+    now: u64,
+) -> Result<bool> {
+    // Killing before the claim can in principle kill a turn whose claim then
+    // loses (another writer settled it in between) — acceptable, and not
+    // new: a process past the hard timeout is dead by fiat, and the old code
+    // killed it unconditionally too.
+    if timed_out && !turn.exited {
+        crate::claude::kill_turn_process(turn);
+    }
+    let reason = if turn.exited {
+        format!(
+            "exited (status {}) without producing an answer",
+            turn.exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )
+    } else if timed_out {
+        "ran past the hard timeout without producing an answer".to_string()
+    } else {
+        "exited without producing an answer".to_string()
+    };
+    let tail = turn_log_tail(std::path::Path::new(&turn.log_path), 400);
+    let event = json!({
+        "type": "thread_error",
+        "threadId": turn.thread_id,
+        "observedAt": now,
+        "eventKey": format!("bridge-turn-failed:{}", turn.turn_id),
+        "message": format!(
+            "The headless turn {reason}.\nLog tail:\n{}",
+            if tail.is_empty() { "(empty log)".to_string() } else { tail }
+        ),
+    });
+    let tx = conn.unchecked_transaction()?;
+    // A timed-out turn is dead by fiat, not by snapshot evidence, so its
+    // claim does not depend on the pid still being missing. Only the
+    // "no pid ever recorded" verdict is snapshot-fragile.
+    let pid_still_missing = turn.pid.is_none() && !turn.exited && !timed_out;
+    let claimed = crate::state::claim_bridge_turn_failure(
+        &tx,
+        &turn.turn_id,
+        if timed_out { "expired" } else { "failed" },
+        now,
+        pid_still_missing,
+    )?;
+    if claimed {
+        enqueue_outbound_event(&tx, &event, now, "bridge")?;
+    }
+    tx.commit()?;
+    Ok(claimed)
+}
+
 /// Deliver answers of bridge-initiated turns from their own turn logs.
 /// This is attribution by construction: the log is this turn's output, so a
 /// concurrently active session cannot mislabel its own Stop as the answer.
@@ -320,46 +400,12 @@ pub(crate) fn process_bridge_turns(
                         }
                     }
                     running += 1;
-                } else {
-                    // Gone (or timed out) without a result: say so loudly
-                    // instead of leaving the user waiting forever.
-                    let reason = if turn.exited {
-                        format!(
-                            "exited (status {}) without producing an answer",
-                            turn.exit_code
-                                .map(|code| code.to_string())
-                                .unwrap_or_else(|| "unknown".to_string())
-                        )
-                    } else if timed_out {
-                        "ran past the hard timeout without producing an answer".to_string()
-                    } else {
-                        "exited without producing an answer".to_string()
-                    };
-                    // A timed-out turn is still alive by definition of this
-                    // branch's fall-through: actually terminate it so it stops
-                    // consuming resources and mutating the session.
-                    if timed_out && !turn.exited {
-                        crate::claude::kill_turn_process(&turn);
-                    }
-                    let tail = turn_log_tail(&log_path, 400);
-                    let event = json!({
-                        "type": "thread_error",
-                        "threadId": turn.thread_id,
-                        "observedAt": now,
-                        "eventKey": format!("bridge-turn-failed:{}", turn.turn_id),
-                        "message": format!(
-                            "The headless turn {reason}.\nLog tail:\n{}",
-                            if tail.is_empty() { "(empty log)".to_string() } else { tail }
-                        ),
-                    });
-                    enqueue_outbound_event(conn, &event, now, "bridge")?;
-                    mark_bridge_turn_finished(
-                        conn,
-                        &turn.turn_id,
-                        if timed_out { "expired" } else { "failed" },
-                        now,
-                    )?;
+                } else if settle_dead_turn(conn, &turn, timed_out, now)? {
                     failed += 1;
+                } else {
+                    // The identity write won the race (see
+                    // `settle_dead_turn`): the turn is alive after all.
+                    running += 1;
                 }
             }
         }
@@ -1486,6 +1532,155 @@ mod tests {
         assert!(payloads
             .iter()
             .any(|payload| payload.contains("answer two")));
+    }
+
+    /// Crash consistency of the death verdict, both halves:
+    /// - a broken outbox must roll the CLAIM back too — a settled turn whose
+    ///   user was never told is unrecoverable (settled turns are invisible
+    ///   to every later scan), while a still-running turn retries next cycle;
+    /// - the kill must land BEFORE the terminal state commits, so a daemon
+    ///   dying in between leaves a `running` turn whose next cycle repeats
+    ///   the idempotent kill — never a committed `expired` hiding a live
+    ///   process from reaping forever.
+    #[test]
+    fn broken_outbox_rolls_back_the_claim_and_the_kill_is_repeatable() {
+        let conn = create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-tx",
+            "sess-tx",
+            "/tmp/tx.log",
+            Some(4_000_000_000),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        let snapshot = crate::state::BridgeTurn {
+            turn_id: "turn-tx".to_string(),
+            thread_id: "sess-tx".to_string(),
+            log_path: "/tmp/tx.log".to_string(),
+            pid: Some(4_000_000_000),
+            started_at: 1000,
+            exited: false,
+            exit_code: None,
+            pgid: None,
+            proc_start_ticks: None,
+            boot_id: None,
+        };
+        // Sabotage the outbox: every insert aborts, as a full-disk or
+        // corrupted database would.
+        conn.execute_batch(
+            "CREATE TRIGGER outbox_down BEFORE INSERT ON outbound_events
+             BEGIN SELECT RAISE(ABORT, 'outbox unavailable'); END;",
+        )
+        .expect("trigger");
+
+        // Timed out (dead by fiat) + broken outbox.
+        let err = settle_dead_turn(&conn, &snapshot, true, 50_000);
+        assert!(err.is_err(), "a lost notice must surface as an error");
+        assert_eq!(
+            crate::claude::test_kill::take(),
+            vec![4_000_000_000],
+            "the kill must have happened BEFORE anything committed"
+        );
+        let status: String = conn
+            .query_row("SELECT status FROM bridge_turns", [], |row| row.get(0))
+            .expect("row");
+        assert_eq!(
+            status, "running",
+            "the claim must roll back with the notice, so the verdict retries"
+        );
+        assert_eq!(
+            crate::state::pending_outbound_count(&conn).expect("pending"),
+            0
+        );
+
+        // Outbox heals: the next cycle's verdict must fully land — claim,
+        // notice, and the (idempotent) re-kill.
+        conn.execute_batch("DROP TRIGGER outbox_down;")
+            .expect("drop");
+        let claimed = settle_dead_turn(&conn, &snapshot, true, 60_000).expect("settle");
+        assert!(claimed);
+        assert_eq!(crate::claude::test_kill::take(), vec![4_000_000_000]);
+        let status: String = conn
+            .query_row("SELECT status FROM bridge_turns", [], |row| row.get(0))
+            .expect("row");
+        assert_eq!(status, "expired");
+        assert_eq!(
+            crate::state::pending_outbound_count(&conn).expect("pending"),
+            1,
+            "the user is told exactly once"
+        );
+    }
+
+    /// The reverse race of `identity_persist_refuses_a_turn_the_daemon_already_settled`:
+    /// the daemon snapshots `pid NULL`, the identity write lands, and only
+    /// THEN does the daemon apply its "no pid = dead" verdict. The claim must
+    /// lose — no failed status, no thread_error — because the caller of that
+    /// turn was already told "started" and its token must stay valid.
+    #[test]
+    fn identity_write_landing_after_the_snapshot_averts_the_failure_verdict() {
+        let conn = create_state_db_in_memory().expect("db");
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-race",
+            "sess-race",
+            "/tmp/race.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        // The daemon's snapshot, taken while the pid was still unwritten:
+        let snapshot = crate::state::BridgeTurn {
+            turn_id: "turn-race".to_string(),
+            thread_id: "sess-race".to_string(),
+            log_path: "/tmp/race.log".to_string(),
+            pid: None,
+            started_at: 1000,
+            exited: false,
+            exit_code: None,
+            pgid: None,
+            proc_start_ticks: None,
+            boot_id: None,
+        };
+        // The identity write lands before the verdict is applied.
+        assert_eq!(
+            crate::state::record_bridge_turn_spawn(
+                &conn,
+                "turn-race",
+                Some(std::process::id()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("identity write"),
+            1
+        );
+        // Well past the failure grace: on the stale snapshot alone this turn
+        // is dead. The claim must notice the pid and drop the verdict.
+        let claimed = settle_dead_turn(&conn, &snapshot, false, 50_000).expect("settle");
+        assert!(!claimed, "the verdict must lose to the identity write");
+        let status: String = conn
+            .query_row("SELECT status FROM bridge_turns", [], |row| row.get(0))
+            .expect("row");
+        assert_eq!(status, "running", "the turn must stay open");
+        assert_eq!(
+            crate::state::pending_outbound_count(&conn).expect("pending"),
+            0,
+            "and no thread_error may be announced for a turn that is alive"
+        );
     }
 
     /// A dead process without a result must produce a loud failure notice,

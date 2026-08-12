@@ -138,6 +138,15 @@ config.
   `default`. With anything stricter than `bypassPermissions`, a headless turn
   that hits a denied action reports what it could not do instead of finishing
   the task.
+- `claude.headlessApprovalTools` — tools a headless (Telegram-started) turn
+  must get approved via Telegram before running. Default:
+  `["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"]`; empty list turns
+  the gate off. NOTE the inverted empty-case vs `approvalTools`, and re-run
+  `tinyctb hooks install` after changing it (the PreToolUse matcher is written
+  at install time).
+- `claude.approvalTimeoutSeconds` — how long an approval waits for an answer
+  (default 300). Interactive sessions fall back to the terminal dialog on
+  timeout; headless turns treat timeout as deny.
 - `claude.sessionScanLimit` — how many recent session transcripts each daemon
   cycle rescans (default 50).
 - `CLAUDE_BIN` — overrides claude binary resolution (authoritative: if set and
@@ -164,8 +173,13 @@ config.
   `/proc`。macOS 无从取证，因此一律 fail closed 退回无头 `--resume` 路径。
 - **新会话**：`/new` 在项目注册表指定的目录下用本地生成的 UUID
   （`--session-id`）启动无头会话，因此确认消息可以立刻用于回复路由。
-- **审批**：交互式终端里的权限确认只能在终端处理，Telegram 只做提醒；
-  从 Telegram 发起的无头回合按 `permissionMode` 配置自主执行，不会卡住。
+- **审批**：away 时，交互式会话的权限确认推送到 Telegram 用按钮作答（不答复则
+  超时回落终端弹窗，绝不自动允许）。从 Telegram 发起的无头回合**无论 away 与否**
+  都要审批：`headlessApprovalTools` 里的工具（默认 Bash/Write/Edit/MultiEdit/
+  NotebookEdit）每次调用推送审批按钮，其余工具直接执行；无头回合背后没有终端，
+  **超时不答复 = 拒绝**，网关内部出错同样拒绝（fail closed）。改了
+  `headlessApprovalTools` 必须重跑 `tinyctb hooks install`（matcher 写死在
+  settings.json 里；`hooks status`/`/away` 会检测到不一致并提示/自动重装）。
 
 ## Notes
 

@@ -1847,6 +1847,35 @@ pub(crate) fn record_bridge_turn_exit(
     Ok(())
 }
 
+/// Atomically claim a turn's failure transition. The daemon judges a turn
+/// dead from an in-memory SNAPSHOT, and the most dangerous way that snapshot
+/// goes stale is a turn read as `pid NULL` whose identity write lands before
+/// the verdict is applied — settling it then would close a turn whose caller
+/// was just told "started" and whose token now points at a failed row.
+///
+/// So the verdict is applied as a conditional UPDATE, and `pid_still_missing`
+/// re-asserts the very evidence the verdict was based on. Zero rows = the
+/// evidence no longer holds (or the turn is no longer running) — the caller
+/// must drop the verdict, not announce it. A re-read instead of a CAS would
+/// leave the same TOCTOU window this exists to close.
+pub(crate) fn claim_bridge_turn_failure(
+    conn: &Connection,
+    turn_id: &str,
+    status: &str,
+    now: u64,
+    pid_still_missing: bool,
+) -> Result<bool> {
+    let sql = if pid_still_missing {
+        "UPDATE bridge_turns SET status = ?2, completed_at = ?3
+         WHERE turn_id = ?1 AND status = 'running' AND pid IS NULL"
+    } else {
+        "UPDATE bridge_turns SET status = ?2, completed_at = ?3
+         WHERE turn_id = ?1 AND status = 'running'"
+    };
+    let rows = conn.execute(sql, params![turn_id, status, to_sql_i64(now)?])?;
+    Ok(rows > 0)
+}
+
 pub(crate) fn mark_bridge_turn_finished(
     conn: &Connection,
     turn_id: &str,
@@ -2211,6 +2240,57 @@ pub(crate) fn set_approval_auto_allow(
         &approval_auto_allow_key(thread_id, tool_name),
         &now.to_string(),
     )
+}
+
+/// Fill in the process identity of a pre-registered turn once the spawn has
+/// happened. The row is created before the spawn (see
+/// `spawn_registered_headless`); this second step only adds what cannot be
+/// known before `spawn` returns.
+///
+/// Scoped to `status = 'running'` and returning the row count, so the caller
+/// can tell BOTH failure shapes apart from success: a lost write, and a
+/// daemon that already settled the turn in the meantime (a slow spawn can
+/// outlive the 10s crash grace). Updating a settled row would misreport a
+/// turn the daemon has declared dead as successfully recorded.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_bridge_turn_spawn(
+    conn: &Connection,
+    turn_id: &str,
+    pid: Option<u32>,
+    proc_start: Option<&str>,
+    proc_exe: Option<&str>,
+    pgid: Option<u32>,
+    proc_start_ticks: Option<&str>,
+    boot_id: Option<&str>,
+) -> Result<usize> {
+    let rows = conn.execute(
+        "UPDATE bridge_turns
+         SET pid = ?2, proc_start = ?3, proc_exe = ?4, pgid = ?5,
+             proc_start_ticks = ?6, boot_id = ?7
+         WHERE turn_id = ?1 AND status = 'running'",
+        params![
+            turn_id,
+            pid.map(i64::from),
+            proc_start,
+            proc_exe,
+            pgid.map(i64::from),
+            proc_start_ticks,
+            boot_id
+        ],
+    )?;
+    Ok(rows)
+}
+
+/// Status of one specific turn, by the id the turn token names.
+pub(crate) fn bridge_turn_status(conn: &Connection, turn_id: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row(
+            "SELECT status FROM bridge_turns WHERE turn_id = ?1",
+            params![turn_id],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 pub(crate) fn approval_auto_allowed(

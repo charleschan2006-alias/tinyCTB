@@ -606,48 +606,6 @@ fn unrouted_message_hint_text(message: &Value) -> String {
     }
 }
 
-/// Register a spawned headless turn so the daemon watches its log for the
-/// answer (see `process_bridge_turns`). Answers to bridge-initiated turns are
-/// always pushed back, away mode or not.
-fn register_bridge_turn_from_result(conn: &Connection, result: &Value, now: u64) -> Result<()> {
-    let thread_id = result
-        .get("threadId")
-        .and_then(Value::as_str)
-        .context("headless turn result missing threadId")?;
-    let turn_id = result
-        .pointer("/claude/turnId")
-        .and_then(Value::as_str)
-        .context("headless turn result missing claude.turnId")?;
-    let log_path = result
-        .pointer("/claude/logPath")
-        .and_then(Value::as_str)
-        .context("headless turn result missing claude.logPath")?;
-    let pid = result
-        .pointer("/claude/pid")
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok());
-    crate::state::register_bridge_turn(
-        conn,
-        turn_id,
-        thread_id,
-        log_path,
-        pid,
-        result.pointer("/claude/procStart").and_then(Value::as_str),
-        // The RESOLVED executable of the spawned process (/proc/<pid>/exe),
-        // not the configured binary path — restart-kill compares it exactly.
-        result.pointer("/claude/procExe").and_then(Value::as_str),
-        result
-            .pointer("/claude/pgid")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok()),
-        result
-            .pointer("/claude/procStartTicks")
-            .and_then(Value::as_str),
-        result.pointer("/claude/procBootId").and_then(Value::as_str),
-        now,
-    )
-}
-
 fn telegram_typing_key(chat_id: &str, thread_id: &str) -> String {
     format!("telegram_typing:{chat_id}:{thread_id}")
 }
@@ -844,9 +802,9 @@ fn send_claude_reply_to_thread(
             "sentAt": now
         }),
         None => {
-            let result = send_user_message(config, thread_id, &prefixed, cwd_hint.as_deref(), now)?;
-            register_bridge_turn_from_result(conn, &result, now)?;
-            result
+            // Registration happens inside the spawn (before it, in fact) so
+            // the turn's first tool call already finds its bridge_turns row.
+            send_user_message(conn, config, thread_id, &prefixed, cwd_hint.as_deref(), now)?
         }
     };
     record_action(
@@ -899,13 +857,15 @@ fn start_new_thread_from_telegram(
     message: &str,
     now: u64,
 ) -> Result<Value> {
-    let result = start_thread_in_cwd(config, Some(&project.cwd), Some(message), now)?;
+    // The bridge_turns row is written by the spawn itself, before the
+    // process exists, so the daemon watches the log (and the headless gate
+    // recognises the turn) from the first instant.
+    let result = start_thread_in_cwd(conn, config, Some(&project.cwd), Some(message), now)?;
     let thread_id = result
         .get("threadId")
         .and_then(Value::as_str)
         .context("new Claude session result missing threadId")?
         .to_string();
-    register_bridge_turn_from_result(conn, &result, now)?;
     record_action(
         conn,
         &thread_id,

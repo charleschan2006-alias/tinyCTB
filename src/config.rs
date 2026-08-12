@@ -34,6 +34,18 @@ pub(crate) struct ClaudeConfig {
     /// decision is genuinely needed, so there is nothing to filter out.
     #[serde(default)]
     pub(crate) approval_tools: Vec<String>,
+    /// Tools that a HEADLESS turn (one the bridge started for Telegram) must
+    /// get approved before it may run them.
+    ///
+    /// This list exists separately from `approval_tools`, and its empty case
+    /// means the OPPOSITE, because the two gates hang off different events.
+    /// `PermissionRequest` only fires when a decision is genuinely needed, so
+    /// an empty list can safely mean "offer everything". A headless turn is
+    /// gated from `PreToolUse`, which fires for EVERY tool call including
+    /// `Read` and `Grep` — so here an empty list means "gate nothing", i.e.
+    /// the explicit off switch. Absent from the config = the default below.
+    #[serde(default = "default_headless_approval_tools")]
+    pub(crate) headless_approval_tools: Vec<String>,
     /// How long a tool call waits for an answer before falling back to the
     /// normal permission flow. Never auto-allows.
     #[serde(default = "default_approval_timeout_seconds")]
@@ -42,6 +54,18 @@ pub(crate) struct ClaudeConfig {
 
 fn default_approval_timeout_seconds() -> u64 {
     300
+}
+
+/// The tools that write, execute, or otherwise change something. Read-only
+/// tools are deliberately absent: a headless turn that greps its way around
+/// the repo should not cost the user a phone tap. `WebFetch` is a defensible
+/// addition for anyone who cares about outbound requests, but it is left out
+/// of the default because it is far more common than the write tools.
+fn default_headless_approval_tools() -> Vec<String> {
+    ["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 fn default_permission_mode() -> String {
@@ -58,6 +82,7 @@ impl Default for ClaudeConfig {
             permission_mode: default_permission_mode(),
             session_scan_limit: default_session_scan_limit(),
             approval_tools: Vec::new(),
+            headless_approval_tools: default_headless_approval_tools(),
             approval_timeout_seconds: default_approval_timeout_seconds(),
         }
     }
@@ -206,6 +231,7 @@ pub(crate) fn redacted_daemon_config(config: &DaemonConfig) -> Value {
             "permissionMode": claude.permission_mode,
             "sessionScanLimit": claude.session_scan_limit,
             "approvalTools": claude.approval_tools,
+            "headlessApprovalTools": claude.headless_approval_tools,
             "approvalTimeoutSeconds": claude.approval_timeout_seconds
         })),
         "telegram": config.telegram.as_ref().map(|telegram| json!({
@@ -373,6 +399,7 @@ mod tests {
                 permission_mode: "yolo".to_string(),
                 session_scan_limit: 50,
                 approval_tools: Vec::new(),
+                headless_approval_tools: default_headless_approval_tools(),
                 approval_timeout_seconds: 300,
             }),
             projects: vec![],

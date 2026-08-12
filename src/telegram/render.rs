@@ -17,6 +17,14 @@ const TELEGRAM_ANSWER_THREAD_HINT: &str =
     "💬 To answer Claude, use Telegram's Reply action on this message.";
 const TELEGRAM_APPROVAL_HINT: &str =
     "⌨️ Approve or deny this in the terminal where the session is running. Replying here sends a follow-up message instead.";
+/// An interactive session's gate: not answering costs nothing, because the
+/// terminal dialog is still there waiting.
+const TELEGRAM_TERMINAL_APPROVAL_HINT: &str =
+    "👆 点按钮作答。不答复也不会放行——超时后回落到终端里的权限弹窗。";
+/// A headless turn's gate: there is no terminal behind it, so silence is a
+/// refusal that stops the task. Say so, or ignoring the message looks free.
+const TELEGRAM_HEADLESS_APPROVAL_HINT: &str =
+    "👆 点按钮作答。这是你从 Telegram 发起的任务，背后没有终端可回落——超时不答复=拒绝，任务就停在这里。";
 const TELEGRAM_MESSAGE_CHAR_LIMIT: usize = 4096;
 /// Shared budget for a /threads snapshot body (question + preview together),
 /// leaving room for the title, name, project and reply-hint lines inside one
@@ -74,6 +82,15 @@ fn telegram_event_title(event_type: &str, event: &Value) -> &'static str {
 }
 
 fn telegram_event_reply_hint(event_type: &str, event: &Value) -> &'static str {
+    if event_type == "approval_request" {
+        // What silence costs differs between the two gates, and it is the one
+        // thing the user needs to know before deciding to ignore the message.
+        return if event.get("headless").and_then(Value::as_bool) == Some(true) {
+            TELEGRAM_HEADLESS_APPROVAL_HINT
+        } else {
+            TELEGRAM_TERMINAL_APPROVAL_HINT
+        };
+    }
     if telegram_event_is_approval(event) {
         TELEGRAM_APPROVAL_HINT
     } else {

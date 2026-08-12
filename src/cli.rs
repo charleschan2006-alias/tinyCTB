@@ -92,9 +92,14 @@ pub(crate) enum Commands {
     HookEvent,
     #[command(
         hide = true,
-        about = "PreToolUse hook: confirm a gated tool call from Telegram while away"
+        about = "PermissionRequest hook: confirm a gated tool call from Telegram while away"
     )]
     ApprovalGate,
+    #[command(
+        hide = true,
+        about = "PreToolUse hook: confirm a gated tool call inside a headless Telegram turn"
+    )]
+    HeadlessApprovalGate,
     #[command(
         hide = true,
         about = "PreToolUse hook: answer an AskUserQuestion from Telegram while away"

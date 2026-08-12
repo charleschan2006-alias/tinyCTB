@@ -25,8 +25,36 @@ const APPROVAL_HOOK_MARKER: &str = "approval-gate";
 pub(crate) const QUESTION_HOOK_EVENT: &str = "PreToolUse";
 const QUESTION_HOOK_MATCHER: &str = "AskUserQuestion";
 const QUESTION_HOOK_MARKER: &str = "question-gate";
+/// A headless turn's tool calls are gated from `PreToolUse` too, because
+/// `PermissionRequest` never fires in `-p` mode. The matcher is what keeps
+/// this off the hot path: without it every tool call in every session would
+/// spawn a hook process.
+const HEADLESS_APPROVAL_HOOK_MARKER: &str = "headless-approval-gate";
 const HOOK_MARKER: &str = "hook-event";
 const HOOK_TIMEOUT_SECONDS: u64 = 10;
+
+/// The matcher for the headless gate: every tool the config asks to gate,
+/// unioned with the built-in defaults.
+///
+/// The union is deliberate. A matcher is written once at install time while
+/// `headlessApprovalTools` can be edited any day after, and a tool that is
+/// configured but not matched would be a gate that silently never fires. The
+/// union cannot fix that on its own — adding an unusual tool still needs
+/// `tinyctb hooks install` to be re-run — but it does guarantee that the
+/// built-in set stays gated no matter what the config later says.
+fn headless_approval_matcher() -> String {
+    let mut tools = crate::config::ClaudeConfig::default().headless_approval_tools;
+    if let Ok(Some(config)) = crate::config::read_daemon_config_raw() {
+        if let Some(claude) = config.claude {
+            for tool in claude.headless_approval_tools {
+                if !tools.contains(&tool) {
+                    tools.push(tool);
+                }
+            }
+        }
+    }
+    tools.join("|")
+}
 
 fn resolve_bridge_binary_for_hooks(bridge_command: &str) -> Result<PathBuf> {
     let trimmed = bridge_command.trim();
@@ -60,7 +88,8 @@ fn is_tinyctb_hook(entry: &Value) -> bool {
             command.contains("tinyctb")
                 && (command.contains(HOOK_MARKER)
                     || command.contains(APPROVAL_HOOK_MARKER)
-                    || command.contains(QUESTION_HOOK_MARKER))
+                    || command.contains(QUESTION_HOOK_MARKER)
+                    || command.contains(HEADLESS_APPROVAL_HOOK_MARKER))
         })
         .unwrap_or(false)
 }
@@ -180,14 +209,16 @@ pub(crate) fn install_hooks(bridge_command: &str, dry_run: bool) -> Result<Value
     }));
     installed.push(APPROVAL_HOOK_EVENT.to_string());
 
-    let question_command = format!(
-        "{} question-gate",
-        shell_quote(
-            &resolve_bridge_binary_for_hooks(bridge_command)?
-                .display()
-                .to_string()
-        )
+    let binary = shell_quote(
+        &resolve_bridge_binary_for_hooks(bridge_command)?
+            .display()
+            .to_string(),
     );
+    let question_command = format!("{binary} question-gate");
+    let headless_approval_command = format!("{binary} headless-approval-gate");
+    let headless_matcher = headless_approval_matcher();
+    // Both PreToolUse entries are pushed after a SINGLE strip: stripping once
+    // per entry would delete the one added just before it.
     let groups_value = hooks
         .entry(QUESTION_HOOK_EVENT.to_string())
         .or_insert_with(|| json!([]));
@@ -204,6 +235,17 @@ pub(crate) fn install_hooks(bridge_command: &str, dry_run: bool) -> Result<Value
         }]
     }));
     installed.push(format!("{QUESTION_HOOK_EVENT}({QUESTION_HOOK_MATCHER})"));
+    if !headless_matcher.is_empty() {
+        groups.push(json!({
+            "matcher": headless_matcher,
+            "hooks": [{
+                "type": "command",
+                "command": headless_approval_command,
+                "timeout": approval_timeout
+            }]
+        }));
+        installed.push(format!("{QUESTION_HOOK_EVENT}({headless_matcher})"));
+    }
 
     if !dry_run {
         write_settings(&path, &settings)?;
@@ -217,9 +259,12 @@ pub(crate) fn install_hooks(bridge_command: &str, dry_run: bool) -> Result<Value
         "command": command,
         "approvalCommand": approval_command,
         "questionCommand": question_command,
+        "headlessApprovalCommand": headless_approval_command,
+        "headlessApprovalMatcher": headless_matcher,
         "approvalTimeoutSeconds": approval_timeout,
         "events": installed,
-        "note": "Restart running interactive Claude Code sessions so they pick up the new hooks."
+        "note": "Restart running interactive Claude Code sessions so they pick up the new hooks.",
+        "headlessNote": "The headless matcher is frozen at install time. Re-run `tinyctb hooks install` after changing claude.headlessApprovalTools, or the new tool will not be gated."
     }))
 }
 
@@ -255,34 +300,98 @@ pub(crate) fn uninstall_hooks(dry_run: bool) -> Result<Value> {
     }))
 }
 
+/// Does this event have a tinyctb entry whose command carries `marker`?
+/// Status must check per marker: `PreToolUse` hosts BOTH the question gate
+/// and the headless approval gate, and "any tinyctb hook present" would call
+/// an old install complete forever — `/away` reuses that verdict and would
+/// never install the missing gate.
+fn marker_installed(settings: &Map<String, Value>, event: &str, marker: &str) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get(event))
+        .and_then(Value::as_array)
+        .map(|groups| {
+            groups.iter().any(|group| {
+                group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .map(|entries| {
+                        entries.iter().any(|entry| {
+                            is_tinyctb_hook(entry)
+                                && entry
+                                    .get("command")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|command| command.contains(marker))
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// The matcher currently installed for the headless gate, if any.
+fn installed_headless_matcher(settings: &Map<String, Value>) -> Option<String> {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get(QUESTION_HOOK_EVENT))
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|group| {
+            group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .map(|entries| {
+                    entries.iter().any(|entry| {
+                        is_tinyctb_hook(entry)
+                            && entry
+                                .get("command")
+                                .and_then(Value::as_str)
+                                .is_some_and(|command| {
+                                    command.contains(HEADLESS_APPROVAL_HOOK_MARKER)
+                                })
+                    })
+                })
+                .unwrap_or(false)
+        })?
+        .get("matcher")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 pub(crate) fn hooks_status() -> Result<Value> {
     let (path, settings) = read_settings()?;
     let mut events = Map::new();
     let mut missing = Vec::new();
-    for event in HOOKED_EVENTS
-        .iter()
-        .chain(std::iter::once(&APPROVAL_HOOK_EVENT))
-        .chain(std::iter::once(&QUESTION_HOOK_EVENT))
-    {
-        let installed = settings
-            .get("hooks")
-            .and_then(|hooks| hooks.get(*event))
-            .and_then(Value::as_array)
-            .map(|groups| {
-                groups.iter().any(|group| {
-                    group
-                        .get("hooks")
-                        .and_then(Value::as_array)
-                        .map(|entries| entries.iter().any(is_tinyctb_hook))
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false);
+    let mut check = |label: String, installed: bool| {
         if !installed {
-            missing.push(event.to_string());
+            missing.push(label.clone());
         }
-        events.insert(event.to_string(), Value::Bool(installed));
+        events.insert(label, Value::Bool(installed));
+    };
+    for event in HOOKED_EVENTS {
+        check(
+            event.to_string(),
+            marker_installed(&settings, event, HOOK_MARKER),
+        );
     }
+    check(
+        APPROVAL_HOOK_EVENT.to_string(),
+        marker_installed(&settings, APPROVAL_HOOK_EVENT, APPROVAL_HOOK_MARKER),
+    );
+    check(
+        format!("{QUESTION_HOOK_EVENT}({QUESTION_HOOK_MATCHER})"),
+        marker_installed(&settings, QUESTION_HOOK_EVENT, QUESTION_HOOK_MARKER),
+    );
+    // The headless gate counts as installed only with the matcher the current
+    // config calls for. A stale matcher is a gate that silently never fires
+    // for the newly configured tool — the exact failure this exists to catch.
+    let expected_matcher = headless_approval_matcher();
+    let current_matcher = installed_headless_matcher(&settings);
+    check(
+        format!("{QUESTION_HOOK_EVENT}({expected_matcher})"),
+        current_matcher.as_deref() == Some(expected_matcher.as_str()),
+    );
     let spool = events_spool_dir()?;
     Ok(json!({
         "ok": true,
@@ -292,6 +401,8 @@ pub(crate) fn hooks_status() -> Result<Value> {
         "events": events,
         "installed": missing.is_empty(),
         "missing": missing,
+        "headlessApprovalMatcher": current_matcher,
+        "headlessApprovalMatcherExpected": expected_matcher,
         "spoolDir": spool.display().to_string(),
         "spoolDirExists": spool.exists()
     }))
@@ -400,11 +511,34 @@ mod tests {
             "approval hook must not be killed while waiting: {approval}"
         );
 
+        // The headless gate is the SECOND PreToolUse entry. Both must survive
+        // installation: they are pushed after one shared strip, and stripping
+        // per entry would have deleted this one's predecessor.
+        let headless = settings["hooks"][QUESTION_HOOK_EVENT][1].clone();
+        assert!(
+            headless["hooks"][0]["command"]
+                .as_str()
+                .expect("headless command")
+                .ends_with("headless-approval-gate"),
+            "{headless}"
+        );
+        let matcher = headless["matcher"].as_str().expect("headless matcher");
+        for tool in ["Bash", "Write", "Edit"] {
+            assert!(
+                matcher.split('|').any(|part| part == tool),
+                "{tool} must be gated inside headless turns: {matcher}"
+            );
+        }
+        assert!(
+            !matcher.split('|').any(|part| part == "Read"),
+            "read-only tools must stay off the hot path: {matcher}"
+        );
+
         let uninstalled = uninstall_hooks(false).expect("uninstall");
         assert_eq!(
             uninstalled["removed"],
-            (HOOKED_EVENTS.len() + 2) as i64,
-            "the spool hooks plus the PermissionRequest approval gate and the              PreToolUse question gate"
+            (HOOKED_EVENTS.len() + 3) as i64,
+            "the spool hooks plus the PermissionRequest approval gate and BOTH PreToolUse gates"
         );
         let settings: Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings"))
@@ -412,5 +546,94 @@ mod tests {
         let stop_groups = settings["hooks"]["Stop"].as_array().expect("stop groups");
         assert_eq!(stop_groups.len(), 1, "foreign hook group should survive");
         assert!(settings["hooks"].get("SessionStart").is_none());
+    }
+
+    /// An install predating the headless gate has a `question-gate` entry
+    /// under `PreToolUse` and nothing else. Status must call that INCOMPLETE:
+    /// `/away` repairs hooks based on this verdict, and "any tinyctb hook on
+    /// the event" would report the old install as done forever — the missing
+    /// gate would never arrive and every Telegram turn would run unchecked.
+    #[test]
+    fn status_flags_an_install_missing_the_headless_gate() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let env = HookTestEnv::new("stale-install");
+        install_hooks("tinyctb", false).expect("install");
+        let settings_path = env.root.join("settings.json");
+
+        // Freshly installed: complete.
+        let status = hooks_status().expect("status");
+        assert_eq!(status["installed"], true, "{status}");
+
+        // Strip the headless entry, keeping the question gate — the exact
+        // shape an old install leaves behind.
+        let mut settings: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).expect("read")).expect("json");
+        let groups = settings["hooks"][QUESTION_HOOK_EVENT]
+            .as_array_mut()
+            .expect("groups");
+        groups.retain(|group| {
+            !group["hooks"].as_array().is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry["command"]
+                        .as_str()
+                        .is_some_and(|command| command.contains(HEADLESS_APPROVAL_HOOK_MARKER))
+                })
+            })
+        });
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).expect("serialize"),
+        )
+        .expect("write");
+
+        let status = hooks_status().expect("status");
+        assert_eq!(status["installed"], false, "{status}");
+        let missing = status["missing"].as_array().expect("missing");
+        assert!(
+            missing
+                .iter()
+                .any(|label| label.as_str().is_some_and(|label| label.contains("Bash"))),
+            "the missing entry must name the headless gate: {status}"
+        );
+        assert_eq!(
+            status["events"][&format!("{QUESTION_HOOK_EVENT}({QUESTION_HOOK_MATCHER})")],
+            true,
+            "and the question gate must still count as present: {status}"
+        );
+    }
+
+    /// A matcher written by an old install no longer covering the configured
+    /// tools is a gate that silently never fires for them. Status treats it
+    /// as not installed, which makes `/away` reinstall with the current one.
+    #[test]
+    fn status_flags_a_stale_headless_matcher() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let env = HookTestEnv::new("stale-matcher");
+        install_hooks("tinyctb", false).expect("install");
+        let settings_path = env.root.join("settings.json");
+        let mut settings: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).expect("read")).expect("json");
+        for group in settings["hooks"][QUESTION_HOOK_EVENT]
+            .as_array_mut()
+            .expect("groups")
+        {
+            if group["matcher"]
+                .as_str()
+                .is_some_and(|matcher| matcher.contains("Bash"))
+            {
+                group["matcher"] = Value::String("Bash".to_string());
+            }
+        }
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).expect("serialize"),
+        )
+        .expect("write");
+
+        let status = hooks_status().expect("status");
+        assert_eq!(
+            status["installed"], false,
+            "a matcher missing configured tools is a silent no-op gate: {status}"
+        );
     }
 }

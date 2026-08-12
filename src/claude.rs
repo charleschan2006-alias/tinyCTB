@@ -1180,6 +1180,13 @@ pub(crate) fn watch_events_from_sync_result(
 // ---------------------------------------------------------------------------
 // Headless turns (detached `claude -p` processes)
 
+/// Environment token stamped on every process the bridge spawns. Hooks run
+/// as descendants of the claude process and inherit it, which gives the
+/// headless approval gate a first-layer identity check that needs no
+/// database: no token, no bridge turn — however broken tinyctb's own state
+/// may be, a user's terminal session can never be misclassified.
+pub(crate) const BRIDGE_TURN_ENV: &str = "TINYCTB_BRIDGE_TURN";
+
 fn claude_config(config: &DaemonConfig) -> ClaudeConfig {
     config.claude.clone().unwrap_or_default()
 }
@@ -1234,6 +1241,24 @@ mod turn_children {
     use std::sync::Mutex;
 
     pub(super) static RUNNING: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+}
+
+#[cfg(test)]
+pub(crate) mod test_identity_persist {
+    use std::sync::atomic::AtomicBool;
+
+    /// Makes `persist_spawn_identity` fail, so tests can prove a turn whose
+    /// identity cannot be recorded is terminated instead of left running.
+    pub(crate) static FAIL: AtomicBool = AtomicBool::new(false);
+}
+
+#[cfg(test)]
+pub(crate) mod test_settle_fail {
+    use std::sync::atomic::AtomicBool;
+
+    /// Makes `settle_failed_turn`'s database write fail, so tests can prove
+    /// a settle error is reported instead of swallowed.
+    pub(crate) static FAIL: AtomicBool = AtomicBool::new(false);
 }
 
 #[cfg(test)]
@@ -1467,6 +1492,180 @@ pub(crate) fn reap_finished_turn_processes() -> Vec<(u32, Option<i32>)> {
     }
 }
 
+/// Spawn a headless turn with its `bridge_turns` row already on disk.
+///
+/// The order is the point: the row is inserted BEFORE the process exists.
+/// Two consumers race the spawn — the headless approval gate admits a tool
+/// call only if it finds a running row for the session, and the daemon's
+/// crash detection assumes every child it reaps is registered. Both would
+/// misread a turn whose registration was still in flight; a turn's first
+/// tool call is only bounded below by Claude's startup time, which is not a
+/// guarantee.
+///
+/// A spawn failure settles the row as `failed` immediately — a permanently
+/// "running" row would keep admitting gate calls for a process that never
+/// existed and read as a crash forever.
+#[allow(clippy::too_many_arguments)]
+fn spawn_registered_headless(
+    conn: &rusqlite::Connection,
+    binary: &Path,
+    args: &[String],
+    cwd: Option<&str>,
+    turn_id: &str,
+    thread_id: &str,
+    log_path: &Path,
+    now: u64,
+) -> Result<Option<u32>> {
+    crate::state::register_bridge_turn(
+        conn,
+        turn_id,
+        thread_id,
+        &log_path.display().to_string(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        now,
+    )?;
+    let pid = match spawn_detached_headless(binary, args, cwd, turn_id) {
+        Ok(pid) => pid,
+        Err(err) => return Err(settle_failed_turn(conn, turn_id, now, err)),
+    };
+    // Identity arrives in a second write because it cannot exist before the
+    // spawn — and losing that write is NOT survivable. With `pid` still NULL
+    // the daemon's crash check calls the turn failed after its 10s grace,
+    // the turn stops counting as running, and from then on a live process
+    // runs outside the approval boundary with nobody able to reap it. So the
+    // write is retried and verified, and a turn that cannot be recorded is
+    // killed rather than left running unsupervised.
+    let identity = capture_process_identity(pid);
+    if let Err(err) = persist_spawn_identity(conn, turn_id, pid, &identity) {
+        kill_spawned_child(pid);
+        let err = err.context(
+            "could not record the spawned turn's identity; the process was terminated \
+             rather than left running outside the approval boundary",
+        );
+        return Err(settle_failed_turn(conn, turn_id, now, err));
+    }
+    Ok(pid)
+}
+
+/// Settle a turn whose spawn went wrong, and fold how THAT went into the
+/// reported error — a dropped settle error would leave the row `running`
+/// with nobody told. If settling itself keeps failing, the row does stay
+/// `running` with a NULL pid; the daemon's 10s crash grace then flags the
+/// turn failed on its own, loudly — delayed and noisier, but never silent.
+fn settle_failed_turn(
+    conn: &rusqlite::Connection,
+    turn_id: &str,
+    now: u64,
+    cause: anyhow::Error,
+) -> anyhow::Error {
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        #[cfg(test)]
+        if test_settle_fail::FAIL.load(std::sync::atomic::Ordering::SeqCst) {
+            last_error = Some(anyhow::anyhow!("injected settle failure"));
+            continue;
+        }
+        match crate::state::mark_bridge_turn_finished(conn, turn_id, "failed", now) {
+            Ok(()) => return cause,
+            Err(err) => last_error = Some(err),
+        }
+    }
+    let settle_error = last_error.unwrap_or_else(|| anyhow::anyhow!("settle never ran"));
+    cause.context(format!(
+        "additionally, settling turn {turn_id} as failed also failed ({settle_error:#}); \
+         the row is still 'running' with no pid, so the daemon's grace-period check \
+         will flag it within seconds"
+    ))
+}
+
+/// Retry the identity write and verify it touched exactly the one row the
+/// registration created. Transient `SQLITE_BUSY` from the daemon's own
+/// connection is the expected failure here; three spaced attempts outlast it.
+fn persist_spawn_identity(
+    conn: &rusqlite::Connection,
+    turn_id: &str,
+    pid: Option<u32>,
+    identity: &ProcessIdentity,
+) -> Result<()> {
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        #[cfg(test)]
+        if test_identity_persist::FAIL.load(std::sync::atomic::Ordering::SeqCst) {
+            last_error = Some(anyhow::anyhow!("injected identity persist failure"));
+            continue;
+        }
+        match crate::state::record_bridge_turn_spawn(
+            conn,
+            turn_id,
+            pid,
+            identity.lstart.as_deref(),
+            identity.exe.as_deref(),
+            identity.pgid,
+            identity.start_ticks.as_deref(),
+            identity.boot_id.as_deref(),
+        ) {
+            Ok(1) => return Ok(()),
+            Ok(0) => {
+                last_error = Some(anyhow::anyhow!(
+                    "identity update matched no RUNNING row for turn {turn_id} — the daemon \
+                     may have already settled it as crashed"
+                ))
+            }
+            Ok(rows) => {
+                last_error = Some(anyhow::anyhow!(
+                    "identity update touched {rows} rows for turn {turn_id}, expected exactly 1"
+                ))
+            }
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("identity update never ran")))
+}
+
+/// Kill a child this process just spawned (it is still in RUNNING). The
+/// narrow cousin of `kill_turn_process`: no restart-identity check needed,
+/// because the pid came straight from our own `spawn`.
+fn kill_spawned_child(pid: Option<u32>) {
+    #[cfg(test)]
+    {
+        test_kill::KILLED
+            .lock()
+            .expect("test kill lock")
+            .push(pid.unwrap_or(0));
+    }
+    #[cfg(not(test))]
+    {
+        let Some(pid) = pid.filter(|pid| *pid > 0) else {
+            return;
+        };
+        let mut running = turn_children::RUNNING.lock().expect("turn children lock");
+        if let Some(index) = running.iter().position(|child| child.id() == pid) {
+            let mut child = running.remove(index);
+            drop(running);
+            if !terminate_process_group(pid, Some(&mut child)) {
+                // Not reaped within the bound: hand the child back so the
+                // per-cycle reaper collects it later instead of leaking a
+                // forever-unreapable zombie.
+                turn_children::RUNNING
+                    .lock()
+                    .expect("turn children lock")
+                    .push(child);
+            }
+        }
+    }
+}
+
 #[cfg_attr(test, allow(clippy::needless_return))]
 fn spawn_detached_headless(
     binary: &Path,
@@ -1500,6 +1699,8 @@ fn spawn_detached_headless(
         let mut command = Command::new(binary);
         command
             .args(args)
+            // The turn token: the headless gate's first-layer identity.
+            .env(BRIDGE_TURN_ENV, log_name)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(err_file));
@@ -1663,6 +1864,7 @@ pub(crate) fn inject_into_live_session(
 /// Start a headless turn that continues an existing session. Returns
 /// immediately; the answer is delivered later through the Stop hook event.
 pub(crate) fn send_user_message(
+    conn: &rusqlite::Connection,
     config: &DaemonConfig,
     session_id: &str,
     message: &str,
@@ -1684,7 +1886,16 @@ pub(crate) fn send_user_message(
     let turn_id = format!("{session_id}-{now}-{}", &generate_session_uuid()?[..8]);
     let log_path = turn_logs_dir()?.join(format!("{turn_id}.log"));
     let args = headless_command_args(&claude, &message, SessionRef::Resume(session_id));
-    let pid = spawn_detached_headless(&binary.path, &args, cwd.as_deref(), &turn_id)?;
+    let pid = spawn_registered_headless(
+        conn,
+        &binary.path,
+        &args,
+        cwd.as_deref(),
+        &turn_id,
+        session_id,
+        &log_path,
+        now,
+    )?;
     let identity = capture_process_identity(pid);
     Ok(json!({
         "ok": true,
@@ -1718,6 +1929,7 @@ pub(crate) fn send_user_message(
 /// session id is generated locally and passed via `--session-id`, so the
 /// caller can route replies immediately.
 pub(crate) fn start_thread_in_cwd(
+    conn: &rusqlite::Connection,
     config: &DaemonConfig,
     cwd: Option<&str>,
     message: Option<&str>,
@@ -1730,7 +1942,16 @@ pub(crate) fn start_thread_in_cwd(
     let turn_id = format!("{session_id}-{now}-{}", &generate_session_uuid()?[..8]);
     let log_path = turn_logs_dir()?.join(format!("{turn_id}.log"));
     let args = headless_command_args(&claude, &message, SessionRef::New(&session_id));
-    let pid = spawn_detached_headless(&binary.path, &args, cwd, &turn_id)?;
+    let pid = spawn_registered_headless(
+        conn,
+        &binary.path,
+        &args,
+        cwd,
+        &turn_id,
+        &session_id,
+        &log_path,
+        now,
+    )?;
     let identity = capture_process_identity(pid);
     Ok(json!({
         "ok": true,
@@ -2421,6 +2642,152 @@ mod tests {
         }
     }
 
+    /// P1 regression: a spawned process whose identity write fails must be
+    /// TERMINATED and its turn settled — not left running. With `pid` NULL
+    /// the daemon's crash check would call the turn failed after 10 seconds,
+    /// the turn would stop counting as running, and a live claude process
+    /// would keep making tool calls outside the approval boundary.
+    #[test]
+    fn spawn_that_cannot_be_recorded_is_terminated() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        let _ = test_spawn::take();
+        let _ = test_kill::take();
+        if resolve_claude_binary().is_err() {
+            return;
+        }
+        let conn = test_state_conn("persist-fail");
+        test_identity_persist::FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = send_user_message(&conn, &config, "sess-persist", "go", None, 4000);
+        test_identity_persist::FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            result.is_err(),
+            "a turn the database cannot track must be reported, not returned as started"
+        );
+        assert_eq!(
+            test_kill::take(),
+            vec![0],
+            "the spawned child must be terminated (test spawn pid = 0)"
+        );
+        let status: String = conn
+            .query_row("SELECT status FROM bridge_turns", [], |row| row.get(0))
+            .expect("turn row");
+        assert_eq!(
+            status, "failed",
+            "the turn must be settled so nothing keeps waiting on it"
+        );
+    }
+
+    /// The daemon-preemption interleaving: a slow spawn can outlive the 10s
+    /// crash grace, in which case the daemon settles the turn as failed
+    /// BEFORE the identity write runs. That write must then refuse — updating
+    /// the settled row would report a turn the daemon has declared dead (and
+    /// notified the user about) as successfully started.
+    #[test]
+    fn identity_persist_refuses_a_turn_the_daemon_already_settled() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let conn = test_state_conn("preempt");
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-p",
+            "sess-p",
+            "/tmp/p.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            900,
+        )
+        .expect("register");
+        // The daemon got there first.
+        crate::state::mark_bridge_turn_finished(&conn, "turn-p", "failed", 950).expect("settle");
+
+        let err = persist_spawn_identity(&conn, "turn-p", Some(0), &ProcessIdentity::default())
+            .expect_err("a settled turn must not be recorded as running");
+        assert!(
+            format!("{err:#}").contains("no RUNNING row"),
+            "the error must name the interleaving: {err:#}"
+        );
+        // And the settled row itself must be untouched by the attempts.
+        let pid: Option<i64> = conn
+            .query_row(
+                "SELECT pid FROM bridge_turns WHERE turn_id = 'turn-p'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(pid, None, "the failed row must not gain a pid");
+    }
+
+    /// When BOTH the identity write and the failure settling break (a truly
+    /// broken database), the error the caller gets must carry the settle
+    /// failure too — and the contract for the leftover row is explicit: it
+    /// stays `running` with a NULL pid, which the daemon's grace-period
+    /// check flags on its own.
+    #[test]
+    fn settle_failure_is_reported_not_swallowed() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        let _ = test_spawn::take();
+        let _ = test_kill::take();
+        if resolve_claude_binary().is_err() {
+            return;
+        }
+        let conn = test_state_conn("settle-fail");
+        test_identity_persist::FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+        test_settle_fail::FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = send_user_message(&conn, &config, "sess-settle", "go", None, 4000);
+        test_identity_persist::FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
+        test_settle_fail::FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let err = result.expect_err("both failures must surface as an error");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("settling turn") && chain.contains("also failed"),
+            "the settle failure must be in the reported chain, not dropped: {chain}"
+        );
+        assert_eq!(
+            test_kill::take(),
+            vec![0],
+            "the child must still be terminated"
+        );
+        let status: String = conn
+            .query_row("SELECT status FROM bridge_turns", [], |row| row.get(0))
+            .expect("row");
+        assert_eq!(
+            status, "running",
+            "the documented leftover: a running/NULL-pid row for the daemon's grace check"
+        );
+    }
+
+    /// A throwaway state DB for tests that spawn turns: the spawn registers
+    /// the turn itself, so it needs somewhere to write.
+    fn test_state_conn(name: &str) -> rusqlite::Connection {
+        let path = std::env::temp_dir().join(format!(
+            "tinyctb-claude-turn-{name}-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        crate::state::create_state_db(&path).expect("test state db")
+    }
+
     #[test]
     fn headless_reply_spawns_resume_with_permission_mode() {
         let _guard = crate::state::test_env_lock().lock().expect("env lock");
@@ -2439,10 +2806,25 @@ mod tests {
             return;
         }
 
-        let result = send_user_message(&config, "sess-reply", "continue please", None, 4000)
+        let conn = test_state_conn("reply");
+        let result = send_user_message(&conn, &config, "sess-reply", "continue please", None, 4000)
             .expect("send reply");
         assert_eq!(result["action"], "reply_started");
         assert_eq!(result["threadId"], "sess-reply");
+        // The spawn registered the turn itself — and the row must be a
+        // RUNNING one, because the daemon's log-watching and the headless
+        // gate's straggler check both key off that status.
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM bridge_turns WHERE thread_id = 'sess-reply'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("turn row");
+        assert_eq!(
+            status, "running",
+            "the spawned turn must register as running"
+        );
 
         let spawned = test_spawn::take();
         assert_eq!(spawned.len(), 1);
@@ -2471,9 +2853,11 @@ mod tests {
             return;
         }
 
-        let first = send_user_message(&config, "sess-uid", "one", None, 4000).expect("first reply");
+        let conn = test_state_conn("uid");
+        let first =
+            send_user_message(&conn, &config, "sess-uid", "one", None, 4000).expect("first reply");
         let second =
-            send_user_message(&config, "sess-uid", "two", None, 4000).expect("second reply");
+            send_user_message(&conn, &config, "sess-uid", "two", None, 4000).expect("second reply");
         let first_turn = first
             .pointer("/claude/turnId")
             .and_then(Value::as_str)
@@ -3000,8 +3384,10 @@ mod tests {
             return;
         }
 
-        let result = start_thread_in_cwd(&config, Some("/tmp"), Some("build the thing"), 5000)
-            .expect("start thread");
+        let conn = test_state_conn("new");
+        let result =
+            start_thread_in_cwd(&conn, &config, Some("/tmp"), Some("build the thing"), 5000)
+                .expect("start thread");
         assert_eq!(result["action"], "new");
         let thread_id = result["threadId"].as_str().expect("threadId");
         assert_eq!(thread_id.len(), 36);

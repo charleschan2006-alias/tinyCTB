@@ -359,6 +359,16 @@ fn run() -> Result<i32> {
                 approvals::run_approval_gate(&mut stdin.lock(), now).unwrap_or_else(|_| json!({}));
             println!("{}", serde_json::to_string(&result)?);
         }
+        Commands::HeadlessApprovalGate => {
+            // No degrade-to-"no opinion" here, unlike the two gates around
+            // it: under `bypassPermissions` an empty reply IS execution, so
+            // errors must deny. The gate itself is infallible and confines
+            // failing closed to sessions with a running bridge turn.
+            let now = now_millis().unwrap_or(0);
+            let stdin = std::io::stdin();
+            let result = approvals::run_headless_approval_gate(&mut stdin.lock(), now);
+            println!("{}", serde_json::to_string(&result)?);
+        }
         Commands::QuestionGate => {
             let now = now_millis().unwrap_or(0);
             let stdin = std::io::stdin();
@@ -423,10 +433,15 @@ fn run() -> Result<i32> {
             } else {
                 let now = now_millis()?;
                 let config = load_daemon_config()?;
-                let result =
-                    claude::start_thread_in_cwd(&config, cwd.as_deref(), message.as_deref(), now)?;
                 let db_path = state_db_path()?;
                 let conn = create_state_db(&db_path)?;
+                let result = claude::start_thread_in_cwd(
+                    &conn,
+                    &config,
+                    cwd.as_deref(),
+                    message.as_deref(),
+                    now,
+                )?;
                 if let Some(thread_id) = result.get("threadId").and_then(Value::as_str) {
                     record_action(
                         &conn,
@@ -504,10 +519,10 @@ fn run() -> Result<i32> {
                 println!("{}", serde_json::to_string(&payload)?);
             } else {
                 let config = load_daemon_config()?;
-                let result =
-                    claude::send_user_message(&config, &thread_id, &message, None, sent_at)?;
                 let db_path = state_db_path()?;
                 let conn = create_state_db(&db_path)?;
+                let result =
+                    claude::send_user_message(&conn, &config, &thread_id, &message, None, sent_at)?;
                 record_action(
                     &conn,
                     &thread_id,

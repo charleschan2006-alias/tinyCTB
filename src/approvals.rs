@@ -1,23 +1,40 @@
 //! Remote approvals: answering Claude's permission prompts from Telegram.
 //!
-//! Runs as a `PermissionRequest` hook — the event Claude Code raises right
-//! before it would show a permission prompt. That timing is the whole point:
-//! the gate only ever engages for calls that genuinely need an answer, so
-//! there is no need to guess which tools are risky or to re-implement the
-//! `permissions.allow` rules (a `PreToolUse` gate, which fires for every
-//! single tool call, would have to do both and would still get it wrong).
+//! Two gates, split on `bypassPermissions`, because the sessions they serve
+//! have nothing in common downstream.
+//!
+//! **Interactive** sessions are gated from `PermissionRequest` — the event
+//! Claude Code raises right before it would show a permission prompt. That
+//! timing is the whole point: the gate engages only for calls that genuinely
+//! need an answer, so it never has to guess which tools are risky or
+//! re-implement the `permissions.allow` rules.
+//!
+//! **Headless** turns — the ones the bridge starts for Telegram — get none of
+//! that. `PermissionRequest` does not fire in `-p` mode, and the alternative
+//! is worse than it sounds: with `--permission-mode default` a headless call
+//! that would prompt is refused by the sandbox instead, which is why bridge
+//! turns run under `bypassPermissions` in the first place. Measured, all
+//! three, in docs/approvals.md. So they are gated from `PreToolUse`, which
+//! does fire, with a matcher confining it to the tools that change something.
 //!
 //! The session's messaging socket cannot answer a permission prompt — it
 //! accepts user messages only — so a blocking hook is the mechanism.
 //!
 //! Safety rules, all load-bearing:
-//! - a timeout NEVER allows; it returns "no opinion" and the normal
-//!   permission flow takes over (the terminal dialog, exactly as today);
-//! - nothing is gated unless away mode is on, so being at the keyboard
-//!   behaves as it always did;
-//! - turns the bridge itself started run with `bypassPermissions` and are
-//!   skipped, otherwise a Telegram-initiated turn would block on its own
-//!   approval request with nobody watching.
+//! - a timeout NEVER allows;
+//! - what a timeout DOES do depends on what is downstream. An interactive
+//!   session gets "no opinion" and its own terminal dialog. A headless turn
+//!   has no dialog to fall back to and `bypassPermissions` behind it, so
+//!   there "no opinion" would mean "run it" — silence has to deny outright;
+//! - errors follow the same asymmetry: the interactive gate degrades to "no
+//!   opinion" (the dialog catches it), the headless gate fails CLOSED once a
+//!   running bridge turn is established (nothing would catch it);
+//! - away gates the interactive side only. Telegram starts headless turns
+//!   with away off too (`/new`, a Reply while at the keyboard), and those
+//!   turns have no terminal regardless of where the user is sitting;
+//! - a headless gate engages only for a session with a RUNNING bridge turn.
+//!   A terminal `--dangerously-skip-permissions` session — even one that ran
+//!   a Telegram turn in the past — is left exactly as the user configured it.
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -40,23 +57,59 @@ fn no_opinion() -> Value {
     json!({})
 }
 
-fn allow(reason: &str) -> Value {
-    json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PermissionRequest",
-            "decision": { "behavior": "allow" },
-            "permissionDecisionReason": reason
-        }
-    })
+/// Which hook is asking. Both gates run the same request/answer path and
+/// differ only at the two edges: whose tool calls they engage for, and what
+/// silence means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateKind {
+    /// A session the user launched. `PermissionRequest` fires only when a
+    /// decision is genuinely needed, and an unanswered request falls through
+    /// to the terminal dialog that was going to appear anyway.
+    Interactive,
+    /// A headless turn the bridge started for Telegram. `PermissionRequest`
+    /// does not fire in `-p` mode at all, so the gate hangs off `PreToolUse`;
+    /// and because the turn runs under `bypassPermissions` with no terminal
+    /// behind it, silence must DENY — falling through would run the call.
+    Headless,
 }
 
-fn deny(message: &str) -> Value {
-    json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PermissionRequest",
-            "decision": { "behavior": "deny", "message": message }
+impl GateKind {
+    fn allow(self, reason: &str) -> Value {
+        match self {
+            GateKind::Interactive => json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": { "behavior": "allow" },
+                    "permissionDecisionReason": reason
+                }
+            }),
+            GateKind::Headless => json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": reason
+                }
+            }),
         }
-    })
+    }
+
+    fn deny(self, message: &str) -> Value {
+        match self {
+            GateKind::Interactive => json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": { "behavior": "deny", "message": message }
+                }
+            }),
+            GateKind::Headless => json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": message
+                }
+            }),
+        }
+    }
 }
 
 /// Cheap away check that avoids opening the database: while the user is at
@@ -74,16 +127,66 @@ fn away_mode_active() -> bool {
 }
 
 pub(crate) fn run_approval_gate<R: Read>(reader: &mut R, now: u64) -> Result<Value> {
+    let payload = read_hook_payload(reader, "PermissionRequest")?;
+    gate_tool_call(&payload, GateKind::Interactive, now)
+}
+
+/// Remote approvals for a headless turn — the calls the interactive gate can
+/// never see.
+///
+/// Three measured facts force this second entry point (see docs/approvals.md):
+/// `PermissionRequest` does not fire in `-p` mode; `--permission-mode default`
+/// there does not prompt but has the sandbox refuse outright, which is why
+/// bridge turns run under `bypassPermissions`; and `PreToolUse` *does* fire,
+/// carrying the same `tool_name` / `tool_input` / `tool_use_id` payload.
+///
+/// So the very turns the user starts from their phone — the ones they are
+/// least able to watch — were the only ones running with nothing in the way.
+///
+/// Infallible by design, and the error direction is the opposite of the
+/// interactive gate's. There, an error degrading to "no opinion" hands the
+/// call to the terminal dialog — safe. Here, "no opinion" IS execution: the
+/// turn runs under `bypassPermissions` and nothing else will ask. So any
+/// internal failure denies, loudly, with the error in the reason. The blast
+/// radius of failing closed is confined by the checks that precede the
+/// fallible work: a call that is not `bypassPermissions`, or that carries no
+/// turn token in its environment, has already returned "no opinion" before
+/// anything that can break (database, config, approvals, Telegram) is
+/// touched.
+pub(crate) fn run_headless_approval_gate<R: Read>(reader: &mut R, now: u64) -> Value {
+    let attempt = read_hook_payload(reader, "PreToolUse")
+        .and_then(|payload| gate_tool_call(&payload, GateKind::Headless, now));
+    match attempt {
+        Ok(value) => value,
+        Err(err) => {
+            // Loud on both channels: stderr for the hook debug log, and the
+            // deny reason for the transcript the user will read.
+            eprintln!("tinyctb headless-approval-gate failed closed: {err:#}");
+            GateKind::Headless.deny(&format!(
+                "tinyctb could not process this approval ({err:#}), so the call was \
+                 blocked — a headless turn has no other check. Do not retry; tell \
+                 the user what you were about to do and stop."
+            ))
+        }
+    }
+}
+
+fn read_hook_payload<R: Read>(reader: &mut R, event: &str) -> Result<Value> {
     let mut raw = String::new();
     reader
         .take(1024 * 1024)
         .read_to_string(&mut raw)
-        .context("failed to read PermissionRequest payload")?;
-    let payload: Value =
-        serde_json::from_str(raw.trim()).context("PermissionRequest payload is not valid JSON")?;
+        .with_context(|| format!("failed to read {event} payload"))?;
+    serde_json::from_str(raw.trim()).with_context(|| format!("{event} payload is not valid JSON"))
+}
 
-    // --- fast paths, no database ------------------------------------------
-    if !away_mode_active() {
+fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
+    // Away gates the INTERACTIVE side only: at the keyboard, the terminal
+    // dialog is right there and remote approval would be noise. A headless
+    // turn has no terminal wherever the user is sitting — Telegram can start
+    // one with away off (`/new`, or a Reply while present) — so its gate
+    // must not depend on away at all.
+    if kind == GateKind::Interactive && !away_mode_active() {
         return Ok(no_opinion());
     }
     let tool_name = payload
@@ -92,46 +195,119 @@ pub(crate) fn run_approval_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         .unwrap_or_default()
         .to_string();
     if tool_name.is_empty() {
+        return match kind {
+            GateKind::Interactive => Ok(no_opinion()),
+            // The matcher restricts this hook to gated tools; a payload with
+            // no tool name is malformed, and malformed fails closed here.
+            GateKind::Headless => Err(anyhow::anyhow!("PreToolUse payload has no tool_name")),
+        };
+    }
+    // `bypassPermissions` splits the two gates cleanly. An interactive
+    // session in that mode raises no permission prompt, so the interactive
+    // gate would never hear about the call anyway; a headless turn is in
+    // that mode by construction.
+    let bypassing =
+        payload.get("permission_mode").and_then(Value::as_str) == Some("bypassPermissions");
+    if bypassing != (kind == GateKind::Headless) {
         return Ok(no_opinion());
     }
-    // A turn the bridge started for the user runs unattended by design; it
-    // must not stop to ask the very person who is not there.
-    if payload.get("permission_mode").and_then(Value::as_str) == Some("bypassPermissions") {
-        return Ok(no_opinion());
-    }
-    let config = match load_daemon_config() {
-        Ok(config) => config,
-        // Unconfigured bridge: stay out of the way entirely.
-        Err(_) => return Ok(no_opinion()),
-    };
-    let claude = config.claude.clone().unwrap_or_default();
-    // The event already means "this call needs an answer", so an empty list
-    // gates everything that asks. A non-empty list is an explicit narrowing
-    // for people who only want to be bothered about certain tools.
-    if !claude.approval_tools.is_empty()
-        && !claude
-            .approval_tools
-            .iter()
-            .any(|gated| gated == &tool_name)
-    {
-        return Ok(no_opinion());
-    }
-    let Some(telegram) = config.telegram.clone() else {
-        return Ok(no_opinion());
-    };
     let thread_id = payload
         .get("session_id")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
     if thread_id.is_empty() {
+        return match kind {
+            GateKind::Interactive => Ok(no_opinion()),
+            GateKind::Headless => Err(anyhow::anyhow!("PreToolUse payload has no session_id")),
+        };
+    }
+    // The headless gate's admission check comes BEFORE config or any approval
+    // work, deliberately early, and its first layer touches NO fallible
+    // state at all: the turn token the bridge stamps into the environment of
+    // every process it spawns (hooks inherit it through the claude process).
+    //
+    // - No token -> not a bridge process. A terminal
+    //   `--dangerously-skip-permissions` session is waved past here even
+    //   when tinyctb's own state directory is unreadable — an environment
+    //   read cannot fail the way a database open can, so "bridge fails
+    //   closed" can never spill onto a session the bridge does not own.
+    // - The token names one turn, and it exists only inside that turn's
+    //   process tree, so a session that ran a Telegram turn last week cannot
+    //   be haunted by it either.
+    // - Token holders ARE bridge processes: everything from here on fails
+    //   closed. The database is consulted second, to check the named turn is
+    //   still running — a straggler call from a turn the daemon has already
+    //   settled (timed out, killed) gets a deny, not a fresh approval.
+    // The spawn registers the turn before the process exists, so there is no
+    // first-call race to lose.
+    let mut admitted_conn = None;
+    if kind == GateKind::Headless {
+        let token = std::env::var(crate::claude::BRIDGE_TURN_ENV).unwrap_or_default();
+        if token.is_empty() {
+            return Ok(no_opinion());
+        }
+        let conn = create_state_db(&state_db_path()?)?;
+        match crate::state::bridge_turn_status(&conn, &token)?.as_deref() {
+            Some("running") => {}
+            status => {
+                return Ok(kind.deny(&format!(
+                    "this bridge turn is {}, so its approval window is closed and \
+                     {tool_name} was not run. Do not retry; stop.",
+                    status.unwrap_or("unknown to the bridge")
+                )))
+            }
+        }
+        admitted_conn = Some(conn);
+    }
+    let config = match load_daemon_config() {
+        Ok(config) => config,
+        Err(err) => {
+            return match kind {
+                // Unconfigured bridge: stay out of the way entirely.
+                GateKind::Interactive => Ok(no_opinion()),
+                // A running bridge turn with unreadable config cannot be
+                // waved through — that would execute the call unchecked.
+                GateKind::Headless => {
+                    Err(err.context("cannot load config while gating a headless call"))
+                }
+            };
+        }
+    };
+    let claude = config.claude.clone().unwrap_or_default();
+    let gated = match kind {
+        // The event already means "this call needs an answer", so an empty
+        // list gates everything that asks. A non-empty list is an explicit
+        // narrowing for people who only want to be bothered about some tools.
+        GateKind::Interactive => {
+            claude.approval_tools.is_empty()
+                || claude
+                    .approval_tools
+                    .iter()
+                    .any(|gated| gated == &tool_name)
+        }
+        // `PreToolUse` fires for EVERY call, so the list is the whole filter
+        // and an empty one is the off switch — the opposite reading, for the
+        // opposite reason. See the config field's doc comment.
+        GateKind::Headless => claude
+            .headless_approval_tools
+            .iter()
+            .any(|gated| gated == &tool_name),
+    };
+    if !gated {
         return Ok(no_opinion());
     }
+    let Some(telegram) = config.telegram.clone() else {
+        return Ok(no_opinion());
+    };
 
     // --- database-backed path ---------------------------------------------
-    let conn = create_state_db(&state_db_path()?)?;
+    let conn = match admitted_conn {
+        Some(conn) => conn,
+        None => create_state_db(&state_db_path()?)?,
+    };
     if approval_auto_allowed(&conn, &thread_id, &tool_name)? {
-        return Ok(allow(&format!(
+        return Ok(kind.allow(&format!(
             "{tool_name} was approved for this session from Telegram"
         )));
     }
@@ -187,6 +363,10 @@ pub(crate) fn run_approval_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
             .push(json!({ "text": label, "callbackId": callback_id, "action": action.as_str() }));
     }
 
+    // Whether silence will deny is part of the request, not a footnote: the
+    // user decides differently when "ignore it" means "the task stops here".
+    // The admission check already proved this is a running bridge turn.
+    let blocking = kind == GateKind::Headless;
     let cwd = payload.get("cwd").and_then(Value::as_str);
     let event = json!({
         "type": "approval_request",
@@ -197,6 +377,7 @@ pub(crate) fn run_approval_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         "eventKey": format!("approval:{approval_id}"),
         "lastPreview": summary,
         "buttons": buttons,
+        "headless": blocking,
         "thread": {
             "threadId": thread_id,
             "cwd": cwd,
@@ -214,7 +395,7 @@ pub(crate) fn run_approval_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         std::thread::sleep(POLL_INTERVAL);
         if let Some(decision) = approval_decision(&conn, &approval_id)? {
             if decision != "expired" {
-                return apply_decision(&conn, &thread_id, &tool_name, &decision, now);
+                return apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now);
             }
         }
     }
@@ -223,11 +404,21 @@ pub(crate) fn run_approval_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     // that answer wins and must be honoured — otherwise Telegram would show
     // "已允许" while the session quietly fell back to its own prompt.
     match crate::state::expire_or_take_decision(&conn, &approval_id, now)? {
-        Some(decision) => apply_decision(&conn, &thread_id, &tool_name, &decision, now),
-        // Nobody answered: explicitly NOT an approval. The normal permission
-        // flow takes over, which in an interactive session is the terminal
-        // dialog.
-        None => Ok(no_opinion()),
+        Some(decision) => apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now),
+        // Nobody answered. Never an approval — but "not an approval" resolves
+        // differently depending on what is downstream of this hook.
+        None => match kind {
+            // An interactive session still has its own prompt to fall back
+            // on, which is exactly what "no opinion" hands it.
+            GateKind::Interactive => Ok(no_opinion()),
+            // A headless turn (proved running by the admission check) has no
+            // dialog behind it and `bypassPermissions` underneath: falling
+            // through would RUN the call. Silence has to deny outright.
+            GateKind::Headless => Ok(kind.deny(&format!(
+                "Nobody approved this from Telegram in time, so {tool_name} was not run. \
+                 Do not retry it; tell the user what you were about to do and stop."
+            ))),
+        },
     }
 }
 
@@ -504,22 +695,32 @@ fn answered(questions: &[Value], question_text: &str, answer: &str) -> Value {
 /// polling loop and the timeout race resolve an answer identically.
 fn apply_decision(
     conn: &rusqlite::Connection,
+    kind: GateKind,
     thread_id: &str,
     tool_name: &str,
     decision: &str,
     now: u64,
 ) -> Result<Value> {
     match decision {
-        "allow" => Ok(allow("Approved from Telegram")),
+        "allow" => Ok(kind.allow("Approved from Telegram")),
         "allow_session" => {
             set_approval_auto_allow(conn, thread_id, tool_name, now)?;
-            Ok(allow(&format!(
+            Ok(kind.allow(&format!(
                 "Approved from Telegram; {tool_name} is allowed for this session"
             )))
         }
-        "deny" => Ok(deny("Denied from Telegram")),
-        // Unknown value: refuse to guess, fall back to the terminal prompt.
-        _ => Ok(no_opinion()),
+        "deny" => Ok(kind.deny("Denied from Telegram")),
+        // Unknown value: refuse to guess. What "not guessing" means differs
+        // per gate — the interactive session falls back to its terminal
+        // prompt, while for a headless turn an empty reply would BE the
+        // guess (it executes), so only deny refuses anything there.
+        _ => match kind {
+            GateKind::Interactive => Ok(no_opinion()),
+            GateKind::Headless => Ok(kind.deny(&format!(
+                "the recorded decision {decision:?} is not one this gate recognises, \
+                 so {tool_name} was not run"
+            ))),
+        },
     }
 }
 
@@ -581,6 +782,9 @@ mod tests {
             fs::create_dir_all(&root).expect("gate dir");
             let previous_state_dir = std::env::var("TINYCTB_STATE_DIR").ok();
             std::env::set_var("TINYCTB_STATE_DIR", &root);
+            // A leftover turn token from a previous test would make this one
+            // look like a bridge process; every test starts tokenless.
+            std::env::remove_var(crate::claude::BRIDGE_TURN_ENV);
             crate::config::write_daemon_config(&DaemonConfig {
                 version: 1,
                 bridge_command: "tinyctb".to_string(),
@@ -696,6 +900,387 @@ mod tests {
             crate::state::pending_outbound_count(&conn).expect("pending"),
             0,
             "nor push anything to Telegram"
+        );
+    }
+
+    fn headless_gate(payload: Value) -> Value {
+        let mut reader = std::io::Cursor::new(payload.to_string());
+        run_headless_approval_gate(&mut reader, 1000)
+    }
+
+    /// The real `PreToolUse` shape, copied from a payload captured off a live
+    /// `claude -p` run (docs/approvals.md records the experiment).
+    fn headless_payload() -> Value {
+        json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "sess-headless",
+            "transcript_path": "/home/user/.claude/projects/x/sess-headless.jsonl",
+            "tool_name": "Bash",
+            "tool_use_id": "toolu_headless_1",
+            "permission_mode": "bypassPermissions",
+            "cwd": "/home/user/project",
+            "prompt_id": "p1",
+            "tool_input": { "command": "rm -rf build/" }
+        })
+    }
+
+    /// Register the turn AND assume its identity: the env token is what the
+    /// gate trusts first, the row is what it verifies second.
+    fn enter_bridge_turn(conn: &rusqlite::Connection, thread_id: &str) {
+        register_turn_for(conn, thread_id);
+        std::env::set_var(crate::claude::BRIDGE_TURN_ENV, "turn-1");
+    }
+
+    fn register_turn_for(conn: &rusqlite::Connection, thread_id: &str) {
+        crate::state::register_bridge_turn(
+            conn,
+            "turn-1",
+            thread_id,
+            "/tmp/turn.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            900,
+        )
+        .expect("register bridge turn");
+    }
+
+    /// The safety rule that had no owner until now. An interactive gate can
+    /// answer "no opinion" and let the terminal dialog handle it; a headless
+    /// turn has no terminal, runs under `bypassPermissions`, and would take
+    /// "no opinion" as permission to proceed. So silence must deny.
+    #[test]
+    fn headless_gate_denies_when_nobody_answers() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("headless-timeout", true, 5); // clamped minimum
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        enter_bridge_turn(&conn, "sess-headless");
+        drop(conn);
+
+        let started = std::time::Instant::now();
+        let result = headless_gate(headless_payload());
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "the gate must actually wait for an answer"
+        );
+        let out = &result["hookSpecificOutput"];
+        assert_eq!(out["hookEventName"], "PreToolUse", "{result}");
+        assert_eq!(out["permissionDecision"], "deny", "{result}");
+        assert!(
+            out["permissionDecisionReason"]
+                .as_str()
+                .expect("reason")
+                .contains("not run"),
+            "the model must be told the call did not happen: {result}"
+        );
+
+        // And the request that went out says silence will stop the task, so
+        // ignoring it is an informed choice.
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let payload_json: String = conn
+            .query_row("SELECT payload_json FROM outbound_events", [], |row| {
+                row.get(0)
+            })
+            .expect("outbound row");
+        let event: Value = serde_json::from_str(&payload_json).expect("json");
+        assert_eq!(event["headless"], true, "{event}");
+        assert!(payload_json.contains("rm -rf build/"), "{payload_json}");
+    }
+
+    /// The same `bypassPermissions` payload from a session the USER started
+    /// (`--dangerously-skip-permissions` in a terminal) is not a bridge turn.
+    /// The gate must step aside IMMEDIATELY — no approval row, no Telegram
+    /// push, no wait. The old shape of this bug: the gate created an approval
+    /// first and checked membership last, so a terminal bypass session got a
+    /// Telegram request promising a fallback dialog that bypass mode does not
+    /// have, and sat out the full timeout.
+    #[test]
+    fn headless_gate_leaves_an_unregistered_session_its_terminal() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("headless-unregistered", true, 30);
+        let started = std::time::Instant::now();
+        let result = headless_gate(headless_payload());
+        assert_eq!(
+            result,
+            json!({}),
+            "no bridge turn behind it: do not deny on the user's behalf"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "and do not make the user's own session wait"
+        );
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let approvals: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_approvals", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(approvals, 0, "no approval may be created before admission");
+        assert_eq!(
+            crate::state::pending_outbound_count(&conn).expect("pending"),
+            0,
+            "and nothing may be pushed to Telegram"
+        );
+    }
+
+    /// A token whose turn the daemon has already settled (timed out and
+    /// killed, say) marks a straggler process. Its calls get an immediate
+    /// deny — not a fresh approval with buttons pointing at a closed window,
+    /// and certainly not a pass.
+    #[test]
+    fn headless_gate_denies_stragglers_of_a_settled_turn() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("headless-straggler", true, 30);
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        enter_bridge_turn(&conn, "sess-headless");
+        crate::state::mark_bridge_turn_finished(&conn, "turn-1", "expired", 950).expect("settle");
+        drop(conn);
+
+        let started = std::time::Instant::now();
+        let result = headless_gate(headless_payload());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a straggler must be refused immediately, not offered an approval"
+        );
+        let out = &result["hookSpecificOutput"];
+        assert_eq!(out["permissionDecision"], "deny", "{result}");
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let approvals: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_approvals", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(approvals, 0, "no approval row for a closed window");
+    }
+
+    /// The first admission layer must not be the database. A user's own
+    /// bypass-mode terminal session (no turn token) has to sail through even
+    /// when tinyctb's state directory is a smoking crater — if admission
+    /// opened SQLite first, that breakage would surface as fail-closed
+    /// denials inside sessions the bridge does not own.
+    #[test]
+    fn headless_gate_spares_tokenless_sessions_even_with_broken_state() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("headless-broken-state", true, 30);
+        // Point the state dir at a regular FILE: any database open under it
+        // fails. The away marker is unreadable too, which must not matter —
+        // the headless gate does not consult away at all.
+        let blocker =
+            std::env::temp_dir().join(format!("tinyctb-state-blocker-{}", std::process::id()));
+        fs::write(&blocker, "not a directory").expect("blocker file");
+        std::env::set_var("TINYCTB_STATE_DIR", &blocker);
+
+        let result = headless_gate(headless_payload());
+        let _ = fs::remove_file(&blocker);
+        assert_eq!(
+            result,
+            json!({}),
+            "a tokenless session must never see the bridge's own failures"
+        );
+    }
+
+    /// An unknown persisted decision must not become execution. For the
+    /// interactive gate "refuse to guess" falls back to the terminal prompt;
+    /// for a headless turn the empty object IS the guess, so only deny works.
+    #[test]
+    fn unknown_decision_resolves_per_gate() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("unknown-decision", true, 30);
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let interactive = apply_decision(
+            &conn,
+            GateKind::Interactive,
+            "sess",
+            "Bash",
+            "garbled",
+            1000,
+        )
+        .expect("interactive");
+        assert_eq!(interactive, json!({}), "terminal prompt catches it");
+        let headless = apply_decision(&conn, GateKind::Headless, "sess", "Bash", "garbled", 1000)
+            .expect("headless");
+        assert_eq!(
+            headless["hookSpecificOutput"]["permissionDecision"], "deny",
+            "nothing catches it downstream: {headless}"
+        );
+    }
+
+    /// Away gates the interactive side only. Telegram starts headless turns
+    /// with away off too (`/new`, a Reply sent while at the keyboard), and
+    /// those turns have no terminal regardless of where the user sits — with
+    /// an away check in front, every such turn would run its gated calls
+    /// unchecked. This is the regression test for exactly that bug.
+    #[test]
+    fn headless_gate_engages_with_away_off() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("headless-away-off", false, 30);
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        enter_bridge_turn(&conn, "sess-headless");
+        drop(conn);
+        let handle = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                let Ok(approval_id) = conn.query_row(
+                    "SELECT approval_id FROM pending_approvals WHERE decision IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) else {
+                    continue;
+                };
+                if matches!(
+                    record_approval_decision(&conn, &approval_id, "allow", 2000),
+                    Ok(crate::state::ApprovalAnswer::Recorded)
+                ) {
+                    return;
+                }
+            }
+            panic!("approval row never appeared — the gate did not engage");
+        });
+        let result = headless_gate(headless_payload());
+        handle.join().expect("answering thread");
+        assert_eq!(
+            result["hookSpecificOutput"]["permissionDecision"], "allow",
+            "{result}"
+        );
+    }
+
+    /// Once a running bridge turn is established, an internal error must
+    /// DENY, not fall through: under `bypassPermissions` an empty reply is
+    /// execution, and "the config was unreadable" is not an approval.
+    #[test]
+    fn headless_gate_fails_closed_when_config_is_unreadable() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("headless-bad-config", true, 30);
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        enter_bridge_turn(&conn, "sess-headless");
+        drop(conn);
+        let config_path = crate::config::daemon_config_path().expect("config path");
+        fs::write(&config_path, "{ not json").expect("corrupt config");
+
+        let started = std::time::Instant::now();
+        let result = headless_gate(headless_payload());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "failing closed must not wait for anything"
+        );
+        let out = &result["hookSpecificOutput"];
+        assert_eq!(out["permissionDecision"], "deny", "{result}");
+        assert!(
+            out["permissionDecisionReason"]
+                .as_str()
+                .expect("reason")
+                .contains("blocked"),
+            "the reason must say the call was blocked, with the error: {result}"
+        );
+    }
+
+    /// `PreToolUse` fires for every tool call, so the tool filter is the only
+    /// thing keeping this gate off the hot path. A read must be waved through
+    /// IMMEDIATELY — not after sitting out the timeout, which would look the
+    /// same from the return value alone.
+    #[test]
+    fn headless_gate_does_not_touch_read_only_tools() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("headless-read", true, 30);
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        enter_bridge_turn(&conn, "sess-headless");
+        drop(conn);
+        let mut payload = headless_payload();
+        payload["tool_name"] = json!("Read");
+        payload["tool_input"] = json!({ "file_path": "/home/user/project/src/main.rs" });
+
+        let started = std::time::Instant::now();
+        assert_eq!(headless_gate(payload), json!({}));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an ungated tool must not wait for an answer"
+        );
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let approvals: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_approvals", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(approvals, 0, "and must not create an approval");
+        assert_eq!(
+            crate::state::pending_outbound_count(&conn).expect("pending"),
+            0,
+            "nor push anything to Telegram"
+        );
+    }
+
+    /// A tap answers in the PreToolUse contract, not the PermissionRequest
+    /// one. The two shapes are different objects, and returning the wrong one
+    /// would be read as "no opinion" — which for a headless turn means the
+    /// call runs despite the user having denied it.
+    #[test]
+    fn headless_gate_answers_in_the_pretooluse_contract() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("headless-answered", true, 30);
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        enter_bridge_turn(&conn, "sess-headless");
+        drop(conn);
+        let handle = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                let Ok(approval_id) = conn.query_row(
+                    "SELECT approval_id FROM pending_approvals WHERE decision IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) else {
+                    continue;
+                };
+                if matches!(
+                    record_approval_decision(&conn, &approval_id, "deny", 2000),
+                    Ok(crate::state::ApprovalAnswer::Recorded)
+                ) {
+                    return;
+                }
+            }
+            panic!("approval row never appeared");
+        });
+        let result = headless_gate(headless_payload());
+        handle.join().expect("answering thread");
+
+        let out = &result["hookSpecificOutput"];
+        assert_eq!(out["hookEventName"], "PreToolUse", "{result}");
+        assert_eq!(out["permissionDecision"], "deny", "{result}");
+        assert!(
+            out.get("decision").is_none(),
+            "the PermissionRequest shape must not leak into a PreToolUse reply: {result}"
+        );
+    }
+
+    /// The two gates partition tool calls on `bypassPermissions` alone. If
+    /// both engaged for the same call the user would get two Telegram
+    /// requests for it; if neither did, it would run unchecked.
+    #[test]
+    fn the_two_gates_do_not_overlap() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("gate-split", true, 30);
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        enter_bridge_turn(&conn, "sess-headless");
+        drop(conn);
+
+        // A normal interactive call is not the headless gate's business.
+        let mut interactive = headless_payload();
+        interactive["permission_mode"] = json!("default");
+        let started = std::time::Instant::now();
+        assert_eq!(headless_gate(interactive), json!({}));
+        // A bypassing call is not the interactive gate's business (covered by
+        // `gate_skips_bridge_initiated_turns`, asserted here as the other half
+        // of the same partition).
+        let mut bypassing = bash_payload();
+        bypassing["permission_mode"] = json!("bypassPermissions");
+        assert_eq!(gate(bypassing), json!({}));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "both must decline immediately, not after a timeout"
         );
     }
 
