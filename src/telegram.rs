@@ -1671,8 +1671,17 @@ fn answer_pending_question_from_reply(
     })))
 }
 
+/// answerCallbackQuery gets its own SHORT timeout. The tap's validity is
+/// ~30s total on Telegram's side, so inheriting the general API timeout
+/// (10s) would let three attempts run to ~30.4s worst case — past the very
+/// window the retries exist to hit, while dragging the whole update batch
+/// behind one tap. Two seconds is generous for this tiny call; three
+/// attempts plus backoff bound the worst case at ~6.4s.
+const CALLBACK_ACK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Answer a callback tap, retrying transient API failures WITHIN the tap's
-/// own validity window (a callback id dies on Telegram's side after ~30s).
+/// own validity window (a callback id dies on Telegram's side after ~30s —
+/// `CALLBACK_ACK_ATTEMPT_TIMEOUT` is what keeps the retries inside it).
 ///
 /// Deliberately NOT retried across cycles: parking the failed update for a
 /// later retry would either wedge the whole queue behind one poison update
@@ -1687,12 +1696,13 @@ fn acknowledge_callback_tap(
     toast: &str,
     timeout: Duration,
 ) -> std::result::Result<(), String> {
+    let attempt_timeout = timeout.min(CALLBACK_ACK_ATTEMPT_TIMEOUT);
     let mut last_error = String::new();
     for attempt in 0..3 {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(200));
         }
-        match send_callback_ack(telegram, callback_query_id, toast, timeout) {
+        match send_callback_ack(telegram, callback_query_id, toast, attempt_timeout) {
             Ok(()) => return Ok(()),
             Err(err) => last_error = format!("{err:#}"),
         }
@@ -1709,8 +1719,8 @@ fn send_callback_ack(
 ) -> Result<()> {
     #[cfg(test)]
     {
-        let _ = (telegram, timeout);
-        test_callback_acks::attempt(callback_query_id, toast)
+        let _ = telegram;
+        test_callback_acks::attempt(callback_query_id, toast, timeout)
     }
     #[cfg(not(test))]
     {
@@ -1730,9 +1740,33 @@ pub(crate) mod test_callback_acks {
     pub(crate) static FAIL: AtomicBool = AtomicBool::new(false);
     pub(crate) static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
     pub(crate) static RECORDED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    pub(crate) static TIMEOUTS: Mutex<Vec<std::time::Duration>> = Mutex::new(Vec::new());
 
-    pub(crate) fn attempt(callback_query_id: &str, toast: &str) -> anyhow::Result<()> {
+    /// RAII failure switch: `FAIL` resets on drop even when the test body
+    /// panics, so one red test cannot leak `FAIL=true` into every later
+    /// test that sends an ack.
+    pub(crate) struct FailGuard;
+
+    impl FailGuard {
+        pub(crate) fn engage() -> Self {
+            FAIL.store(true, Ordering::SeqCst);
+            FailGuard
+        }
+    }
+
+    impl Drop for FailGuard {
+        fn drop(&mut self) {
+            FAIL.store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn attempt(
+        callback_query_id: &str,
+        toast: &str,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<()> {
         ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        TIMEOUTS.lock().expect("ack lock").push(timeout);
         if FAIL.load(Ordering::SeqCst) {
             anyhow::bail!("injected ack failure");
         }
@@ -1741,6 +1775,10 @@ pub(crate) mod test_callback_acks {
             .expect("ack lock")
             .push((callback_query_id.to_string(), toast.to_string()));
         Ok(())
+    }
+
+    pub(crate) fn take_timeouts() -> Vec<std::time::Duration> {
+        std::mem::take(&mut TIMEOUTS.lock().expect("ack lock"))
     }
 
     pub(crate) fn take() -> Vec<(String, String)> {
@@ -3240,19 +3278,21 @@ mod tests {
                 "data": "claude:cb_dead"
             }
         })];
-        test_callback_acks::FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
-        let result = process_telegram_update_batch(
-            &conn,
-            &config,
-            &telegram,
-            &bot_id,
-            "telegram_offset:test",
-            &updates,
-            2000,
-            Duration::from_secs(1),
-            None,
-        );
-        test_callback_acks::FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = test_callback_acks::take_timeouts();
+        let result = {
+            let _fail = test_callback_acks::FailGuard::engage();
+            process_telegram_update_batch(
+                &conn,
+                &config,
+                &telegram,
+                &bot_id,
+                "telegram_offset:test",
+                &updates,
+                2000,
+                Duration::from_secs(10),
+                None,
+            )
+        };
         result.expect("batch must not error");
 
         assert_eq!(
@@ -3260,9 +3300,23 @@ mod tests {
             3,
             "the ack must be retried before giving up"
         );
+        // Each attempt must run under the ack-specific cap: with the general
+        // 10s API timeout, three attempts could take ~30s — past the tap's
+        // own validity and stalling the rest of the batch.
+        for timeout in test_callback_acks::take_timeouts() {
+            assert!(
+                timeout <= Duration::from_secs(2),
+                "ack attempts must use the short ack timeout, got {timeout:?}"
+            );
+        }
         assert!(
             telegram_inbound_processed(&conn, &bot_id, 7).expect("processed"),
             "a poison tap must not wedge the queue"
+        );
+        assert_eq!(
+            crate::state::get_setting_number(&conn, "telegram_offset:test").expect("offset"),
+            Some(7),
+            "the persisted offset must advance past the poison tap"
         );
         let result_json: String = conn
             .query_row(
