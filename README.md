@@ -72,16 +72,44 @@ refresh typing indicators → deliver queued notifications (with retry/backoff
 and per-event dedupe in sqlite). Local-session notifications are enqueued only
 in away mode; answers to bridge-initiated turns are always enqueued.
 
-Permission prompts inside an interactive terminal session can only be answered
-in that terminal — tinyCTB notifies you about them but deliberately has no
-remote Approve/Deny buttons. Headless turns started from Telegram run with the
-configured `permissionMode` (default `bypassPermissions`) and never block.
+Approvals work remotely on both sides. In away mode, an interactive session's
+permission prompt is pushed to Telegram with Approve / Approve-for-session /
+Deny buttons (no answer = fall back to the terminal dialog; a timeout never
+auto-approves). Headless turns started from Telegram are gated regardless of
+away mode: tools listed in `headlessApprovalTools` (default: Bash, Write,
+Edit, MultiEdit, NotebookEdit) wait for a Telegram approval on every call,
+and for them silence or any internal error means DENY — a headless turn has
+no terminal to fall back to. `AskUserQuestion` dialogs are likewise answered
+from Telegram (buttons or a text reply), and `/threads` re-offers any prompt
+you missed.
 
 ## Install
 
+**Prebuilt binary (Linux x86_64, recommended — no Rust toolchain needed):**
+
 ```bash
-cargo build --release
-cargo install --path .
+curl -fsSL https://raw.githubusercontent.com/charleschan2006-alias/tinyCTB/main/scripts/install.sh | bash
+```
+
+Installs a static musl build (runs on any Linux x86_64, no system libraries)
+to `~/.local/bin/tinyctb`, with sha256 verification. Then continue with
+`tinyctb setup` below — it does the rest (Telegram pairing, Claude Code
+hooks, daemon service).
+
+**From source (Linux / macOS, Rust ≥ 1.81; live-session delivery and
+process-identity checks are Linux-only):**
+
+```bash
+cargo install --locked --git https://github.com/charleschan2006-alias/tinyCTB
+# or, from a checkout:
+cargo install --locked --path .
+```
+
+**Releasing (maintainers):** push a version tag and CI builds, tests, and
+publishes the release automatically:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
 ```
 
 ## Quick start

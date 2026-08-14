@@ -1,0 +1,121 @@
+# Builds and publishes a GitHub Release whenever a version tag is pushed:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The binary is a STATIC musl build on purpose: a glibc build made on a new
+# distro refuses to start on an older one (and this project has been bitten
+# by cross-machine glibc drift before). Static musl runs on any Linux x86_64.
+# The dependency tree permits it: rusqlite bundles SQLite, ureq uses rustls —
+# no OpenSSL, no system libraries at all.
+#
+# Two jobs on purpose: everything that runs project code (tests, build) holds
+# READ-ONLY permissions; the only step with contents:write receives a finished
+# artifact and never touches a checkout. All third-party actions are pinned to
+# full commit SHAs — every one of them runs inside jobs with credentials, and
+# a movable tag would let the action's repo rewrite our release chain.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # v4.4.0; the build needs no git credentials after checkout, so none
+      # are left on disk for later steps (or compromised deps) to read.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      # A tag that does not match the crate version would ship a binary
+      # whose --version lies about what the release page claims.
+      - name: Assert tag matches crate version
+        run: |
+          set -euo pipefail
+          crate_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "${GITHUB_REF_NAME}" != "v${crate_version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} != crate version v${crate_version} — bump Cargo.toml or retag" >&2
+            exit 1
+          fi
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
+      # The full test suite gates the release: a tag on a red tree must fail
+      # here, not ship.
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build (static musl)
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          bin=target/x86_64-unknown-linux-musl/release/tinyctb
+          strip "$bin"
+          # Refuse to ship a dynamically linked binary: the whole point of
+          # this artifact is that it runs anywhere. readelf runs as its own
+          # statement first — inside an `if` condition, errexit is exempted
+          # and a FAILING readelf would look exactly like a static binary
+          # (measured: the gate passed on a nonexistent file when piped).
+          program_headers=$(readelf -l "$bin")
+          dynamic_section=$(readelf -d "$bin")
+          # Positive anchor first: a real ELF always has LOAD headers, so an
+          # empty/garbled readelf output can never sail through the two
+          # absence checks below.
+          if ! grep -q 'LOAD' <<<"$program_headers"; then
+            echo "no LOAD program headers — not a readable ELF" >&2
+            exit 1
+          fi
+          if grep -q 'INTERP' <<<"$program_headers"; then
+            echo "release binary has a program interpreter (dynamically linked)" >&2
+            exit 1
+          fi
+          if grep -q 'NEEDED' <<<"$dynamic_section"; then
+            echo "release binary declares dynamic dependencies" >&2
+            exit 1
+          fi
+          name="tinyctb-${GITHUB_REF_NAME}-x86_64-linux-musl"
+          mkdir "$name"
+          cp "$bin" README.md LICENSE "$name/"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      # v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-artifacts
+          path: |
+            tinyctb-*.tar.gz
+            tinyctb-*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-artifacts
+
+      # v2.4.2
+      - uses: softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe
+        with:
+          files: |
+            tinyctb-*.tar.gz
+            tinyctb-*.tar.gz.sha256
+          generate_release_notes: true
