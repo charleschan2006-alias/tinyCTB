@@ -1769,6 +1769,82 @@ pub(crate) fn socket_identity(socket_path: &str) -> (Option<u64>, Option<String>
     }
 }
 
+/// Where a session's live end actually is. `Window` and `Background` are
+/// both injectable (a reply lands in the session either way); the difference
+/// is whether the user can SEE it — a background-hosted session counted as
+/// "terminal" made the /threads census claim one more window than the screen
+/// showed (observed live, 2026-08-14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalPresence {
+    /// A terminal the user has open.
+    Window,
+    /// Alive under Claude Code's background pty host — no visible window.
+    Background,
+    /// No verified live socket at all.
+    Gone,
+}
+
+/// Same identity rule as `inject_into_live_session` (recorded inode + boot
+/// id must still match the socket on disk, unverifiable counts as dead), but
+/// without connecting — this is for display, and a connect could perturb the
+/// session.
+pub(crate) fn session_terminal_presence(
+    conn: &rusqlite::Connection,
+    thread_id: &str,
+) -> Result<TerminalPresence> {
+    // A database error is NOT `Gone`: `Gone` renders as "idle", and a state
+    // read failure dressed up as idleness is exactly the silent degradation
+    // the caller needs to display honestly.
+    let Some(socket) = crate::state::session_messaging_socket(conn, thread_id)? else {
+        return Ok(TerminalPresence::Gone);
+    };
+    if !Path::new(&socket.path).exists() {
+        return Ok(TerminalPresence::Gone);
+    }
+    let (Some(expected_inode), Some(expected_boot)) = (socket.inode, socket.boot_id) else {
+        return Ok(TerminalPresence::Gone);
+    };
+    let (current_inode, current_boot) = socket_identity(&socket.path);
+    if current_inode != Some(expected_inode)
+        || current_boot.as_deref() != Some(expected_boot.as_str())
+    {
+        return Ok(TerminalPresence::Gone);
+    }
+    // The socket name carries the owning pid; a session whose parent is the
+    // background pty host has no window. Unreadable /proc degrades to
+    // Window — the pid was just verified alive, and guessing "background"
+    // would recreate the missing-window confusion in the other direction.
+    let hosted = Path::new(&socket.path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.parse::<u32>().ok())
+        .is_some_and(parent_is_bg_pty_host);
+    if hosted {
+        Ok(TerminalPresence::Background)
+    } else {
+        Ok(TerminalPresence::Window)
+    }
+}
+
+fn parent_is_bg_pty_host(pid: u32) -> bool {
+    let ppid = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse::<u32>()
+                .ok()
+        });
+    let Some(ppid) = ppid else {
+        return false;
+    };
+    fs::read_to_string(format!("/proc/{ppid}/cmdline"))
+        .map(|cmdline| cmdline.contains("bg-pty-host"))
+        .unwrap_or(false)
+}
+
 const INJECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Deliver a message straight into a LIVE Claude session over its unix
@@ -2683,6 +2759,43 @@ mod tests {
         assert_eq!(
             status, "failed",
             "the turn must be settled so nothing keeps waiting on it"
+        );
+    }
+
+    /// The /threads liveness facts: a session with a running turn counts as
+    /// headless-active, a settled one does not; a session with no recorded
+    /// socket never counts as a live terminal.
+    #[test]
+    fn liveness_primitives_read_the_actual_state() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let conn = test_state_conn("liveness");
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-l",
+            "sess-l",
+            "/tmp/l.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            900,
+        )
+        .expect("register");
+        let running = |conn: &rusqlite::Connection| {
+            crate::state::list_running_bridge_turns(conn)
+                .expect("query")
+                .iter()
+                .any(|turn| turn.thread_id == "sess-l")
+        };
+        assert!(running(&conn));
+        crate::state::mark_bridge_turn_finished(&conn, "turn-l", "done", 950).expect("finish");
+        assert!(!running(&conn));
+        assert_eq!(
+            session_terminal_presence(&conn, "sess-l").expect("presence"),
+            TerminalPresence::Gone,
+            "no recorded socket must never read as a live terminal"
         );
     }
 

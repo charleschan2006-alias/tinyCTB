@@ -1106,6 +1106,121 @@ fn telegram_threads_failure_text(error: &anyhow::Error) -> String {
     format!("I couldn't fetch recent Claude sessions.\nError: {error:#}\n\nTry /repair if the backend looks broken.")
 }
 
+/// How many recent sessions compete for the /threads list before the limit
+/// cut. Big enough that a live terminal older than a screenful of idle
+/// churn still makes the list.
+const THREADS_CLASSIFY_POOL: u64 = 50;
+
+/// Assemble and classify the /threads candidates.
+///
+/// The pool is the recent `threads_cache` rows UNIONED with every running
+/// bridge turn: a turn started moments ago (CLI `tinyctb new`, a fresh
+/// Telegram task) has a `bridge_turns` row before its transcript or first
+/// hook produces a snapshot, and a cache-only pool made exactly those
+/// in-flight tasks vanish from the list. Missing snapshots get a minimal
+/// placeholder — better a sparse row than an invisible running task.
+/// One `list_running_bridge_turns` query serves both the union and the
+/// per-candidate headless flag.
+fn classify_recent_threads(
+    conn: &Connection,
+    classify_pool: u64,
+) -> Result<Vec<(crate::state::BridgeThreadSnapshot, render::ThreadLiveness)>> {
+    let mut pool = list_recent_thread_snapshots_from_db(conn, classify_pool)?;
+    let running_turns = crate::state::list_running_bridge_turns(conn)?;
+    // Aggregate BY SESSION first: one session can have several running turns
+    // (concurrent replies), and one placeholder per TURN would list the
+    // session twice, double it in the census, and register duplicate reply
+    // routes. The newest start stamps the placeholder's recency.
+    let mut latest_running = std::collections::HashMap::new();
+    for turn in &running_turns {
+        let started = latest_running
+            .entry(turn.thread_id.clone())
+            .or_insert(turn.started_at);
+        *started = (*started).max(turn.started_at);
+    }
+    let running = latest_running
+        .keys()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let known = pool
+        .iter()
+        .map(|snapshot| snapshot.thread_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for (thread_id, started_at) in &latest_running {
+        if known.contains(thread_id) {
+            continue;
+        }
+        pool.push(crate::state::BridgeThreadSnapshot {
+            thread_id: thread_id.clone(),
+            name: None,
+            cwd: None,
+            updated_at: Some(*started_at),
+            status_type: "active".to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: None,
+            last_preview: Some("（任务刚启动，还没有可显示的输出）".to_string()),
+            pending_prompt: None,
+            event_uid: None,
+        });
+    }
+    Ok(pool
+        .into_iter()
+        .map(|snapshot| {
+            let liveness = classify_thread_liveness(conn, &snapshot.thread_id, &running);
+            (snapshot, liveness)
+        })
+        .collect())
+}
+
+/// Classify one candidate. A terminal-state read failure becomes the
+/// `unknown` condition — displayed as exactly that; calling it "idle" would
+/// be a silent lie about a session that may be live. Loud on stderr as well.
+/// The headless flag comes from the batch set either way: the socket being
+/// unreadable does not un-know that a turn is running.
+fn classify_thread_liveness(
+    conn: &Connection,
+    thread_id: &str,
+    running: &std::collections::HashSet<String>,
+) -> render::ThreadLiveness {
+    match crate::claude::session_terminal_presence(conn, thread_id) {
+        Ok(presence) => render::ThreadLiveness {
+            presence,
+            headless: running.contains(thread_id),
+            unknown: false,
+        },
+        Err(error) => {
+            eprintln!("tinyctb: liveness read failed for {thread_id}: {error:#}");
+            render::ThreadLiveness {
+                presence: crate::claude::TerminalPresence::Gone,
+                headless: running.contains(thread_id),
+                unknown: true,
+            }
+        }
+    }
+}
+
+/// Order by liveness class (alive first), newest first inside each class,
+/// THEN cut to the display limit.
+///
+/// Recency is part of the sort KEY, not an assumption about input order: the
+/// pool mixes cache rows (DB returns newest first) with running-turn
+/// placeholders (hash-map order), and a stable sort over that mix would keep
+/// whatever accident it was handed — truncation could then keep an old task
+/// and drop a new one.
+fn order_threads_for_display(
+    mut threads: Vec<(crate::state::BridgeThreadSnapshot, render::ThreadLiveness)>,
+    limit: usize,
+) -> Vec<(crate::state::BridgeThreadSnapshot, render::ThreadLiveness)> {
+    threads.sort_by_key(|(snapshot, liveness)| {
+        (
+            liveness.order(),
+            std::cmp::Reverse(snapshot.updated_at.unwrap_or(0)),
+        )
+    });
+    threads.truncate(limit);
+    threads
+}
+
 fn execute_threads_command(
     conn: &Connection,
     telegram: &TelegramConfig,
@@ -1129,8 +1244,14 @@ fn execute_threads_command(
     };
 
     let config = load_daemon_config()?;
-    sync_state_from_sessions(conn, &config, now, limit, false)?;
-    let snapshots = list_recent_thread_snapshots_from_db(conn, limit)?;
+    let classify_pool = limit.max(THREADS_CLASSIFY_POOL);
+    sync_state_from_sessions(conn, &config, now, classify_pool, false)?;
+    // Classify BEFORE cutting to `limit`: the limit bounds what is shown,
+    // not what competes. Cutting by recency first let a fresh idle session
+    // push a slightly older LIVE terminal off the default list — the exact
+    // sessions the grouping exists to surface.
+    let classified = classify_recent_threads(conn, classify_pool)?;
+    let snapshots = order_threads_for_display(classified, limit as usize);
     if snapshots.is_empty() {
         let sent = telegram_send_text(
             telegram,
@@ -1145,9 +1266,34 @@ fn execute_threads_command(
         }));
     }
 
+    // A one-line census up front, so the grouping reads as intentional. The
+    // window/background split is the census's whole point: the window count
+    // must match what the user can actually see on screen. Counted by
+    // primary class (the same key the ordering uses), so the numbers add up
+    // to the total even for a live session that also runs a headless turn.
+    let count = |wanted: u8| {
+        snapshots
+            .iter()
+            .filter(|(_, liveness)| liveness.order() == wanted)
+            .count()
+    };
+    let mut census = format!(
+        "🧵 {} 个会话：🖥 终端 {} · 🫥 后台 {} · ⚙️ 无头 {} · 💤 空闲 {}",
+        snapshots.len(),
+        count(0),
+        count(1),
+        count(2),
+        count(3)
+    );
+    let unknown = count(4);
+    if unknown > 0 {
+        census.push_str(&format!(" · ❓ 未知 {unknown}"));
+    }
+    telegram_send_text(telegram, &census, timeout)?;
+
     let mut sent = Vec::with_capacity(snapshots.len());
     let mut render_failed = 0usize;
-    for snapshot in &snapshots {
+    for (snapshot, liveness) in &snapshots {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             break;
         }
@@ -1155,7 +1301,8 @@ fn execute_threads_command(
         // snapshot while the transport still works, so report it in place and
         // keep listing the rest.
         let mut prepared =
-            match prepare_telegram_thread_snapshot_delivery(&telegram.chat_id, snapshot) {
+            match prepare_telegram_thread_snapshot_delivery(&telegram.chat_id, snapshot, *liveness)
+            {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     render_failed += 1;
@@ -3332,6 +3479,220 @@ mod tests {
         assert!(
             result_json.contains("\"ackDelivered\":false"),
             "{result_json}"
+        );
+    }
+
+    /// The REAL error chain, not a hand-built `unknown: true`: a database
+    /// whose schema is missing makes `session_terminal_presence` genuinely
+    /// fail, and the production classifier must turn that into the unknown
+    /// condition rather than "idle" (or a crash). Also pins the prune rule
+    /// that keeps the running-turns set correct: settled history is
+    /// removable, running rows never are.
+    #[test]
+    fn a_real_read_failure_classifies_as_unknown() {
+        // No schema at all: every table lookup errors.
+        let broken = rusqlite::Connection::open_in_memory().expect("raw db");
+        let running = std::collections::HashSet::new();
+        let liveness = classify_thread_liveness(&broken, "thr-broken", &running);
+        assert!(liveness.unknown, "a query error must classify as unknown");
+        assert!(
+            !liveness.headless && liveness.presence == crate::claude::TerminalPresence::Gone,
+            "and must not invent liveness facts: {liveness:?}"
+        );
+        // But an unreadable socket must not ERASE facts either: the batch
+        // set already knows this thread has a running turn.
+        let mut known_running = std::collections::HashSet::new();
+        known_running.insert("thr-broken".to_string());
+        let liveness = classify_thread_liveness(&broken, "thr-broken", &known_running);
+        assert!(liveness.unknown);
+        assert!(
+            liveness.headless,
+            "unknown terminal state must keep the known running turn: {liveness:?}"
+        );
+
+        // The healthy path on a real db, driven through the same classifier.
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-c",
+            "sess-c",
+            "/tmp/c.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        let classified = classify_recent_threads(&conn, 50).expect("classify");
+        let (_, liveness) = classified
+            .iter()
+            .find(|(snapshot, _)| snapshot.thread_id == "sess-c")
+            .expect("a running turn with NO threads_cache row must still be listed");
+        assert!(!liveness.unknown);
+        assert!(
+            liveness.headless,
+            "the batch set must feed the classifier: {liveness:?}"
+        );
+
+        // Pruning: a settled turn far past retention goes, the running one
+        // stays whatever its age.
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-old",
+            "sess-old",
+            "/tmp/o.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            500,
+        )
+        .expect("register old");
+        crate::state::mark_bridge_turn_finished(&conn, "turn-old", "done", 600).expect("finish");
+        let far_future = 500 + 31 * 24 * 60 * 60 * 1000;
+        crate::state::prune_state_logs(&conn, far_future).expect("prune");
+        assert!(
+            crate::state::list_running_bridge_turns(&conn)
+                .expect("after prune")
+                .iter()
+                .any(|turn| turn.thread_id == "sess-c"),
+            "a running turn must survive pruning regardless of age"
+        );
+        let turns: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bridge_turns", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(turns, 1, "the settled turn must be pruned");
+    }
+
+    /// One session, one row — however many running turns it has. A
+    /// per-turn placeholder would list the session twice, double the census
+    /// and register duplicate reply routes.
+    #[test]
+    fn concurrent_turns_of_one_session_collapse_to_one_row() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        for (turn_id, started) in [("turn-a", 1000), ("turn-b", 3000), ("turn-c", 2000)] {
+            crate::state::register_bridge_turn(
+                &conn,
+                turn_id,
+                "sess-multi",
+                "/tmp/m.log",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                started,
+            )
+            .expect("register");
+        }
+        let classified = classify_recent_threads(&conn, 50).expect("classify");
+        let rows = classified
+            .iter()
+            .filter(|(snapshot, _)| snapshot.thread_id == "sess-multi")
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1, "one session must render once: {rows:?}");
+        assert_eq!(
+            rows[0].0.updated_at,
+            Some(3000),
+            "the placeholder carries the NEWEST turn's start"
+        );
+    }
+
+    /// Placeholders and cache rows mix in one pool; within a class the sort
+    /// key (not input order) must put the newest first, or truncation keeps
+    /// an old task and drops a new one.
+    #[test]
+    fn newest_task_survives_truncation_regardless_of_input_order() {
+        use crate::claude::TerminalPresence;
+        let entry = |id: &str, updated: u64| {
+            (
+                crate::state::BridgeThreadSnapshot {
+                    thread_id: id.to_string(),
+                    name: None,
+                    cwd: None,
+                    updated_at: Some(updated),
+                    status_type: "active".to_string(),
+                    status_flags: vec![],
+                    last_turn_status: None,
+                    last_preview: None,
+                    pending_prompt: None,
+                    event_uid: None,
+                },
+                render::ThreadLiveness {
+                    presence: TerminalPresence::Gone,
+                    headless: true,
+                    unknown: false,
+                },
+            )
+        };
+        // Oldest-first input — the exact order `list_running_bridge_turns`
+        // hands back.
+        let pool = vec![entry("task-old", 100), entry("task-new", 900)];
+        let shown = order_threads_for_display(pool, 1);
+        assert_eq!(
+            shown[0].0.thread_id, "task-new",
+            "truncation must keep the newest task"
+        );
+    }
+
+    /// The display limit cuts AFTER liveness ordering: an older live
+    /// terminal must survive a screenful of newer idle sessions. Cutting by
+    /// recency first (the original shape) evicted exactly the sessions the
+    /// grouping exists to surface.
+    #[test]
+    fn display_limit_keeps_live_sessions_over_newer_idle_ones() {
+        use crate::claude::TerminalPresence;
+        let snapshot = |id: &str, updated: u64| crate::state::BridgeThreadSnapshot {
+            thread_id: id.to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(updated),
+            status_type: "active".to_string(),
+            status_flags: vec![],
+            last_turn_status: None,
+            last_preview: None,
+            pending_prompt: None,
+            event_uid: None,
+        };
+        let live = |presence| render::ThreadLiveness {
+            presence,
+            headless: false,
+            unknown: false,
+        };
+        // Recency order, as the DB returns them: three fresh idle sessions,
+        // then an older live terminal, then an older running headless turn.
+        let pool = vec![
+            (snapshot("idle-newest", 500), live(TerminalPresence::Gone)),
+            (snapshot("idle-2", 400), live(TerminalPresence::Gone)),
+            (snapshot("idle-3", 300), live(TerminalPresence::Gone)),
+            (
+                snapshot("terminal-old", 200),
+                live(TerminalPresence::Window),
+            ),
+            (
+                snapshot("headless-old", 100),
+                render::ThreadLiveness {
+                    presence: TerminalPresence::Gone,
+                    headless: true,
+                    unknown: false,
+                },
+            ),
+        ];
+        let shown = order_threads_for_display(pool, 3);
+        let ids = shown
+            .iter()
+            .map(|(snapshot, _)| snapshot.thread_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec!["terminal-old", "headless-old", "idle-newest"],
+            "alive sessions outrank newer idle ones; recency breaks ties"
         );
     }
 

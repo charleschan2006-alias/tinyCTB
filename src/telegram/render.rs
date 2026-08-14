@@ -264,6 +264,11 @@ pub(crate) fn prepare_telegram_delivery(
         telegram_event_title(event_type, event).to_string(),
         format!("🧵 {}", telegram_event_display_name(event)),
     ];
+    // A snapshot's liveness line: what is behind the session right now, i.e.
+    // where a reply to this very message would land.
+    if let Some(status_line) = event.get("statusLine").and_then(Value::as_str) {
+        lines.push(status_line.to_string());
+    }
     if let Some(project) = event.pointer("/thread/project").and_then(Value::as_str) {
         lines.push(format!("📁 {project}"));
     }
@@ -435,6 +440,13 @@ fn thread_snapshot_event(snapshot: &BridgeThreadSnapshot) -> Value {
         &snapshot.thread_id,
     );
     let display_name = trim_for_telegram_line(&display_name, 160);
+    // Two sessions doing similar work get identical derived names; the short
+    // id is what makes them tell apart (and names the exact session a Reply
+    // will continue).
+    let display_name = format!(
+        "{display_name} · {}",
+        snapshot.thread_id.chars().take(8).collect::<String>()
+    );
     // The rendered body concatenates question AND preview, so the two share
     // one budget — /threads snapshots must stay within a single Telegram
     // message, and two independent 3000-char fields would overflow it.
@@ -485,11 +497,78 @@ fn thread_snapshot_event(snapshot: &BridgeThreadSnapshot) -> Value {
     })
 }
 
+/// What is behind a session RIGHT NOW — the fact that decides where a reply
+/// to it lands, plus whether the user can SEE it. Four states, not two:
+/// most sessions are dormant (Idle), and a live session may have no window
+/// at all (hosted by Claude's background pty host).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ThreadLiveness {
+    /// Verified live messaging socket, and where its window is (or isn't).
+    pub(crate) presence: crate::claude::TerminalPresence,
+    /// A running bridge turn: a Telegram-started task is working now.
+    pub(crate) headless: bool,
+    /// The state could not be READ (database error). Shown as its own
+    /// condition: a read failure dressed up as "idle" would be a silent lie.
+    pub(crate) unknown: bool,
+}
+
+impl ThreadLiveness {
+    /// Sort key for /threads: what is alive comes before what is dormant,
+    /// and what has a window comes before what runs unseen.
+    pub(crate) fn order(self) -> u8 {
+        use crate::claude::TerminalPresence::*;
+        if self.unknown {
+            // A known running turn outranks the unknown: the task is a fact
+            // even when the terminal state is not.
+            return if self.headless { 2 } else { 4 };
+        }
+        match (self.presence, self.headless) {
+            (Window, _) => 0,
+            (Background, _) => 1,
+            (Gone, true) => 2,
+            (Gone, false) => 3,
+        }
+    }
+
+    pub(crate) fn status_line(self) -> String {
+        use crate::claude::TerminalPresence::*;
+        if self.unknown {
+            // The socket being unreadable does not un-know a running turn.
+            return if self.headless {
+                "⚙️ 无头任务运行中 + ❓ 终端状态读取失败".to_string()
+            } else {
+                "❓ 状态读取失败（无法判断会话在做什么；回复仍会尝试送达）".to_string()
+            };
+        }
+        let base = match self.presence {
+            Window => "🖥 终端活跃（回复直达终端）",
+            Background => "🫥 后台运行（无终端窗口，回复仍直达会话）",
+            // A running `-p` turn accepts no input: a Reply here does NOT
+            // join it, it spawns a SECOND concurrent resume. Say so — the
+            // status line's one job is where a reply actually lands.
+            Gone if self.headless => "⚙️ 无头任务运行中（回复不会进入它，而是另起一个续跑）",
+            Gone => "💤 空闲（回复会无头续跑）",
+        };
+        // A live session can also be running a headless turn; hiding either
+        // side would lie.
+        if self.headless && self.presence != Gone {
+            format!("{base} + ⚙️ 无头任务")
+        } else {
+            base.to_string()
+        }
+    }
+}
+
 pub(crate) fn prepare_telegram_thread_snapshot_delivery(
     chat_id: &str,
     snapshot: &BridgeThreadSnapshot,
+    liveness: ThreadLiveness,
 ) -> Result<PreparedTelegramDelivery> {
-    let prepared = prepare_telegram_delivery(chat_id, &thread_snapshot_event(snapshot))?;
+    let mut event = thread_snapshot_event(snapshot);
+    if let Some(object) = event.as_object_mut() {
+        object.insert("statusLine".to_string(), json!(liveness.status_line()));
+    }
+    let prepared = prepare_telegram_delivery(chat_id, &event)?;
     if prepared.payloads.len() != 1 {
         bail!("thread snapshot Telegram delivery exceeded one message");
     }
@@ -844,6 +923,102 @@ mod tests {
 
     /// Regression: the body concatenates question AND preview, so a snapshot
     /// with both fields long must still fit one Telegram message — otherwise
+    /// The liveness line tells the user where a reply to THIS message will
+    /// land — the one fact that differs between the three session states.
+    #[test]
+    fn snapshot_message_carries_its_liveness_line() {
+        let base = BridgeThreadSnapshot {
+            thread_id: "thr-live".to_string(),
+            name: Some("session".to_string()),
+            cwd: Some("/home/user/x".to_string()),
+            updated_at: Some(42),
+            status_type: "active".to_string(),
+            status_flags: vec![],
+            last_turn_status: None,
+            last_preview: Some("最近的回答".to_string()),
+            pending_prompt: None,
+            event_uid: None,
+        };
+        let case = |presence: crate::claude::TerminalPresence, headless: bool, needle: &str| {
+            let prepared = prepare_telegram_thread_snapshot_delivery(
+                "999",
+                &base,
+                ThreadLiveness {
+                    presence,
+                    headless,
+                    unknown: false,
+                },
+            )
+            .expect("render");
+            let text = prepared.payloads[0]["text"]
+                .as_str()
+                .expect("text")
+                .to_string();
+            assert!(text.contains(needle), "missing {needle:?} in: {text}");
+            // The short id keeps same-named sessions apart.
+            assert!(text.contains("thr-live"), "short id missing: {text}");
+        };
+        use crate::claude::TerminalPresence::*;
+        case(Window, false, "🖥 终端活跃");
+        case(Background, false, "🫥 后台运行");
+        case(Gone, true, "另起一个续跑");
+        case(Gone, false, "💤 空闲");
+        case(Window, true, "+ ⚙️ 无头任务");
+        // A read failure must not masquerade as idleness.
+        let prepared = prepare_telegram_thread_snapshot_delivery(
+            "999",
+            &base,
+            ThreadLiveness {
+                presence: Gone,
+                headless: false,
+                unknown: true,
+            },
+        )
+        .expect("render");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert!(text.contains("❓ 状态读取失败"), "{text}");
+        assert!(
+            !text.contains("💤"),
+            "unknown must not display as idle: {text}"
+        );
+    }
+
+    /// /threads groups by what is alive: terminals, then running headless
+    /// turns, then the idle rest.
+    #[test]
+    fn liveness_orders_alive_before_dormant() {
+        use crate::claude::TerminalPresence::*;
+        let window = ThreadLiveness {
+            presence: Window,
+            headless: false,
+            unknown: false,
+        };
+        let background = ThreadLiveness {
+            presence: Background,
+            headless: false,
+            unknown: false,
+        };
+        let headless = ThreadLiveness {
+            presence: Gone,
+            headless: true,
+            unknown: false,
+        };
+        let idle = ThreadLiveness {
+            presence: Gone,
+            headless: false,
+            unknown: false,
+        };
+        assert!(window.order() < background.order());
+        assert!(background.order() < headless.order());
+        assert!(headless.order() < idle.order());
+        let unknown = ThreadLiveness {
+            presence: Gone,
+            headless: false,
+            unknown: true,
+        };
+        assert!(idle.order() < unknown.order());
+    }
+
     /// prepare_telegram_thread_snapshot_delivery bails and /threads dies.
     #[test]
     fn snapshot_with_long_question_and_long_preview_stays_one_message() {
@@ -865,8 +1040,16 @@ mod tests {
             event_uid: None,
         };
 
-        let prepared = prepare_telegram_thread_snapshot_delivery("999", &snapshot)
-            .expect("long snapshot must not fail to render");
+        let prepared = prepare_telegram_thread_snapshot_delivery(
+            "999",
+            &snapshot,
+            ThreadLiveness {
+                presence: crate::claude::TerminalPresence::Gone,
+                headless: false,
+                unknown: false,
+            },
+        )
+        .expect("long snapshot must not fail to render");
         assert_eq!(
             prepared.payloads.len(),
             1,
@@ -1065,8 +1248,16 @@ mod tests {
             event_uid: None,
         };
 
-        let prepared = prepare_telegram_thread_snapshot_delivery("999", &snapshot)
-            .expect("prepared thread snapshot");
+        let prepared = prepare_telegram_thread_snapshot_delivery(
+            "999",
+            &snapshot,
+            ThreadLiveness {
+                presence: crate::claude::TerminalPresence::Gone,
+                headless: false,
+                unknown: false,
+            },
+        )
+        .expect("prepared thread snapshot");
 
         assert_eq!(prepared.thread_id.as_deref(), Some("thr_done"));
         assert_eq!(

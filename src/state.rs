@@ -483,7 +483,14 @@ pub(crate) fn prune_state_logs(conn: &Connection, now: u64) -> Result<usize> {
         "DELETE FROM dialog_messages WHERE created_at < ?1",
         params![sql_cutoff],
     )?;
-    Ok(inbound + actions + injections + dialogs)
+    // Settled turns are history; running rows are load-bearing (liveness,
+    // crash detection) and are never pruned regardless of age.
+    let turns = conn.execute(
+        "DELETE FROM bridge_turns
+         WHERE status != 'running' AND COALESCE(completed_at, started_at) < ?1",
+        params![sql_cutoff],
+    )?;
+    Ok(inbound + actions + injections + dialogs + turns)
 }
 
 /// Injection debts are short-lived by design: settled ones are history and
