@@ -490,7 +490,22 @@ pub(crate) fn prune_state_logs(conn: &Connection, now: u64) -> Result<usize> {
          WHERE status != 'running' AND COALESCE(completed_at, started_at) < ?1",
         params![sql_cutoff],
     )?;
-    Ok(inbound + actions + injections + dialogs + turns)
+    // Settled or long-expired prompts are history too — /threads scans these
+    // tables on every call. The not-open guard is redundant for rows a whole
+    // retention period old (their windows are minutes, not weeks) but keeps
+    // the invariant provable: an OPEN prompt is never pruned, whatever its
+    // age says.
+    let approvals = conn.execute(
+        "DELETE FROM pending_approvals
+         WHERE created_at < ?1 AND (decision IS NOT NULL OR expires_at < ?1)",
+        params![sql_cutoff],
+    )?;
+    let questions = conn.execute(
+        "DELETE FROM pending_questions
+         WHERE created_at < ?1 AND (answer IS NOT NULL OR expires_at < ?1)",
+        params![sql_cutoff],
+    )?;
+    Ok(inbound + actions + injections + dialogs + turns + approvals + questions)
 }
 
 /// Injection debts are short-lived by design: settled ones are history and
@@ -703,6 +718,8 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "threads_cache", "socket_boot_id", "TEXT")?;
     ensure_column(conn, "telegram_command_routes", "payload_json", "TEXT")?;
     ensure_column(conn, "telegram_callback_routes", "approval_id", "TEXT")?;
+    ensure_column(conn, "pending_questions", "multi_select", "INTEGER")?;
+    ensure_column(conn, "pending_approvals", "headless", "INTEGER")?;
     ensure_column(conn, "telegram_callback_routes", "question_id", "TEXT")?;
     ensure_column(conn, "telegram_callback_routes", "answer", "TEXT")?;
     ensure_column(
@@ -731,6 +748,15 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "telegram_inbound_log", "result_action", "TEXT")?;
     ensure_column(conn, "telegram_inbound_log", "backend_transport", "TEXT")?;
     ensure_column(conn, "telegram_inbound_log", "backend_pid", "INTEGER")?;
+    // Partial indexes for the /threads open-prompt scan: only unsettled rows
+    // are indexed, so the index stays tiny however much settled history
+    // accumulates (and pruning keeps that bounded too).
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_pending_questions_open
+             ON pending_questions(expires_at, created_at) WHERE answer IS NULL;
+         CREATE INDEX IF NOT EXISTS idx_pending_approvals_open
+             ON pending_approvals(expires_at, created_at) WHERE decision IS NULL;",
+    )?;
     Ok(())
 }
 
@@ -1918,18 +1944,21 @@ pub(crate) fn create_pending_approval(
     thread_id: &str,
     tool_name: &str,
     summary: &str,
+    headless: bool,
     now: u64,
     expires_at: u64,
 ) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO pending_approvals(
-            approval_id, thread_id, tool_name, summary, created_at, decision, decided_at, expires_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)",
+            approval_id, thread_id, tool_name, summary, headless, created_at, decision,
+            decided_at, expires_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7)",
         params![
             approval_id,
             thread_id,
             tool_name,
             summary,
+            headless as i64,
             to_sql_i64(now)?,
             to_sql_i64(expires_at)?
         ],
@@ -2111,30 +2140,137 @@ pub(crate) fn pending_approval_row(
 
 // --- questions the session is blocked on -----------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_pending_question(
     conn: &Connection,
     question_id: &str,
     thread_id: &str,
     question: &str,
     options: &[String],
+    multi_select: bool,
     now: u64,
     expires_at: u64,
 ) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO pending_questions(
-            question_id, thread_id, question, options_json, created_at, expires_at,
-            message_id, answer, answered_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL)",
+            question_id, thread_id, question, options_json, multi_select, created_at,
+            expires_at, message_id, answer, answered_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL)",
         params![
             question_id,
             thread_id,
             question,
             serde_json::to_string(options)?,
+            multi_select as i64,
             to_sql_i64(now)?,
             to_sql_i64(expires_at)?
         ],
     )?;
     Ok(())
+}
+
+/// A prompt that is still WAITING on the user: its hook is blocked polling
+/// the row this very moment, so a fresh set of answer buttons — on a
+/// /threads message, say — feeds the same row and works exactly like the
+/// original notification's buttons. One-answer semantics stay with the row,
+/// not with any particular message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OpenPrompt {
+    Approval {
+        approval_id: String,
+        summary: String,
+        /// The GATE KIND at creation time, replayed verbatim: what a timeout
+        /// does is a property of the approval, not of whatever the session
+        /// happens to look like when /threads reoffers it.
+        headless: bool,
+    },
+    Question {
+        question_id: String,
+        question: String,
+        options: Vec<String>,
+        multi_select: bool,
+    },
+}
+
+/// Every thread's open prompt in two queries (not 2×N). An approval wins
+/// over a question for the same thread — it blocks a tool call mid-flight.
+/// Only unexpired, unanswered rows count: a settled prompt's buttons would
+/// be refused anyway, and reoffering one would just advertise a dead window.
+pub(crate) fn open_prompts(
+    conn: &Connection,
+    now: u64,
+) -> Result<std::collections::HashMap<String, OpenPrompt>> {
+    let mut prompts = std::collections::HashMap::new();
+    // `>=`: the answer side treats `now == expires_at` as still answerable
+    // (expiry there is `now > expires_at`), so the open side must agree —
+    // an off-by-one here would refuse to reoffer a prompt that a tap could
+    // still legitimately answer.
+    let mut questions = conn.prepare(
+        "SELECT thread_id, question_id, question, options_json, multi_select
+         FROM pending_questions
+         WHERE answer IS NULL AND expires_at >= ?1
+         ORDER BY created_at ASC",
+    )?;
+    let rows = questions.query_map(params![to_sql_i64(now)?], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (thread_id, question_id, question, options_json, multi_select) = row?;
+        let options = serde_json::from_str::<Vec<String>>(&options_json).unwrap_or_default();
+        // ASC iteration + insert: the newest open question per thread wins.
+        // A legacy NULL (row created before the column existed) is treated
+        // as multi-select, i.e. NO one-tap buttons: guessing "single" could
+        // submit one option of what was really a multi-select and silently
+        // drop the rest. The reply path accepts both shapes either way.
+        let multi_select = multi_select.map(|value| value != 0).unwrap_or(true);
+        prompts.insert(
+            thread_id,
+            OpenPrompt::Question {
+                question_id,
+                question,
+                options,
+                multi_select,
+            },
+        );
+    }
+    let mut approvals = conn.prepare(
+        "SELECT thread_id, approval_id, summary, headless
+         FROM pending_approvals
+         WHERE decision IS NULL AND expires_at >= ?1
+         ORDER BY created_at ASC",
+    )?;
+    let rows = approvals.query_map(params![to_sql_i64(now)?], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (thread_id, approval_id, summary, headless) = row?;
+        // A legacy NULL (row created before the column existed) claims
+        // HEADLESS — the urgency-safe lie: "timeout denies" makes the user
+        // answer promptly, and if the approval was really interactive the
+        // terminal dialog still catches an ignored one. Claiming interactive
+        // the other way would invite ignoring a task that dies on timeout.
+        let headless = headless.map(|value| value != 0).unwrap_or(true);
+        prompts.insert(
+            thread_id,
+            OpenPrompt::Approval {
+                approval_id,
+                summary,
+                headless,
+            },
+        );
+    }
+    Ok(prompts)
 }
 
 /// Remember which Telegram message carries this question, so a text reply to

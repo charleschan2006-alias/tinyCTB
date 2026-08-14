@@ -325,43 +325,14 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
         &thread_id,
         &tool_name,
         &summary,
+        kind == GateKind::Headless,
         now,
         now + wait.as_millis() as u64,
     )?;
 
     // The buttons are registered before the message is sent so the callback
     // can be resolved the moment the user taps.
-    let mut buttons = Vec::new();
-    for (action, label) in [
-        (TelegramCallbackAction::Approve, "✅ 允许"),
-        (TelegramCallbackAction::ApproveSession, "🔁 本会话都允许"),
-        (TelegramCallbackAction::Deny, "❌ 拒绝"),
-    ] {
-        let callback_id = format!(
-            "ap{}",
-            generate_session_uuid()?
-                .replace('-', "")
-                .chars()
-                .take(16)
-                .collect::<String>()
-        );
-        insert_telegram_callback_route(
-            &conn,
-            &TelegramCallbackRoute {
-                callback_id: callback_id.clone(),
-                chat_id: telegram.chat_id.clone(),
-                message_id: None,
-                thread_id: thread_id.clone(),
-                action,
-                approval_id: Some(approval_id.clone()),
-                question_id: None,
-                answer: None,
-            },
-            now,
-        )?;
-        buttons
-            .push(json!({ "text": label, "callbackId": callback_id, "action": action.as_str() }));
-    }
+    let buttons = approval_answer_buttons(&conn, &telegram.chat_id, &thread_id, &approval_id, now)?;
 
     // Whether silence will deny is part of the request, not a footnote: the
     // user decides differently when "ignore it" means "the task stops here".
@@ -519,70 +490,26 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         &thread_id,
         &question_text,
         &options,
+        multi_select,
         now,
         now + wait.as_millis() as u64,
     )?;
 
-    let mut buttons = Vec::new();
-    for (index, label) in options.iter().enumerate().take(8) {
-        if multi_select {
-            break;
-        }
-        let callback_id = format!(
-            "qa{}",
-            generate_session_uuid()?
-                .replace('-', "")
-                .chars()
-                .take(16)
-                .collect::<String>()
-        );
-        insert_telegram_callback_route(
+    let buttons = if multi_select {
+        Vec::new()
+    } else {
+        question_answer_buttons(
             &conn,
-            &TelegramCallbackRoute {
-                callback_id: callback_id.clone(),
-                chat_id: telegram.chat_id.clone(),
-                message_id: None,
-                thread_id: thread_id.clone(),
-                action: TelegramCallbackAction::AnswerQuestion,
-                approval_id: None,
-                question_id: Some(question_id.clone()),
-                answer: Some(label.clone()),
-            },
+            &telegram.chat_id,
+            &thread_id,
+            &question_id,
+            &options,
             now,
-        )?;
-        // Colour makes a row read as a button; the letter makes options
-        // distinguishable at a glance (and is what a text reply can name).
-        // Unicode has no full A–Z coloured-letter set — 🅰️🅱️ stop at B and
-        // regional indicators (🇦🇧🇨) render flat on some clients — so a
-        // saturated dot supplies the colour and the letter follows it.
-        const MARKERS: [&str; 8] = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "🟤", "⚫"];
-        let marker = MARKERS[index.min(MARKERS.len() - 1)];
-        let letter = (b'A' + index as u8) as char;
-        buttons.push(json!({
-            "text": format!("{marker}{letter} {}", truncate_tool_detail(label)),
-            "callbackId": callback_id,
-            "action": TelegramCallbackAction::AnswerQuestion.as_str(),
-            "answer": label
-        }));
-    }
+        )?
+    };
 
     let cwd = payload.get("cwd").and_then(Value::as_str);
-    // When the options are buttons, listing them in the body too makes the
-    // buttons read as a duplicate block of text — the body keeps just the
-    // question. Only the no-button paths spell the options out.
-    let body = if options.is_empty() {
-        question_text.clone()
-    } else if multi_select {
-        let listed = options
-            .iter()
-            .enumerate()
-            .map(|(index, label)| format!("{}. {label}", (b'A' + index as u8) as char))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("{question_text}\n\n{listed}\n\n（多选）回复本消息，逗号分隔，例如 A,C")
-    } else {
-        question_text.clone()
-    };
+    let body = question_body(&question_text, &options, multi_select);
     let event = json!({
         "type": "question_request",
         "threadId": thread_id,
@@ -721,6 +648,122 @@ fn apply_decision(
                  so {tool_name} was not run"
             ))),
         },
+    }
+}
+
+/// Fresh answer buttons for an OPEN approval, with their callback routes
+/// registered. Shared by the gate's original push and by /threads reoffers:
+/// the blocked hook polls the ROW, so any registered button that writes the
+/// row answers it — whichever message the user happens to have in front of
+/// them. One-answer-per-approval is enforced by the row, not the message.
+pub(crate) fn approval_answer_buttons(
+    conn: &rusqlite::Connection,
+    chat_id: &str,
+    thread_id: &str,
+    approval_id: &str,
+    now: u64,
+) -> Result<Vec<Value>> {
+    let mut buttons = Vec::new();
+    for (action, label) in [
+        (TelegramCallbackAction::Approve, "✅ 允许"),
+        (TelegramCallbackAction::ApproveSession, "🔁 本会话都允许"),
+        (TelegramCallbackAction::Deny, "❌ 拒绝"),
+    ] {
+        let callback_id = format!(
+            "ap{}",
+            generate_session_uuid()?
+                .replace('-', "")
+                .chars()
+                .take(16)
+                .collect::<String>()
+        );
+        insert_telegram_callback_route(
+            conn,
+            &TelegramCallbackRoute {
+                callback_id: callback_id.clone(),
+                chat_id: chat_id.to_string(),
+                message_id: None,
+                thread_id: thread_id.to_string(),
+                action,
+                approval_id: Some(approval_id.to_string()),
+                question_id: None,
+                answer: None,
+            },
+            now,
+        )?;
+        buttons
+            .push(json!({ "text": label, "callbackId": callback_id, "action": action.as_str() }));
+    }
+    Ok(buttons)
+}
+
+/// Fresh option buttons for an OPEN question (single-select only — a
+/// multi-select tap would submit one choice and drop the rest). Same shared
+/// contract as `approval_answer_buttons`.
+pub(crate) fn question_answer_buttons(
+    conn: &rusqlite::Connection,
+    chat_id: &str,
+    thread_id: &str,
+    question_id: &str,
+    options: &[String],
+    now: u64,
+) -> Result<Vec<Value>> {
+    let mut buttons = Vec::new();
+    for (index, label) in options.iter().enumerate().take(8) {
+        let callback_id = format!(
+            "qa{}",
+            generate_session_uuid()?
+                .replace('-', "")
+                .chars()
+                .take(16)
+                .collect::<String>()
+        );
+        insert_telegram_callback_route(
+            conn,
+            &TelegramCallbackRoute {
+                callback_id: callback_id.clone(),
+                chat_id: chat_id.to_string(),
+                message_id: None,
+                thread_id: thread_id.to_string(),
+                action: TelegramCallbackAction::AnswerQuestion,
+                approval_id: None,
+                question_id: Some(question_id.to_string()),
+                answer: Some(label.clone()),
+            },
+            now,
+        )?;
+        // Colour makes a row read as a button; the letter makes options
+        // distinguishable at a glance (and is what a text reply can name).
+        // Unicode has no full A–Z coloured-letter set — 🅰️🅱️ stop at B and
+        // regional indicators (🇦🇧🇨) render flat on some clients — so a
+        // saturated dot supplies the colour and the letter follows it.
+        const MARKERS: [&str; 8] = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "🟤", "⚫"];
+        let marker = MARKERS[index.min(MARKERS.len() - 1)];
+        let letter = (b'A' + index as u8) as char;
+        buttons.push(json!({
+            "text": format!("{marker}{letter} {}", truncate_tool_detail(label)),
+            "callbackId": callback_id,
+            "action": TelegramCallbackAction::AnswerQuestion.as_str(),
+            "answer": label
+        }));
+    }
+    Ok(buttons)
+}
+
+/// The question message's body. When the options ARE the buttons, listing
+/// them in the body too makes the buttons read as a duplicate block of
+/// text — only the no-button paths (multi-select) spell the options out.
+pub(crate) fn question_body(question: &str, options: &[String], multi_select: bool) -> String {
+    if multi_select && !options.is_empty() {
+        let listed = options
+            .iter()
+            .enumerate()
+            .map(|(index, label)| format!("{}. {label}", (b'A' + index as u8) as char))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{question}\n\n{listed}\n\n（多选）回复本消息，逗号分隔，例如 A,C")
+    } else {
+        question.to_string()
     }
 }
 
@@ -1401,6 +1444,7 @@ mod tests {
             "sess-race",
             "Bash",
             "Bash: ls",
+            false,
             1000,
             5000,
         )
@@ -1446,6 +1490,7 @@ mod tests {
                     "sess-race",
                     "Bash",
                     "Bash: ls",
+                    false,
                     1000,
                     5000,
                 )
@@ -1503,6 +1548,7 @@ mod tests {
             "sess-race",
             "Bash",
             "Bash: ls",
+            false,
             1000,
             5000,
         )

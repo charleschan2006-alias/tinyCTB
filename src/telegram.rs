@@ -444,6 +444,7 @@ pub(crate) fn extract_telegram_command_prompt_reply(
 /// one the Telegram client spins on the tap for ~30s and then shows nothing,
 /// which reads as "the bridge hung" (observed live, 2026-08-13). Only taps
 /// that are not ours to answer stay silent.
+#[derive(Debug)]
 pub(crate) enum TelegramCallbackLookup {
     /// An unused route: record the answer and consume it.
     Route(RoutedTelegramCallback),
@@ -1121,10 +1122,103 @@ const THREADS_CLASSIFY_POOL: u64 = 50;
 /// placeholder — better a sparse row than an invisible running task.
 /// One `list_running_bridge_turns` query serves both the union and the
 /// per-candidate headless flag.
+/// The /threads row for a session whose prompt is still open: shaped exactly
+/// like the gate's original approval/question event, so the whole delivery
+/// machinery (inline keyboard, route stamping, dialog registration for text
+/// replies) applies unchanged.
+fn reoffer_prompt_event(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    snapshot: &crate::state::BridgeThreadSnapshot,
+    liveness: render::ThreadLiveness,
+    prompt: &crate::state::OpenPrompt,
+    now: u64,
+) -> Result<Value> {
+    let short_id = snapshot.thread_id.chars().take(8).collect::<String>();
+    let display_name = match snapshot.name.as_deref() {
+        Some(name) if !name.trim().is_empty() => format!("{name} · {short_id}"),
+        _ => short_id.clone(),
+    };
+    let thread = json!({
+        "threadId": snapshot.thread_id,
+        "displayName": display_name,
+        "project": crate::projects::derive_project_label(snapshot.cwd.as_deref()),
+        "cwd": snapshot.cwd,
+    });
+    match prompt {
+        crate::state::OpenPrompt::Approval {
+            approval_id,
+            summary,
+            headless,
+        } => {
+            let buttons = crate::approvals::approval_answer_buttons(
+                conn,
+                &telegram.chat_id,
+                &snapshot.thread_id,
+                approval_id,
+                now,
+            )?;
+            Ok(json!({
+                "type": "approval_request",
+                "threadId": snapshot.thread_id,
+                "approvalId": approval_id,
+                "observedAt": now,
+                "eventKey": format!("approval-reoffer:{approval_id}:{now}"),
+                "lastPreview": summary,
+                "buttons": buttons,
+                // The gate kind persisted at creation, NOT the session's
+                // current look: what a timeout does was fixed when the hook
+                // started waiting, and the hint must not lie about it.
+                "headless": headless,
+                "statusLine": liveness.status_line(),
+                "thread": thread
+            }))
+        }
+        crate::state::OpenPrompt::Question {
+            question_id,
+            question,
+            options,
+            multi_select,
+        } => {
+            let buttons = if *multi_select {
+                Vec::new()
+            } else {
+                crate::approvals::question_answer_buttons(
+                    conn,
+                    &telegram.chat_id,
+                    &snapshot.thread_id,
+                    question_id,
+                    options,
+                    now,
+                )?
+            };
+            let body = crate::approvals::question_body(question, options, *multi_select);
+            Ok(json!({
+                "type": "question_request",
+                "threadId": snapshot.thread_id,
+                "questionId": question_id,
+                "observedAt": now,
+                "eventKey": format!("question-reoffer:{question_id}:{now}"),
+                "lastPreview": body,
+                "buttons": buttons,
+                "statusLine": liveness.status_line(),
+                "thread": thread
+            }))
+        }
+    }
+}
+
+type ClassifiedThread = (
+    crate::state::BridgeThreadSnapshot,
+    render::ThreadLiveness,
+    Option<crate::state::OpenPrompt>,
+);
+
 fn classify_recent_threads(
     conn: &Connection,
     classify_pool: u64,
-) -> Result<Vec<(crate::state::BridgeThreadSnapshot, render::ThreadLiveness)>> {
+    now: u64,
+) -> Result<Vec<ClassifiedThread>> {
     let mut pool = list_recent_thread_snapshots_from_db(conn, classify_pool)?;
     let running_turns = crate::state::list_running_bridge_turns(conn)?;
     // Aggregate BY SESSION first: one session can have several running turns
@@ -1163,11 +1257,41 @@ fn classify_recent_threads(
             event_uid: None,
         });
     }
+    // Open prompts ride along: a waiting session's /threads row re-offers
+    // the very question, so a missed notification stops mattering. And they
+    // UNION into the pool like running turns do — an open ask on a session
+    // outside the recent-50 cache (or with no cache row at all) is the most
+    // urgent row of the whole list, not one to silently drop.
+    let mut prompts = crate::state::open_prompts(conn, now)?;
+    let known = pool
+        .iter()
+        .map(|snapshot| snapshot.thread_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for thread_id in prompts.keys() {
+        if known.contains(thread_id) {
+            continue;
+        }
+        pool.push(crate::state::BridgeThreadSnapshot {
+            thread_id: thread_id.clone(),
+            name: None,
+            cwd: None,
+            // `now`: waiting rows sort by their own tier anyway; recency only
+            // breaks ties between several waiting sessions.
+            updated_at: Some(now),
+            status_type: "active".to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: None,
+            last_preview: None,
+            pending_prompt: None,
+            event_uid: None,
+        });
+    }
     Ok(pool
         .into_iter()
         .map(|snapshot| {
             let liveness = classify_thread_liveness(conn, &snapshot.thread_id, &running);
-            (snapshot, liveness)
+            let prompt = prompts.remove(&snapshot.thread_id);
+            (snapshot, liveness, prompt)
         })
         .collect())
 }
@@ -1208,11 +1332,14 @@ fn classify_thread_liveness(
 /// whatever accident it was handed — truncation could then keep an old task
 /// and drop a new one.
 fn order_threads_for_display(
-    mut threads: Vec<(crate::state::BridgeThreadSnapshot, render::ThreadLiveness)>,
+    mut threads: Vec<ClassifiedThread>,
     limit: usize,
-) -> Vec<(crate::state::BridgeThreadSnapshot, render::ThreadLiveness)> {
-    threads.sort_by_key(|(snapshot, liveness)| {
+) -> Vec<ClassifiedThread> {
+    threads.sort_by_key(|(snapshot, liveness, prompt)| {
         (
+            // A session WAITING on an answer outranks everything: the whole
+            // point of listing it is that the user may have missed the ask.
+            prompt.is_none(),
             liveness.order(),
             std::cmp::Reverse(snapshot.updated_at.unwrap_or(0)),
         )
@@ -1250,7 +1377,7 @@ fn execute_threads_command(
     // not what competes. Cutting by recency first let a fresh idle session
     // push a slightly older LIVE terminal off the default list — the exact
     // sessions the grouping exists to surface.
-    let classified = classify_recent_threads(conn, classify_pool)?;
+    let classified = classify_recent_threads(conn, classify_pool, now)?;
     let snapshots = order_threads_for_display(classified, limit as usize);
     if snapshots.is_empty() {
         let sent = telegram_send_text(
@@ -1274,9 +1401,13 @@ fn execute_threads_command(
     let count = |wanted: u8| {
         snapshots
             .iter()
-            .filter(|(_, liveness)| liveness.order() == wanted)
+            .filter(|(_, liveness, _)| liveness.order() == wanted)
             .count()
     };
+    let waiting = snapshots
+        .iter()
+        .filter(|(_, _, prompt)| prompt.is_some())
+        .count();
     let mut census = format!(
         "🧵 {} 个会话：🖥 终端 {} · 🫥 后台 {} · ⚙️ 无头 {} · 💤 空闲 {}",
         snapshots.len(),
@@ -1289,39 +1420,53 @@ fn execute_threads_command(
     if unknown > 0 {
         census.push_str(&format!(" · ❓ 未知 {unknown}"));
     }
+    if waiting > 0 {
+        census = format!("⏳ {waiting} 个会话在等你作答！\n{census}");
+    }
     telegram_send_text(telegram, &census, timeout)?;
 
     let mut sent = Vec::with_capacity(snapshots.len());
     let mut render_failed = 0usize;
-    for (snapshot, liveness) in &snapshots {
+    for (snapshot, liveness, prompt) in &snapshots {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             break;
         }
+        // A waiting session's row IS the ask, buttons included — answered
+        // through the same pending row the original notification feeds, so
+        // whichever message the user answers first wins and the other gets
+        // an honest "already handled".
+        let prepared = match prompt {
+            Some(prompt) => {
+                let event = reoffer_prompt_event(conn, telegram, snapshot, *liveness, prompt, now)?;
+                prepare_telegram_delivery(&telegram.chat_id, &event)
+            }
+            None => {
+                prepare_telegram_thread_snapshot_delivery(&telegram.chat_id, snapshot, *liveness)
+            }
+        };
         // ONLY a rendering failure is isolated: it is specific to this one
         // snapshot while the transport still works, so report it in place and
         // keep listing the rest.
-        let mut prepared =
-            match prepare_telegram_thread_snapshot_delivery(&telegram.chat_id, snapshot, *liveness)
-            {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    render_failed += 1;
-                    let notice = format!(
-                        "⚠️ Could not render session {}: {error:#}",
-                        snapshot.thread_id.chars().take(8).collect::<String>()
-                    );
-                    // Propagate if even this cannot be sent — that is a
-                    // transport failure, not a per-snapshot problem.
-                    telegram_send_text(telegram, &notice, timeout)?;
-                    sent.push(json!({
-                        "ok": false,
-                        "threadId": snapshot.thread_id,
-                        "stage": "render",
-                        "error": format!("{error:#}")
-                    }));
-                    continue;
-                }
-            };
+        let mut prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                render_failed += 1;
+                let notice = format!(
+                    "⚠️ Could not render session {}: {error:#}",
+                    snapshot.thread_id.chars().take(8).collect::<String>()
+                );
+                // Propagate if even this cannot be sent — that is a
+                // transport failure, not a per-snapshot problem.
+                telegram_send_text(telegram, &notice, timeout)?;
+                sent.push(json!({
+                    "ok": false,
+                    "threadId": snapshot.thread_id,
+                    "stage": "render",
+                    "error": format!("{error:#}")
+                }));
+                continue;
+            }
+        };
         // Delivery and reply-route persistence failures are transport/state
         // level, not snapshot level: reporting them as "could not render"
         // would be wrong, and a half-delivered snapshot (sent but unroutable)
@@ -2625,6 +2770,7 @@ mod tests {
             "sess-toast",
             "Bash",
             "Bash: ls",
+            false,
             1000,
             9000,
         )
@@ -2649,6 +2795,7 @@ mod tests {
             "sess-toast",
             "Bash",
             "Bash: ls",
+            false,
             1000,
             9000,
         )
@@ -2694,6 +2841,7 @@ mod tests {
             "sess-x",
             "Bash",
             "Bash: rm -rf /",
+            false,
             1000,
             9000,
         )
@@ -2752,6 +2900,7 @@ mod tests {
             "sess-x",
             "按优先级排列这几项",
             &[],
+            false,
             1000,
             9000,
         )
@@ -2800,7 +2949,7 @@ mod tests {
 
         // An approval that already timed out, and an answered question.
         crate::state::create_pending_approval(
-            &conn, "ap-done", "sess-x", "Bash", "Bash: ls", 1000, 5000,
+            &conn, "ap-done", "sess-x", "Bash", "Bash: ls", false, 1000, 5000,
         )
         .expect("create");
         crate::state::record_dialog_message(&conn, "456", 10, "approval", "ap-done", 1000)
@@ -2809,8 +2958,17 @@ mod tests {
             .expect("route");
         crate::state::expire_or_take_decision(&conn, "ap-done", 6000).expect("expire");
 
-        crate::state::create_pending_question(&conn, "q-done", "sess-x", "哪个?", &[], 1000, 9000)
-            .expect("create");
+        crate::state::create_pending_question(
+            &conn,
+            "q-done",
+            "sess-x",
+            "哪个?",
+            &[],
+            false,
+            1000,
+            9000,
+        )
+        .expect("create");
         crate::state::record_dialog_message(&conn, "456", 20, "question", "q-done", 1000)
             .expect("dialog");
         crate::state::insert_telegram_message_route(&conn, "456", 20, "sess-x", "e", 1000)
@@ -2875,6 +3033,7 @@ mod tests {
             "sess-x",
             "很长的问题",
             &[],
+            false,
             1000,
             9000,
         )
@@ -2924,8 +3083,17 @@ mod tests {
         write_daemon_config(&config).expect("config");
         let telegram = config.telegram.clone().expect("telegram");
         let conn = crate::state::create_state_db_in_memory().expect("db");
-        crate::state::create_pending_question(&conn, "q-auth", "sess-x", "哪个?", &[], 1000, 9000)
-            .expect("create");
+        crate::state::create_pending_question(
+            &conn,
+            "q-auth",
+            "sess-x",
+            "哪个?",
+            &[],
+            false,
+            1000,
+            9000,
+        )
+        .expect("create");
         crate::state::attach_question_message_id(&conn, "q-auth", 90).expect("attach");
         crate::state::record_dialog_message(&conn, "456", 90, "question", "q-auth", 1000)
             .expect("dialog message");
@@ -3526,10 +3694,10 @@ mod tests {
             1000,
         )
         .expect("register");
-        let classified = classify_recent_threads(&conn, 50).expect("classify");
-        let (_, liveness) = classified
+        let classified = classify_recent_threads(&conn, 50, 2000).expect("classify");
+        let (_, liveness, _) = classified
             .iter()
-            .find(|(snapshot, _)| snapshot.thread_id == "sess-c")
+            .find(|(snapshot, _, _)| snapshot.thread_id == "sess-c")
             .expect("a running turn with NO threads_cache row must still be listed");
         assert!(!liveness.unknown);
         assert!(
@@ -3569,6 +3737,430 @@ mod tests {
         assert_eq!(turns, 1, "the settled turn must be pruned");
     }
 
+    /// A waiting session outranks even a live terminal: the list exists so a
+    /// missed ask gets seen.
+    #[test]
+    fn waiting_sessions_lead_the_list() {
+        use crate::claude::TerminalPresence;
+        let snapshot = |id: &str, updated: u64| crate::state::BridgeThreadSnapshot {
+            thread_id: id.to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(updated),
+            status_type: "active".to_string(),
+            status_flags: vec![],
+            last_turn_status: None,
+            last_preview: None,
+            pending_prompt: None,
+            event_uid: None,
+        };
+        let live = |presence| render::ThreadLiveness {
+            presence,
+            headless: false,
+            unknown: false,
+        };
+        let pool = vec![
+            (
+                snapshot("terminal-new", 900),
+                live(TerminalPresence::Window),
+                None,
+            ),
+            (
+                snapshot("waiting-idle", 100),
+                live(TerminalPresence::Gone),
+                Some(crate::state::OpenPrompt::Approval {
+                    approval_id: "ap-w".to_string(),
+                    summary: "Bash: rm -rf".to_string(),
+                    headless: false,
+                }),
+            ),
+        ];
+        let shown = order_threads_for_display(pool, 2);
+        assert_eq!(
+            shown[0].0.thread_id, "waiting-idle",
+            "an open ask must lead even from the idle class"
+        );
+    }
+
+    /// The full reoffer chain for an approval: /threads builds a fresh
+    /// buttons event for the OPEN approval, and tapping one of those fresh
+    /// buttons answers the very row the blocked hook is polling.
+    #[test]
+    fn threads_reoffers_an_open_approval_and_its_buttons_answer_it() {
+        let _guard = config_test_lock().lock().expect("config lock");
+        let _env = CommandEnv::new("reoffer-approval");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("write daemon config");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let telegram = config.telegram.clone().expect("telegram");
+        // A running headless turn whose approval is waiting: registered in
+        // bridge_turns (so the union lists it) with an open approval row.
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-w",
+            "sess-wait",
+            "/tmp/w.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        crate::state::create_pending_approval(
+            &conn,
+            "ap-wait",
+            "sess-wait",
+            "Bash",
+            "Bash: touch x",
+            false,
+            1000,
+            9_000,
+        )
+        .expect("approval");
+
+        let classified = classify_recent_threads(&conn, 50, 2000).expect("classify");
+        let (snapshot, liveness, prompt) = classified
+            .iter()
+            .find(|(snapshot, _, _)| snapshot.thread_id == "sess-wait")
+            .expect("waiting session listed");
+        let prompt = prompt.as_ref().expect("open approval must ride along");
+        let event = reoffer_prompt_event(&conn, &telegram, snapshot, *liveness, prompt, 2000)
+            .expect("reoffer event");
+        assert_eq!(event["type"], "approval_request", "{event}");
+        assert_eq!(event["approvalId"], "ap-wait", "{event}");
+        let buttons = event["buttons"].as_array().expect("buttons");
+        assert_eq!(buttons.len(), 3, "允许/本会话/拒绝 must all be offered");
+
+        // Tap the freshly minted deny button: the ORIGINAL pending row is
+        // answered — exactly what the blocked hook polls.
+        let deny = buttons
+            .iter()
+            .find(|button| button["action"] == "deny")
+            .expect("deny button");
+        let callback_query = json!({
+            "id": "cq_reoffer",
+            "from": { "id": 789 },
+            "message": { "message_id": 42, "chat": { "id": "456" } },
+            "data": format!("claude:{}", deny["callbackId"].as_str().expect("id"))
+        });
+        let route = match extract_telegram_callback_route(&conn, &callback_query, &telegram)
+            .expect("extract")
+        {
+            TelegramCallbackLookup::Route(route) => route,
+            other => panic!("fresh reoffer button must route: {other:?}"),
+        };
+        let answer = record_callback_answer(&conn, &route, 3000).expect("record");
+        assert_eq!(answer["recorded"], true, "{answer}");
+        assert_eq!(
+            crate::state::approval_decision(&conn, "ap-wait").expect("decision"),
+            Some("deny".to_string()),
+            "the hook-visible row carries the answer"
+        );
+    }
+
+    /// A multi-select question reoffered by /threads keeps the no-buttons
+    /// rule and spells out the options with the comma instruction — the
+    /// stored multi_select flag is what makes that possible.
+    #[test]
+    fn threads_reoffers_a_multiselect_question_without_buttons() {
+        let _guard = config_test_lock().lock().expect("config lock");
+        let _env = CommandEnv::new("reoffer-multi");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("write daemon config");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let telegram = config.telegram.clone().expect("telegram");
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-q",
+            "sess-q",
+            "/tmp/q.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        crate::state::create_pending_question(
+            &conn,
+            "q-multi",
+            "sess-q",
+            "选哪些库？",
+            &["serde".to_string(), "tokio".to_string()],
+            true,
+            1000,
+            9_000,
+        )
+        .expect("question");
+
+        let classified = classify_recent_threads(&conn, 50, 2000).expect("classify");
+        let (snapshot, liveness, prompt) = classified
+            .iter()
+            .find(|(snapshot, _, _)| snapshot.thread_id == "sess-q")
+            .expect("listed");
+        let event = reoffer_prompt_event(
+            &conn,
+            &telegram,
+            snapshot,
+            *liveness,
+            prompt.as_ref().expect("open question"),
+            2000,
+        )
+        .expect("event");
+        assert_eq!(event["type"], "question_request", "{event}");
+        assert!(
+            event["buttons"].as_array().expect("buttons").is_empty(),
+            "multi-select must never get one-tap buttons: {event}"
+        );
+        let body = event["lastPreview"].as_str().expect("body");
+        assert!(body.contains("A. serde"), "{body}");
+        assert!(body.contains("逗号分隔"), "{body}");
+    }
+
+    /// A session whose ONLY trace is an open prompt — no cache row, no
+    /// running turn — must still be listed and led with. It is the most
+    /// urgent row of the list, not one to silently drop.
+    #[test]
+    fn a_prompt_only_session_still_makes_the_list() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::create_pending_approval(
+            &conn,
+            "ap-orphan",
+            "sess-orphan",
+            "Bash",
+            "Bash: make deploy",
+            false,
+            1000,
+            9_000,
+        )
+        .expect("approval");
+        let classified = classify_recent_threads(&conn, 50, 2000).expect("classify");
+        let shown = order_threads_for_display(classified, 5);
+        assert!(
+            !shown.is_empty(),
+            "an open prompt with no other trace must not vanish"
+        );
+        let (snapshot, _, prompt) = &shown[0];
+        assert_eq!(
+            snapshot.thread_id, "sess-orphan",
+            "and it must lead the list"
+        );
+        assert!(prompt.is_some(), "carrying its prompt for the reoffer");
+    }
+
+    /// The timeout hint replays the gate kind persisted at CREATION. The
+    /// session's current look must not rewrite it: a headless approval's
+    /// timeout denies whatever the session is doing now.
+    #[test]
+    fn reoffer_replays_the_persisted_gate_kind() {
+        let _guard = config_test_lock().lock().expect("config lock");
+        let _env = CommandEnv::new("reoffer-kind");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("write daemon config");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let telegram = config.telegram.clone().expect("telegram");
+        crate::state::create_pending_approval(
+            &conn, "ap-h", "sess-h", "Bash", "Bash: x", true, 1000, 9_000,
+        )
+        .expect("approval");
+        let classified = classify_recent_threads(&conn, 50, 2000).expect("classify");
+        let (snapshot, liveness, prompt) = classified
+            .iter()
+            .find(|(snapshot, _, _)| snapshot.thread_id == "sess-h")
+            .expect("listed");
+        // The session no longer looks headless (no running turn), but the
+        // approval was born at the headless gate.
+        assert!(!liveness.headless);
+        let event = reoffer_prompt_event(
+            &conn,
+            &telegram,
+            snapshot,
+            *liveness,
+            prompt.as_ref().expect("prompt"),
+            2000,
+        )
+        .expect("event");
+        assert_eq!(
+            event["headless"], true,
+            "the hint must describe the approval, not today's session: {event}"
+        );
+    }
+
+    /// Rows from before the `multi_select` column existed have NULL there.
+    /// Guessing "single-select" would mint one-tap buttons for what may
+    /// really be a multi-select — one tap would submit a single option and
+    /// silently drop the rest. NULL must render the no-buttons shape.
+    #[test]
+    fn legacy_questions_without_multiselect_flag_get_no_buttons() {
+        let _guard = config_test_lock().lock().expect("config lock");
+        let _env = CommandEnv::new("reoffer-legacy");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("write daemon config");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let telegram = config.telegram.clone().expect("telegram");
+        // A pre-upgrade row: written without the multi_select column.
+        conn.execute(
+            "INSERT INTO pending_questions(
+                question_id, thread_id, question, options_json, created_at, expires_at
+             ) VALUES ('q-old', 'sess-old', '选哪个？', '[\"甲\",\"乙\"]', 1000, 9000)",
+            [],
+        )
+        .expect("legacy row");
+        let classified = classify_recent_threads(&conn, 50, 2000).expect("classify");
+        let (snapshot, liveness, prompt) = classified
+            .iter()
+            .find(|(snapshot, _, _)| snapshot.thread_id == "sess-old")
+            .expect("listed");
+        let event = reoffer_prompt_event(
+            &conn,
+            &telegram,
+            snapshot,
+            *liveness,
+            prompt.as_ref().expect("prompt"),
+            2000,
+        )
+        .expect("event");
+        assert!(
+            event["buttons"].as_array().expect("buttons").is_empty(),
+            "unknown select-mode must not mint one-tap buttons: {event}"
+        );
+        let body = event["lastPreview"].as_str().expect("body");
+        assert!(body.contains("A. 甲"), "options stay visible: {body}");
+    }
+
+    /// Prompt history is pruned, open prompts are untouchable — whatever
+    /// their age claims. /threads scans these tables on every call, so
+    /// without pruning its cost grows with every approval ever made.
+    #[test]
+    fn prompt_history_is_pruned_but_open_prompts_never() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let retention: u64 = 30 * 24 * 60 * 60 * 1000;
+        let now = retention + 100_000;
+        // Ancient settled approval and ancient expired question: history.
+        crate::state::create_pending_approval(
+            &conn,
+            "ap-ancient",
+            "sess-1",
+            "Bash",
+            "x",
+            false,
+            1000,
+            5000,
+        )
+        .expect("approval");
+        crate::state::record_approval_decision(&conn, "ap-ancient", "allow", 2000).expect("decide");
+        crate::state::create_pending_question(
+            &conn,
+            "q-ancient",
+            "sess-2",
+            "?",
+            &[],
+            false,
+            1000,
+            5000,
+        )
+        .expect("question");
+        // Ancient but OPEN approval (window still ahead of `now`): whatever
+        // created_at says, an open prompt must survive pruning.
+        crate::state::create_pending_approval(
+            &conn,
+            "ap-open",
+            "sess-3",
+            "Bash",
+            "y",
+            false,
+            1000,
+            now + 60_000,
+        )
+        .expect("open approval");
+
+        crate::state::prune_state_logs(&conn, now).expect("prune");
+        let approvals: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT approval_id FROM pending_approvals")
+                .expect("stmt");
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("rows");
+            rows.collect::<rusqlite::Result<_>>().expect("collect")
+        };
+        assert_eq!(
+            approvals,
+            vec!["ap-open".to_string()],
+            "settled history pruned, the open row untouched"
+        );
+        let questions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_questions", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(questions, 0, "the expired question is history too");
+    }
+
+    /// A pre-upgrade approval has NULL for the gate kind. The reoffer must
+    /// claim HEADLESS — the urgency-safe direction: "timeout denies" gets
+    /// answered promptly either way, while "terminal will catch it" invites
+    /// ignoring an approval whose task actually dies on timeout.
+    #[test]
+    fn legacy_approvals_claim_the_urgent_gate_kind() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        conn.execute(
+            "INSERT INTO pending_approvals(
+                approval_id, thread_id, tool_name, summary, created_at, expires_at
+             ) VALUES ('ap-legacy', 'sess-legacy', 'Bash', 'Bash: x', 1000, 9000)",
+            [],
+        )
+        .expect("legacy row");
+        let prompts = crate::state::open_prompts(&conn, 2000).expect("prompts");
+        match prompts.get("sess-legacy") {
+            Some(crate::state::OpenPrompt::Approval { headless, .. }) => {
+                assert!(*headless, "unknown gate kind must claim the urgent one")
+            }
+            other => panic!("legacy approval must be open: {other:?}"),
+        }
+    }
+
+    /// Settled and expired prompts are NOT reoffered: their windows are
+    /// closed, and buttons pointing at them would only harvest refusals.
+    #[test]
+    fn settled_and_expired_prompts_are_not_reoffered() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::create_pending_approval(
+            &conn, "ap-done", "sess-a", "Bash", "x", false, 1000, 9_000,
+        )
+        .expect("approval");
+        crate::state::record_approval_decision(&conn, "ap-done", "allow", 1500).expect("decide");
+        crate::state::create_pending_question(
+            &conn,
+            "q-late",
+            "sess-b",
+            "?",
+            &[],
+            false,
+            1000,
+            1500,
+        )
+        .expect("question");
+        // At exactly expires_at the answer side still accepts (expiry there
+        // is `now > expires_at`), so the open side must still offer.
+        let prompts = crate::state::open_prompts(&conn, 1500).expect("prompts");
+        assert!(
+            prompts.contains_key("sess-b"),
+            "the boundary instant is still answerable: {prompts:?}"
+        );
+        // now=2000: the question's window (1500) has passed.
+        let prompts = crate::state::open_prompts(&conn, 2000).expect("prompts");
+        assert!(
+            prompts.is_empty(),
+            "neither a decided approval nor an expired question is open: {prompts:?}"
+        );
+    }
+
     /// One session, one row — however many running turns it has. A
     /// per-turn placeholder would list the session twice, double the census
     /// and register duplicate reply routes.
@@ -3591,10 +4183,10 @@ mod tests {
             )
             .expect("register");
         }
-        let classified = classify_recent_threads(&conn, 50).expect("classify");
+        let classified = classify_recent_threads(&conn, 50, 2000).expect("classify");
         let rows = classified
             .iter()
-            .filter(|(snapshot, _)| snapshot.thread_id == "sess-multi")
+            .filter(|(snapshot, _, _)| snapshot.thread_id == "sess-multi")
             .collect::<Vec<_>>();
         assert_eq!(rows.len(), 1, "one session must render once: {rows:?}");
         assert_eq!(
@@ -3633,7 +4225,16 @@ mod tests {
         };
         // Oldest-first input — the exact order `list_running_bridge_turns`
         // hands back.
-        let pool = vec![entry("task-old", 100), entry("task-new", 900)];
+        let pool = vec![
+            {
+                let (snapshot, liveness) = entry("task-old", 100);
+                (snapshot, liveness, None)
+            },
+            {
+                let (snapshot, liveness) = entry("task-new", 900);
+                (snapshot, liveness, None)
+            },
+        ];
         let shown = order_threads_for_display(pool, 1);
         assert_eq!(
             shown[0].0.thread_id, "task-new",
@@ -3668,12 +4269,17 @@ mod tests {
         // Recency order, as the DB returns them: three fresh idle sessions,
         // then an older live terminal, then an older running headless turn.
         let pool = vec![
-            (snapshot("idle-newest", 500), live(TerminalPresence::Gone)),
-            (snapshot("idle-2", 400), live(TerminalPresence::Gone)),
-            (snapshot("idle-3", 300), live(TerminalPresence::Gone)),
+            (
+                snapshot("idle-newest", 500),
+                live(TerminalPresence::Gone),
+                None,
+            ),
+            (snapshot("idle-2", 400), live(TerminalPresence::Gone), None),
+            (snapshot("idle-3", 300), live(TerminalPresence::Gone), None),
             (
                 snapshot("terminal-old", 200),
                 live(TerminalPresence::Window),
+                None,
             ),
             (
                 snapshot("headless-old", 100),
@@ -3682,12 +4288,13 @@ mod tests {
                     headless: true,
                     unknown: false,
                 },
+                None,
             ),
         ];
         let shown = order_threads_for_display(pool, 3);
         let ids = shown
             .iter()
-            .map(|(snapshot, _)| snapshot.thread_id.as_str())
+            .map(|(snapshot, _, _)| snapshot.thread_id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(
             ids,
