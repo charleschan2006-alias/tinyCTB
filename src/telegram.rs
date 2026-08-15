@@ -1263,7 +1263,7 @@ fn classify_recent_threads(
     // outside the recent-50 cache (or with no cache row at all) is the most
     // urgent row of the whole list, not one to silently drop.
     let mut prompts = crate::state::open_prompts(conn, now)?;
-    let known = pool
+    let mut known = pool
         .iter()
         .map(|snapshot| snapshot.thread_id.clone())
         .collect::<std::collections::HashSet<_>>();
@@ -1271,6 +1271,7 @@ fn classify_recent_threads(
         if known.contains(thread_id) {
             continue;
         }
+        known.insert(thread_id.clone());
         pool.push(crate::state::BridgeThreadSnapshot {
             thread_id: thread_id.clone(),
             name: None,
@@ -1283,6 +1284,30 @@ fn classify_recent_threads(
             last_turn_status: None,
             last_preview: None,
             pending_prompt: None,
+            event_uid: None,
+        });
+    }
+    // Sessions stuck at a TERMINAL prompt union in too — such a session may
+    // have waited longer than the whole recent-cache window (a dialog that
+    // sat for eight hours was exactly how this gap was found), and falling
+    // off the pool would deny it the waiting tier it exists to occupy.
+    for (thread_id, prompt, created_at) in
+        crate::state::threads_with_pending_terminal_prompts(conn)?
+    {
+        if known.contains(&thread_id) {
+            continue;
+        }
+        known.insert(thread_id.clone());
+        pool.push(crate::state::BridgeThreadSnapshot {
+            thread_id,
+            name: None,
+            cwd: None,
+            updated_at: Some(created_at),
+            status_type: "active".to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: None,
+            last_preview: None,
+            pending_prompt: Some(prompt),
             event_uid: None,
         });
     }
@@ -1323,6 +1348,36 @@ fn classify_thread_liveness(
     }
 }
 
+/// What is waiting on the user comes first — that is the list's whole
+/// point. Two waiting flavours, remote-answerable ahead of terminal-bound:
+/// 0 = an OPEN gate prompt (/threads re-offers it with buttons);
+/// 1 = a terminal dialog observed by the hooks (`pending_prompt`) on a
+///     session whose terminal is verifiably ALIVE — a session that has sat
+///     waiting for hours is exactly what the user runs /threads to discover
+///     (measured live: an 8-hour-old dialog was ranked third and read as a
+///     bug). The liveness requirement keeps ghosts out: a `pending` row can
+///     outlive its session (crash, plain non-gate notification), and a dead
+///     session's stale prompt must not squat on the top of the list;
+/// 2 = everything else.
+fn waiting_rank(
+    snapshot: &crate::state::BridgeThreadSnapshot,
+    liveness: render::ThreadLiveness,
+    prompt: Option<&crate::state::OpenPrompt>,
+) -> u8 {
+    if prompt.is_some() {
+        0
+    } else if liveness.presence == crate::claude::TerminalPresence::Window
+        && snapshot
+            .pending_prompt
+            .as_ref()
+            .is_some_and(|pending| pending.status == "pending")
+    {
+        1
+    } else {
+        2
+    }
+}
+
 /// Order by liveness class (alive first), newest first inside each class,
 /// THEN cut to the display limit.
 ///
@@ -1337,9 +1392,7 @@ fn order_threads_for_display(
 ) -> Vec<ClassifiedThread> {
     threads.sort_by_key(|(snapshot, liveness, prompt)| {
         (
-            // A session WAITING on an answer outranks everything: the whole
-            // point of listing it is that the user may have missed the ask.
-            prompt.is_none(),
+            waiting_rank(snapshot, *liveness, prompt.as_ref()),
             liveness.order(),
             std::cmp::Reverse(snapshot.updated_at.unwrap_or(0)),
         )
@@ -1408,6 +1461,12 @@ fn execute_threads_command(
         .iter()
         .filter(|(_, _, prompt)| prompt.is_some())
         .count();
+    let terminal_waiting = snapshots
+        .iter()
+        .filter(|(snapshot, liveness, prompt)| {
+            waiting_rank(snapshot, *liveness, prompt.as_ref()) == 1
+        })
+        .count();
     let mut census = format!(
         "🧵 {} 个会话：🖥 终端 {} · 🫥 后台 {} · ⚙️ 无头 {} · 💤 空闲 {}",
         snapshots.len(),
@@ -1419,6 +1478,9 @@ fn execute_threads_command(
     let unknown = count(4);
     if unknown > 0 {
         census.push_str(&format!(" · ❓ 未知 {unknown}"));
+    }
+    if terminal_waiting > 0 {
+        census = format!("🔐 {terminal_waiting} 个会话在终端等你作答\n{census}");
     }
     if waiting > 0 {
         census = format!("⏳ {waiting} 个会话在等你作答！\n{census}");
@@ -3737,6 +3799,68 @@ mod tests {
         assert_eq!(turns, 1, "the settled turn must be pruned");
     }
 
+    /// The live bug replayed: a session stuck at a TERMINAL dialog (remote
+    /// window expired hours ago, `pending_prompt` still pending) must rank
+    /// above ordinary live terminals — below only the remote-answerable
+    /// re-offers. Idle recency must not bury it.
+    #[test]
+    fn terminal_waiting_sessions_rank_between_reoffers_and_the_rest() {
+        use crate::claude::TerminalPresence;
+        let snapshot = |id: &str, updated: u64, waiting: bool| crate::state::BridgeThreadSnapshot {
+            thread_id: id.to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(updated),
+            status_type: "active".to_string(),
+            status_flags: vec![],
+            last_turn_status: None,
+            last_preview: None,
+            pending_prompt: waiting.then(|| crate::state::PendingPrompt {
+                prompt_id: "notify:1".to_string(),
+                kind: "approval".to_string(),
+                status: "pending".to_string(),
+                question: Some("Claude needs your permission".to_string()),
+            }),
+            event_uid: None,
+        };
+        let live = |presence| render::ThreadLiveness {
+            presence,
+            headless: false,
+            unknown: false,
+        };
+        let pool = vec![
+            (
+                snapshot("terminal-busy", 900, false),
+                live(TerminalPresence::Window),
+                None,
+            ),
+            (
+                snapshot("terminal-dialog", 100, true),
+                live(TerminalPresence::Window),
+                None,
+            ),
+            (
+                snapshot("reoffer", 50, false),
+                live(TerminalPresence::Gone),
+                Some(crate::state::OpenPrompt::Approval {
+                    approval_id: "ap".to_string(),
+                    summary: "Bash: x".to_string(),
+                    headless: false,
+                }),
+            ),
+        ];
+        let shown = order_threads_for_display(pool, 3);
+        let ids = shown
+            .iter()
+            .map(|(snapshot, _, _)| snapshot.thread_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec!["reoffer", "terminal-dialog", "terminal-busy"],
+            "answerable ask first, terminal dialog second, ordinary sessions last"
+        );
+    }
+
     /// A waiting session outranks even a live terminal: the list exists so a
     /// missed ask gets seen.
     #[test]
@@ -4031,6 +4155,102 @@ mod tests {
         );
         let body = event["lastPreview"].as_str().expect("body");
         assert!(body.contains("A. 甲"), "options stay visible: {body}");
+    }
+
+    /// A session waiting at a TERMINAL dialog beyond the recent-cache window
+    /// must still make the pool — driven through the real database, past the
+    /// 50-row recency cut. (An 8-hour-old dialog fell off exactly this way.)
+    #[test]
+    fn a_terminal_waiting_session_beyond_the_cache_window_is_still_listed() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        // 50 fresher cache rows fill the recency window completely.
+        for index in 0..50 {
+            conn.execute(
+                "INSERT INTO threads_cache(thread_id, updated_at, last_seen_at, status_type, status_flags_json)
+                 VALUES (?1, ?2, ?2, 'active', '[]')",
+                rusqlite::params![format!("filler-{index}"), 10_000 + index as i64],
+            )
+            .expect("filler");
+        }
+        // The waiting session: OLDEST of all, terminal prompt still pending.
+        conn.execute(
+            "INSERT INTO threads_cache(thread_id, updated_at, last_seen_at, status_type, status_flags_json)
+             VALUES ('sess-stuck', 100, 100, 'active', '[]')",
+            [],
+        )
+        .expect("stuck cache row");
+        conn.execute(
+            "INSERT INTO pending_prompts(thread_id, prompt_id, prompt_kind, prompt_status, question, created_at)
+             VALUES ('sess-stuck', 'notify:1', 'approval', 'pending', 'Claude needs your permission', 200)",
+            [],
+        )
+        .expect("pending prompt");
+
+        let classified = classify_recent_threads(&conn, 50, 20_000).expect("classify");
+        let stuck = classified
+            .iter()
+            .find(|(snapshot, _, _)| snapshot.thread_id == "sess-stuck")
+            .expect("the waiting session must be in the pool despite the recency cut");
+        assert!(
+            stuck.0.pending_prompt.is_some(),
+            "and must carry its prompt for the waiting tier"
+        );
+    }
+
+    /// The waiting tier is for LIVE terminals only: a stale pending-prompt
+    /// row whose session is gone must not squat on the top of the list.
+    #[test]
+    fn a_ghost_sessions_stale_prompt_does_not_lead() {
+        use crate::claude::TerminalPresence;
+        let snapshot = crate::state::BridgeThreadSnapshot {
+            thread_id: "ghost".to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(100),
+            status_type: "active".to_string(),
+            status_flags: vec![],
+            last_turn_status: None,
+            last_preview: None,
+            pending_prompt: Some(crate::state::PendingPrompt {
+                prompt_id: "notify:9".to_string(),
+                kind: "approval".to_string(),
+                status: "pending".to_string(),
+                question: Some("Claude needs your permission".to_string()),
+            }),
+            event_uid: None,
+        };
+        let gone = render::ThreadLiveness {
+            presence: TerminalPresence::Gone,
+            headless: false,
+            unknown: false,
+        };
+        let window = render::ThreadLiveness {
+            presence: TerminalPresence::Window,
+            headless: false,
+            unknown: false,
+        };
+        assert_eq!(
+            waiting_rank(&snapshot, gone, None),
+            2,
+            "a dead session's prompt is history, not a wait"
+        );
+        assert_eq!(
+            waiting_rank(&snapshot, window, None),
+            1,
+            "the same prompt on a live terminal IS a wait"
+        );
+        // Background is explicitly "no window": nothing is waiting where the
+        // user could see it, so no waiting tier either.
+        let background = render::ThreadLiveness {
+            presence: TerminalPresence::Background,
+            headless: false,
+            unknown: false,
+        };
+        assert_eq!(
+            waiting_rank(&snapshot, background, None),
+            2,
+            "a windowless session cannot have a terminal waiting on anyone"
+        );
     }
 
     /// Prompt history is pruned, open prompts are untouchable — whatever

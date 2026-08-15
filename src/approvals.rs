@@ -51,6 +51,344 @@ use crate::state::{
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// If the machine saw keyboard/mouse input this recently when the gate
+/// fires, the user is sitting right there: show the terminal dialog
+/// immediately instead of detouring through Telegram.
+const ACTIVELY_PRESENT_WINDOW: Duration = Duration::from_millis(15_000);
+
+/// One presence probe per gate process. The real coordination lives in a
+/// SHARED state file + flock lease, because a poll tick every 500ms must
+/// not mean an external process every 500ms, and N concurrent gates must
+/// not mean N probers:
+/// - the shared state carries the last result (success OR failure), the
+///   globally agreed `nextProbeAt`, and the failure backoff — every gate
+///   honours the same cadence, including the relaxed deep-idle one;
+/// - only the holder of a `try_lock_exclusive` lease probes; everyone else
+///   serves the stored value aged by the elapsed time. flock dies with its
+///   process, so a crashed holder cannot wedge the lease;
+/// - failure backoff doubles to a 120s cap and is stored globally — one
+///   fleet-wide retry schedule, and NEVER a permanent mute.
+struct PresenceProbe;
+
+const PRESENCE_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+const PRESENCE_PROBE_INTERVAL_DEEP_IDLE: Duration = Duration::from_secs(10);
+const PRESENCE_DEEP_IDLE: Duration = Duration::from_secs(300);
+const PRESENCE_BACKOFF_CAP: Duration = Duration::from_secs(120);
+#[cfg_attr(test, allow(dead_code))]
+const PRESENCE_COMMAND_TIMEOUT: Duration = Duration::from_millis(1000);
+pub(crate) const PRESENCE_STATE_FILE: &str = "presence-probe.json";
+pub(crate) const PRESENCE_LOCK_FILE: &str = "presence-probe.lock";
+
+/// The probe schedule, pure so it can be pinned by tests: what to wait
+/// before the NEXT probe, and the backoff to carry forward.
+fn next_probe_schedule(
+    result: Option<Duration>,
+    previous_backoff: Duration,
+) -> (Duration, Duration) {
+    match result {
+        Some(idle) => {
+            let interval = if idle >= PRESENCE_DEEP_IDLE {
+                PRESENCE_PROBE_INTERVAL_DEEP_IDLE
+            } else {
+                PRESENCE_PROBE_INTERVAL
+            };
+            (interval, PRESENCE_PROBE_INTERVAL)
+        }
+        None => {
+            let next_backoff = (previous_backoff * 2).min(PRESENCE_BACKOFF_CAP);
+            (previous_backoff, next_backoff)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedProbeState {
+    probed_at_ms: u64,
+    /// `None` = the last probe FAILED — recorded so non-holders back off
+    /// with the fleet instead of each probing on their own.
+    idle_ms: Option<u64>,
+    next_probe_at_ms: u64,
+    backoff_ms: u64,
+}
+
+fn read_probe_state(path: &std::path::Path) -> Option<SharedProbeState> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    Some(SharedProbeState {
+        probed_at_ms: value.get("probedAtMs")?.as_u64()?,
+        idle_ms: value.get("idleMs").and_then(serde_json::Value::as_u64),
+        next_probe_at_ms: value.get("nextProbeAtMs")?.as_u64()?,
+        backoff_ms: value.get("backoffMs")?.as_u64()?,
+    })
+}
+
+/// Age a stored SUCCESS by the time since it was measured: with nobody back
+/// yet, idle grows exactly with the clock. A stored FAILURE ages to nothing.
+fn aged_idle(state: &SharedProbeState, now_ms: u64) -> Option<Duration> {
+    state
+        .idle_ms
+        .map(|idle| Duration::from_millis(idle + now_ms.saturating_sub(state.probed_at_ms)))
+}
+
+/// A state stamped in OUR future means the wall clock went backwards since
+/// it was written. Serving it would freeze the old idle at zero age — a
+/// small stored idle would then read as "user present" for as long as the
+/// clock stays behind. Rolled-back state is simply not credible: re-probe.
+fn state_is_credible(state: &SharedProbeState, now_ms: u64) -> bool {
+    now_ms >= state.probed_at_ms
+}
+
+/// The coordinated probe. `prober` is injected so tests can count how many
+/// times the underlying command actually runs.
+fn shared_desktop_idle(
+    dir: &std::path::Path,
+    clock: &dyn Fn() -> u64,
+    prober: &dyn Fn() -> Option<Duration>,
+) -> Option<Duration> {
+    shared_desktop_idle_with_gap(dir, clock, prober, &|| {})
+}
+
+/// `after_first_read` is a test seam marking the gap between the freshness
+/// check and the lease grab — the exact window in which another gate can
+/// complete a whole probe. Production passes a no-op.
+///
+/// The clock is injected (not a snapshot): probing itself can take up to
+/// ~2s of command timeouts, and stamping the result with the START time
+/// could burn through a whole short backoff window before the state even
+/// lands on disk. Completion time is what schedules the next probe.
+fn shared_desktop_idle_with_gap(
+    dir: &std::path::Path,
+    clock: &dyn Fn() -> u64,
+    prober: &dyn Fn() -> Option<Duration>,
+    after_first_read: &dyn Fn(),
+) -> Option<Duration> {
+    use fs2::FileExt as _;
+    let state_path = dir.join(PRESENCE_STATE_FILE);
+    let now_ms = clock();
+    let state = read_probe_state(&state_path).filter(|state| state_is_credible(state, now_ms));
+    if let Some(state) = &state {
+        if now_ms < state.next_probe_at_ms {
+            // The fleet agreed not to probe yet — this covers the deep-idle
+            // cadence and the failure backoff alike.
+            return aged_idle(state, now_ms);
+        }
+    }
+    after_first_read();
+    // Time to probe: exactly one gate gets the lease. flock releases on
+    // process death, so a crashed holder cannot wedge anyone.
+    let lease = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(PRESENCE_LOCK_FILE));
+    // Only `WouldBlock` means "another prober is working". Any OTHER failure
+    // (flock unsupported on this filesystem, I/O error) must degrade to
+    // UNCOORDINATED probing — treating it as "busy" would serve stale state
+    // forever and quietly break the never-mute promise.
+    let held = match &lease {
+        Ok(file) => match file.try_lock_exclusive() {
+            Ok(()) => Some(true),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Some(false),
+            Err(error) => {
+                eprintln!("tinyctb: presence lease unusable ({error}); probing uncoordinated");
+                None
+            }
+        },
+        Err(error) => {
+            eprintln!("tinyctb: presence lock file unavailable ({error}); probing uncoordinated");
+            None
+        }
+    };
+    if held == Some(false) {
+        // Someone is probing right now; serve the freshest known CREDIBLE
+        // state — rolled-back state serves nothing rather than a frozen
+        // "present" verdict. The clock is taken FRESH: judging a state
+        // published after our entry against the entry timestamp would damn
+        // legitimate new state as "rolled back".
+        let now_ms = clock();
+        return read_probe_state(&state_path)
+            .filter(|state| state_is_credible(state, now_ms))
+            .and_then(|state| aged_idle(&state, now_ms));
+    }
+    // DOUBLE-CHECK under the lease: between our first read and the lock,
+    // another gate may have probed and published. Probing again would both
+    // duplicate the process and clobber the fleet's fresh schedule with our
+    // stale backoff. Same fresh-clock rule as above — a winner's state is
+    // STAMPED LATER than our entry, and the stale entry time would misread
+    // it as clock rollback and reopen the very lost-race this check closes.
+    let now_ms = clock();
+    let state = read_probe_state(&state_path).filter(|state| state_is_credible(state, now_ms));
+    if held == Some(true) {
+        if let Some(state) = &state {
+            if now_ms < state.next_probe_at_ms {
+                if let Ok(file) = &lease {
+                    let _ = fs2::FileExt::unlock(file);
+                }
+                return aged_idle(state, now_ms);
+            }
+        }
+    }
+    let value = prober();
+    // Stamp with COMPLETION time: the probe itself may have eaten seconds.
+    let done_ms = clock();
+    let previous_backoff = state
+        .map(|state| Duration::from_millis(state.backoff_ms))
+        .unwrap_or(PRESENCE_PROBE_INTERVAL);
+    let (interval, backoff) = next_probe_schedule(value, previous_backoff);
+    let payload = serde_json::json!({
+        "probedAtMs": done_ms,
+        "idleMs": value.map(|idle| idle.as_millis() as u64),
+        "nextProbeAtMs": done_ms + interval.as_millis() as u64,
+        "backoffMs": backoff.as_millis() as u64
+    });
+    // Unique staging name: concurrent writers must never truncate each
+    // other's half-written temp file.
+    let staged = dir.join(format!(".presence-probe.{}.tmp", std::process::id()));
+    if std::fs::write(&staged, payload.to_string()).is_ok() {
+        let _ = std::fs::rename(&staged, &state_path);
+    }
+    if held == Some(true) {
+        if let Ok(file) = &lease {
+            let _ = fs2::FileExt::unlock(file);
+        }
+    }
+    value
+}
+
+impl PresenceProbe {
+    fn new() -> Self {
+        PresenceProbe
+    }
+
+    /// How long the user has left the machine's input devices untouched.
+    ///
+    /// The signal is the DESKTOP idle time (GNOME Mutter's IdleMonitor, with
+    /// xprintidle as a fallback) — exact, covering keyboard and mouse, X11
+    /// and Wayland alike. Deliberately NOT the pty atime: measured on this
+    /// kernel (7.0), reading typed input from a raw pty advances the slave's
+    /// atime by exactly zero nanoseconds.
+    ///
+    /// `None` when no desktop session answers (SSH-only, or a bus hiccup —
+    /// retried on the fleet-wide backoff): presence is then unknown and the
+    /// away flag is the switch that still works everywhere.
+    fn idle(&mut self) -> Option<Duration> {
+        #[cfg(test)]
+        {
+            std::env::var("TINYCTB_TEST_IDLE_MS")
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .map(Duration::from_millis)
+        }
+        #[cfg(not(test))]
+        {
+            let clock = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|epoch| epoch.as_millis() as u64)
+                    .unwrap_or(0)
+            };
+            match crate::state::state_dir_path() {
+                Ok(dir) => shared_desktop_idle(&dir, &clock, &probe_desktop_idle),
+                // No state dir: uncoordinated beats blind.
+                Err(_) => probe_desktop_idle(),
+            }
+        }
+    }
+
+    /// Is the user at the machine right now?
+    fn user_is_present(&mut self) -> bool {
+        self.idle()
+            .is_some_and(|idle| idle <= ACTIVELY_PRESENT_WINDOW)
+    }
+
+    /// Should a blocked interactive gate hand its prompt to the terminal?
+    /// `/back` is checked FIRST: it is the deterministic path (works with no
+    /// desktop session at all, e.g. over SSH) and must never queue behind a
+    /// wedged desktop probe's timeout.
+    fn terminal_reclaimed(&mut self) -> bool {
+        !away_mode_active() || self.user_is_present()
+    }
+}
+
+#[cfg(not(test))]
+fn probe_desktop_idle() -> Option<Duration> {
+    run_with_timeout(
+        "gdbus",
+        &[
+            "call",
+            "--session",
+            "--dest",
+            "org.gnome.Mutter.IdleMonitor",
+            "--object-path",
+            "/org/gnome/Mutter/IdleMonitor/Core",
+            "--method",
+            "org.gnome.Mutter.IdleMonitor.GetIdletime",
+        ],
+        PRESENCE_COMMAND_TIMEOUT,
+    )
+    .and_then(|raw| parse_gdbus_idle(&raw))
+    .map(Duration::from_millis)
+    .or_else(|| {
+        run_with_timeout("xprintidle", &[], PRESENCE_COMMAND_TIMEOUT)
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .map(Duration::from_millis)
+    })
+}
+
+/// Millisecond value out of gdbus output shaped like `(uint64 45,)`.
+///
+/// The LAST digit run, on purpose: the type name carries its own digits, and
+/// taking the first run parsed `64` out of `uint64` — idle was permanently
+/// 64ms, "always present", and every remote approval silently went to the
+/// terminal (review-caught before it shipped).
+fn parse_gdbus_idle(raw: &str) -> Option<u64> {
+    raw.split(|ch: char| !ch.is_ascii_digit())
+        .rfind(|part| !part.is_empty())?
+        .parse()
+        .ok()
+}
+
+/// `Command::output()` has no timeout, and a wedged session bus would freeze
+/// the hook (and with it the whole tool call) indefinitely. Bounded run:
+/// kill on deadline, `None` for any failure. Output is read only after exit;
+/// these probes emit a few bytes, far below the pipe buffer.
+fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    use std::io::Read as _;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut output = String::new();
+                child.stdout.take()?.read_to_string(&mut output).ok()?;
+                return Some(output);
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 /// "No opinion": the normal permission flow decides. This is the answer for
 /// every path that is not an explicit remote allow/deny.
 fn no_opinion() -> Value {
@@ -306,10 +644,19 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
         Some(conn) => conn,
         None => create_state_db(&state_db_path()?)?,
     };
+    // Session-scoped auto-allow comes BEFORE any presence check: the user
+    // already granted this, and presence must never resurrect a prompt they
+    // paid a tap to silence.
     if approval_auto_allowed(&conn, &thread_id, &tool_name)? {
         return Ok(kind.allow(&format!(
             "{tool_name} was approved for this session from Telegram"
         )));
+    }
+    // A user at the machine gets the dialog THERE, immediately — no phone
+    // detour. (Headless turns have no terminal to hand anything to.)
+    let mut presence = PresenceProbe::new();
+    if kind == GateKind::Interactive && presence.user_is_present() {
+        return Ok(no_opinion());
     }
 
     let approval_id = payload
@@ -318,7 +665,7 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
         .map(str::to_string)
         .unwrap_or_else(|| generate_session_uuid().unwrap_or_else(|_| now.to_string()));
     let summary = tool_call_summary(&tool_name, payload.get("tool_input"));
-    let wait = Duration::from_secs(claude.approval_timeout_seconds.clamp(5, 3600));
+    let wait = Duration::from_secs(claude.approval_timeout_seconds.clamp(5, 86_400));
     create_pending_approval(
         &conn,
         &approval_id,
@@ -368,6 +715,17 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
             if decision != "expired" {
                 return apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now);
             }
+        }
+        // The user is back (input devices woke up, or /back): hand the
+        // prompt to the terminal RIGHT NOW. Settling is atomic with any
+        // in-flight tap — a tap that already landed still wins.
+        if kind == GateKind::Interactive && presence.terminal_reclaimed() {
+            return match crate::state::expire_or_take_decision(&conn, &approval_id, now)? {
+                Some(decision) => {
+                    apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now)
+                }
+                None => Ok(no_opinion()),
+            };
         }
     }
     // Timed out. Settling the record and taking a decision is one atomic
@@ -481,7 +839,13 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         .unwrap_or_default();
 
     let claude = config.claude.clone().unwrap_or_default();
-    let wait = Duration::from_secs(claude.approval_timeout_seconds.clamp(5, 3600));
+    let wait = Duration::from_secs(claude.approval_timeout_seconds.clamp(5, 86_400));
+    // Same presence rule as the approval gate: a user at the machine gets
+    // the question dialog in the terminal, immediately.
+    let mut presence = PresenceProbe::new();
+    if presence.user_is_present() {
+        return Ok(no_opinion());
+    }
     let conn = create_state_db(&state_db_path()?)?;
     let question_id = format!("q{}", generate_session_uuid()?.replace('-', ""));
     crate::state::create_pending_question(
@@ -538,6 +902,18 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
                     &resolve_answer(&answer, &options),
                 ));
             }
+        }
+        // The user is back (input devices or /back): give them the question
+        // dialog in the terminal, honouring any answer that raced in first.
+        if presence.terminal_reclaimed() {
+            return match crate::state::expire_or_take_answer(&conn, &question_id, now)? {
+                Some(answer) => Ok(answered(
+                    &questions,
+                    &question_raw,
+                    &resolve_answer(&answer, &options),
+                )),
+                None => Ok(no_opinion()),
+            };
         }
     }
     match crate::state::expire_or_take_answer(&conn, &question_id, now)? {
@@ -828,6 +1204,8 @@ mod tests {
             // A leftover turn token from a previous test would make this one
             // look like a bridge process; every test starts tokenless.
             std::env::remove_var(crate::claude::BRIDGE_TURN_ENV);
+            // And no leftover fake idle: presence must be opt-in per test.
+            std::env::remove_var("TINYCTB_TEST_IDLE_MS");
             crate::config::write_daemon_config(&DaemonConfig {
                 version: 1,
                 bridge_command: "tinyctb".to_string(),
@@ -1324,6 +1702,472 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "both must decline immediately, not after a timeout"
+        );
+    }
+
+    /// The whole point of the lease: N concurrent gates, exactly ONE
+    /// underlying probe. Everyone else serves the shared state.
+    #[test]
+    fn concurrent_gates_share_one_probe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        let dir = std::env::temp_dir().join(format!("tinyctb-probe-share-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        // A stale-but-parseable previous state, due for a re-probe, so the
+        // non-holders have something to serve.
+        fs::write(
+            dir.join(PRESENCE_STATE_FILE),
+            r#"{"probedAtMs":1000,"idleMs":20000,"nextProbeAtMs":2000,"backoffMs":2000}"#,
+        )
+        .expect("seed state");
+        let probes = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let dir = dir.clone();
+            let probes = Arc::new(Arc::clone(&probes));
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let prober = || -> Option<Duration> {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    // Widen the race window: the lease must cover this.
+                    std::thread::sleep(Duration::from_millis(80));
+                    Some(Duration::from_millis(9_000))
+                };
+                barrier.wait();
+                shared_desktop_idle(&dir, &|| 10_000, &prober)
+            }));
+        }
+        let results: Vec<Option<Duration>> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker"))
+            .collect();
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "exactly one gate may run the underlying command"
+        );
+        assert!(
+            results.iter().all(Option::is_some),
+            "every gate still gets a value (fresh or aged): {results:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The lost-race interleaving: gate B reads an expired state, then gate
+    /// A completes a WHOLE probe (publish + release) before B gets the
+    /// lease. B must re-check under the lease and serve A's fresh state —
+    /// probing again would duplicate the process AND clobber the fleet's
+    /// schedule with B's stale backoff.
+    #[test]
+    fn a_late_lease_holder_rechecks_instead_of_reprobing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir =
+            std::env::temp_dir().join(format!("tinyctb-probe-recheck-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        // Expired state with a big backoff B would wrongly re-publish.
+        fs::write(
+            dir.join(PRESENCE_STATE_FILE),
+            r#"{"probedAtMs":1000,"idleMs":20000,"nextProbeAtMs":2000,"backoffMs":64000}"#,
+        )
+        .expect("seed");
+        let outer_probes = AtomicUsize::new(0);
+        let outer = || -> Option<Duration> {
+            outer_probes.fetch_add(1, Ordering::SeqCst);
+            Some(Duration::from_millis(1))
+        };
+        // B's clock: 10.000s at entry, 12.000s when it re-checks under the
+        // lease — the wall clock moved while B waited for the lock.
+        let b_ticks = std::sync::atomic::AtomicU64::new(0);
+        let b_clock = || -> u64 {
+            match b_ticks.fetch_add(1, Ordering::SeqCst) {
+                0 => 10_000,
+                _ => 12_000,
+            }
+        };
+        // In the gap between B's first read and B's lease, A completes a
+        // whole probe at 11.500s — AFTER B's entry timestamp. B's recheck
+        // must judge A's state with a FRESH clock: against the stale entry
+        // time, A's 11.500 stamp reads as "clock rollback", B reprobes, and
+        // the lost-race this check exists to close reopens.
+        let gap = || {
+            let a_prober = || -> Option<Duration> { Some(Duration::from_millis(9_000)) };
+            let value = shared_desktop_idle(&dir, &|| 11_500, &a_prober);
+            assert_eq!(value, Some(Duration::from_millis(9_000)));
+        };
+        let value = shared_desktop_idle_with_gap(&dir, &b_clock, &outer, &gap);
+        assert_eq!(
+            outer_probes.load(Ordering::SeqCst),
+            0,
+            "B must NOT probe after losing the race"
+        );
+        assert_eq!(
+            value,
+            Some(Duration::from_millis(9_500)),
+            "B serves A's value aged by the 500ms since A published"
+        );
+        let state = read_probe_state(&dir.join(PRESENCE_STATE_FILE)).expect("state");
+        assert_eq!(
+            state.backoff_ms, 2_000,
+            "A's reset backoff survives — B's stale 64s must not clobber it"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A filesystem where flock fails for reasons OTHER than contention must
+    /// degrade to uncoordinated probing — treating it as "busy" would serve
+    /// stale state forever and quietly break the never-mute promise.
+    #[test]
+    fn a_broken_lock_file_degrades_to_direct_probing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = std::env::temp_dir().join(format!("tinyctb-probe-broken-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        // Make the lock path UNOPENABLE: a directory where the file goes.
+        fs::create_dir_all(dir.join(PRESENCE_LOCK_FILE)).expect("blocker");
+        let probes = AtomicUsize::new(0);
+        let prober = || -> Option<Duration> {
+            probes.fetch_add(1, Ordering::SeqCst);
+            Some(Duration::from_millis(7))
+        };
+        assert_eq!(
+            shared_desktop_idle(&dir, &|| 10_000, &prober),
+            Some(Duration::from_millis(7)),
+            "no lease must still mean a signal"
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A wall clock that went BACKWARDS invalidates the stored state: aging
+    /// saturates to zero, so a small stored idle would read as "user
+    /// present" for as long as the clock stays behind — approvals would
+    /// silently skip Telegram. Rolled-back state must re-probe instead.
+    #[test]
+    fn clock_rollback_invalidates_stored_presence() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir =
+            std::env::temp_dir().join(format!("tinyctb-probe-rollback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        // Stored "just probed, user present" — stamped at t=50_000 with a
+        // window until 52_000. Our clock says 10_000: the future.
+        fs::write(
+            dir.join(PRESENCE_STATE_FILE),
+            r#"{"probedAtMs":50000,"idleMs":100,"nextProbeAtMs":52000,"backoffMs":2000}"#,
+        )
+        .expect("seed");
+        let probes = AtomicUsize::new(0);
+        let prober = || -> Option<Duration> {
+            probes.fetch_add(1, Ordering::SeqCst);
+            Some(Duration::from_millis(600_000))
+        };
+        let value = shared_desktop_idle(&dir, &|| 10_000, &prober);
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "future-stamped state is not credible: re-probe"
+        );
+        assert_eq!(
+            value,
+            Some(Duration::from_millis(600_000)),
+            "and the fresh probe wins over the frozen 'present' verdict"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The published schedule is stamped with the probe's COMPLETION time: a
+    /// slow probe (worst case ~2s of command timeouts) stamped with its
+    /// START time could exhaust a short backoff window before the state even
+    /// lands, triggering an immediate re-probe.
+    #[test]
+    fn probe_schedule_is_stamped_at_completion() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = std::env::temp_dir().join(format!("tinyctb-probe-stamp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        // The clock advances 1.5s while the probe runs.
+        let ticks = AtomicU64::new(0);
+        let clock = || -> u64 {
+            match ticks.fetch_add(1, Ordering::SeqCst) {
+                0 => 10_000,
+                _ => 11_500,
+            }
+        };
+        let prober = || -> Option<Duration> { Some(Duration::from_millis(30)) };
+        shared_desktop_idle(&dir, &clock, &prober);
+        let state = read_probe_state(&dir.join(PRESENCE_STATE_FILE)).expect("state");
+        assert_eq!(state.probed_at_ms, 11_500, "completion time, not start");
+        assert_eq!(
+            state.next_probe_at_ms, 13_500,
+            "the next window opens relative to completion"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A probe FAILURE is shared state too: the whole fleet honours one
+    /// backoff schedule instead of each gate hammering the dead bus.
+    #[test]
+    fn shared_failure_backs_the_whole_fleet_off() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = std::env::temp_dir().join(format!("tinyctb-probe-fail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let probes = AtomicUsize::new(0);
+        let failing = || -> Option<Duration> {
+            probes.fetch_add(1, Ordering::SeqCst);
+            None
+        };
+        assert_eq!(shared_desktop_idle(&dir, &|| 10_000, &failing), None);
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        let state = read_probe_state(&dir.join(PRESENCE_STATE_FILE)).expect("state");
+        assert_eq!(state.idle_ms, None, "the failure itself is recorded");
+        assert_eq!(
+            state.next_probe_at_ms, 12_000,
+            "the fleet waits out the current backoff (2s)"
+        );
+        assert_eq!(state.backoff_ms, 4_000, "and the next one doubles");
+        // ANY gate arriving before nextProbeAt — including a different one —
+        // must not probe.
+        assert_eq!(shared_desktop_idle(&dir, &|| 11_999, &failing), None);
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "no gate probes inside the shared backoff window"
+        );
+        // Past the window, the retry happens and doubles the backoff again.
+        assert_eq!(shared_desktop_idle(&dir, &|| 12_000, &failing), None);
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+        let state = read_probe_state(&dir.join(PRESENCE_STATE_FILE)).expect("state");
+        assert_eq!(state.backoff_ms, 8_000);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The probe schedule: success resets backoff and picks cadence by idle
+    /// depth; failure retries with doubling backoff, capped, NEVER muted
+    /// forever — a transient bus hiccup must not disable user-returned
+    /// detection for the rest of an hours-long gate.
+    #[test]
+    fn probe_schedule_backs_off_but_never_mutes() {
+        use std::time::Duration;
+        // Active-ish desktop: 2s cadence.
+        assert_eq!(
+            next_probe_schedule(Some(Duration::from_secs(10)), Duration::from_secs(2)),
+            (Duration::from_secs(2), Duration::from_secs(2))
+        );
+        // Deep idle: relax to 10s.
+        assert_eq!(
+            next_probe_schedule(Some(Duration::from_secs(3600)), Duration::from_secs(2)),
+            (Duration::from_secs(10), Duration::from_secs(2))
+        );
+        // Failures: wait the current backoff, double the next, cap at 120s.
+        let mut backoff = Duration::from_secs(2);
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            let (wait, next) = next_probe_schedule(None, backoff);
+            waits.push(wait.as_secs());
+            backoff = next;
+        }
+        assert_eq!(waits, vec![2, 4, 8, 16, 32, 64, 120, 120]);
+        // Recovery after failures resets the backoff.
+        let (_, reset) = next_probe_schedule(Some(Duration::from_secs(1)), backoff);
+        assert_eq!(reset, Duration::from_secs(2));
+    }
+
+    /// The gdbus reply carries digits in its TYPE NAME: taking the first
+    /// digit run parsed `64` out of `uint64` and made idle permanently 64ms
+    /// — "always present", every remote approval silently to the terminal.
+    #[test]
+    fn gdbus_idle_parser_takes_the_value_not_the_type_name() {
+        assert_eq!(parse_gdbus_idle("(uint64 45,)"), Some(45));
+        assert_eq!(parse_gdbus_idle("(uint64 3600000,)"), Some(3600000));
+        assert_eq!(parse_gdbus_idle("(uint64 0,)"), Some(0));
+        assert_eq!(parse_gdbus_idle("()"), None);
+        assert_eq!(parse_gdbus_idle("error: no bus"), None);
+        assert_eq!(parse_gdbus_idle(""), None);
+    }
+
+    /// The probe must never freeze the hook: a wedged command is killed at
+    /// the deadline, a quick one delivers its output.
+    #[test]
+    fn bounded_runner_kills_wedged_commands() {
+        let started = std::time::Instant::now();
+        assert_eq!(
+            run_with_timeout("sleep", &["5"], Duration::from_millis(300)),
+            None,
+            "a wedged probe must be killed"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "and killed promptly: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            run_with_timeout("echo", &["(uint64 7,)"], Duration::from_secs(2)),
+            Some("(uint64 7,)\n".to_string())
+        );
+        assert_eq!(
+            run_with_timeout("false", &[], Duration::from_secs(2)),
+            None,
+            "non-zero exit is failure"
+        );
+        assert_eq!(
+            run_with_timeout("/nonexistent/probe", &[], Duration::from_secs(2)),
+            None
+        );
+    }
+
+    /// A user at the machine when the prompt fires gets the dialog in the
+    /// terminal, instantly — no Telegram detour, no approval row, no push.
+    #[test]
+    fn gate_steps_aside_for_a_present_user() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("present-user", true, 30);
+        std::env::set_var("TINYCTB_TEST_IDLE_MS", "500");
+
+        let started = std::time::Instant::now();
+        let result = gate(bash_payload());
+        std::env::remove_var("TINYCTB_TEST_IDLE_MS");
+        assert_eq!(
+            result,
+            json!({}),
+            "the terminal dialog must appear directly"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "and immediately"
+        );
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        assert_eq!(
+            crate::state::pending_outbound_count(&conn).expect("pending"),
+            0,
+            "no Telegram push for a user who is right there"
+        );
+    }
+
+    /// Session-scoped auto-allow outranks presence: a grant the user paid a
+    /// tap for must not resurface as a terminal dialog just because they
+    /// are at the keyboard now.
+    #[test]
+    fn auto_allow_beats_presence() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("auto-allow-present", true, 30);
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        crate::state::set_approval_auto_allow(&conn, "sess-gate", "Bash", 900).expect("auto allow");
+        drop(conn);
+        std::env::set_var("TINYCTB_TEST_IDLE_MS", "0");
+
+        let result = gate(bash_payload());
+        std::env::remove_var("TINYCTB_TEST_IDLE_MS");
+        assert_eq!(
+            result["hookSpecificOutput"]["decision"]["behavior"], "allow",
+            "the existing session grant must fire, not the presence bypass: {result}"
+        );
+    }
+
+    /// The user comes BACK mid-wait: fresh input on the machine hands the
+    /// prompt to the terminal within a poll tick instead of holding it for
+    /// the rest of the remote window. This is what makes a long remote
+    /// window safe to configure.
+    #[test]
+    fn gate_releases_to_the_terminal_when_the_user_returns() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("user-returns", true, 30);
+        // Idle for an hour when the gate fires.
+        std::env::set_var("TINYCTB_TEST_IDLE_MS", "3600000");
+
+        let returner = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(1200));
+            // Mouse moved / key pressed.
+            std::env::set_var("TINYCTB_TEST_IDLE_MS", "50");
+        });
+        let started = std::time::Instant::now();
+        let result = gate(bash_payload());
+        returner.join().expect("returner");
+        std::env::remove_var("TINYCTB_TEST_IDLE_MS");
+
+        assert_eq!(result, json!({}), "the prompt must fall to the terminal");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "released by the returning user, not the 30s window: {:?}",
+            started.elapsed()
+        );
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let decision: Option<String> = conn
+            .query_row("SELECT decision FROM pending_approvals", [], |row| {
+                row.get(0)
+            })
+            .expect("row");
+        assert_eq!(decision.as_deref(), Some("expired"));
+        assert_eq!(
+            crate::state::pending_outbound_count(&conn).expect("pending"),
+            1,
+            "Telegram was offered the window first"
+        );
+    }
+
+    /// `/back` is the deterministic release — it needs no desktop session at
+    /// all (SSH included): declaring yourself back hands every waiting
+    /// prompt to its terminal.
+    #[test]
+    fn gate_releases_to_the_terminal_on_back() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("back-release", true, 30);
+        // No desktop signal at all: presence unknown.
+        let returner = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(1200));
+            write_away_marker_for_test(false).expect("back");
+        });
+        let started = std::time::Instant::now();
+        let result = gate(bash_payload());
+        returner.join().expect("returner");
+
+        assert_eq!(result, json!({}), "the prompt must fall to the terminal");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "released by /back, not the 30s window: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A tap that lands before the returning user still wins — the settle is
+    /// atomic, not a blind expiry.
+    #[test]
+    fn a_tap_racing_the_returning_user_still_wins() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("tap-vs-return", true, 30);
+        std::env::set_var("TINYCTB_TEST_IDLE_MS", "3600000");
+
+        let worker = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                let Ok(approval_id) = conn.query_row(
+                    "SELECT approval_id FROM pending_approvals WHERE decision IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) else {
+                    continue;
+                };
+                // Tap first, the user walks in right after.
+                if matches!(
+                    record_approval_decision(&conn, &approval_id, "allow", 2000),
+                    Ok(crate::state::ApprovalAnswer::Recorded)
+                ) {
+                    std::env::set_var("TINYCTB_TEST_IDLE_MS", "50");
+                    return;
+                }
+            }
+            panic!("approval row never appeared");
+        });
+        let result = gate(bash_payload());
+        worker.join().expect("worker");
+        std::env::remove_var("TINYCTB_TEST_IDLE_MS");
+        assert_eq!(
+            result["hookSpecificOutput"]["decision"]["behavior"], "allow",
+            "the recorded tap must be honoured, not discarded by the return: {result}"
         );
     }
 

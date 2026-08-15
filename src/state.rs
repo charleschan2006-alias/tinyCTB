@@ -1802,6 +1802,37 @@ pub(crate) fn register_bridge_turn(
     Ok(())
 }
 
+/// Threads whose hooks observed a still-pending terminal prompt, with the
+/// prompt itself — for the /threads pool union. A session stuck at a
+/// terminal dialog may be far older than the recent-cache window, and it is
+/// exactly the session the user runs /threads to find.
+pub(crate) fn threads_with_pending_terminal_prompts(
+    conn: &Connection,
+) -> Result<Vec<(String, PendingPrompt, u64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT thread_id, prompt_id, prompt_kind, prompt_status, question, MAX(created_at)
+         FROM pending_prompts WHERE prompt_status = 'pending' GROUP BY thread_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            PendingPrompt {
+                prompt_id: row.get(1)?,
+                kind: row.get(2)?,
+                status: row.get(3)?,
+                question: row.get(4)?,
+            },
+            row.get::<_, i64>(5)?,
+        ))
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        let (thread_id, prompt, created_at) = row?;
+        result.push((thread_id, prompt, from_sql_i64(created_at)?));
+    }
+    Ok(result)
+}
+
 pub(crate) fn list_running_bridge_turns(conn: &Connection) -> Result<Vec<BridgeTurn>> {
     let mut stmt = conn.prepare(
         "SELECT turn_id, thread_id, log_path, pid, started_at, exited, exit_code,

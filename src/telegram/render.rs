@@ -566,7 +566,25 @@ pub(crate) fn prepare_telegram_thread_snapshot_delivery(
 ) -> Result<PreparedTelegramDelivery> {
     let mut event = thread_snapshot_event(snapshot);
     if let Some(object) = event.as_object_mut() {
-        object.insert("statusLine".to_string(), json!(liveness.status_line()));
+        // A pending terminal dialog is THE fact about this session — but
+        // claim it only for a verifiably live terminal (a stale prompt row
+        // can outlive its session), and claim no more than we know: the
+        // prompt may never have had a remote window at all, so the line
+        // says where it must be answered and nothing about history.
+        let status_line = if liveness.presence == crate::claude::TerminalPresence::Window
+            && snapshot
+                .pending_prompt
+                .as_ref()
+                .is_some_and(|prompt| prompt.status == "pending")
+        {
+            format!(
+                "⏳ 终端有对话框在等你（需要在终端处理）\n{}",
+                liveness.status_line()
+            )
+        } else {
+            liveness.status_line()
+        };
+        object.insert("statusLine".to_string(), json!(status_line));
     }
     let prepared = prepare_telegram_delivery(chat_id, &event)?;
     if prepared.payloads.len() != 1 {
@@ -923,6 +941,78 @@ mod tests {
 
     /// Regression: the body concatenates question AND preview, so a snapshot
     /// with both fields long must still fit one Telegram message — otherwise
+    /// A snapshot with a pending terminal dialog carries the loud prefix —
+    /// the user must learn it waits AND that only the terminal can answer.
+    #[test]
+    fn terminal_dialog_snapshot_carries_the_waiting_prefix() {
+        let snapshot = BridgeThreadSnapshot {
+            thread_id: "thr-dialog".to_string(),
+            name: Some("s".to_string()),
+            cwd: None,
+            updated_at: Some(42),
+            status_type: "active".to_string(),
+            status_flags: vec![],
+            last_turn_status: None,
+            last_preview: None,
+            pending_prompt: Some(PendingPrompt {
+                prompt_id: "notify:9".to_string(),
+                kind: "approval".to_string(),
+                status: "pending".to_string(),
+                question: Some("Claude needs your permission".to_string()),
+            }),
+            event_uid: None,
+        };
+        let prepared = prepare_telegram_thread_snapshot_delivery(
+            "999",
+            &snapshot,
+            ThreadLiveness {
+                presence: crate::claude::TerminalPresence::Window,
+                headless: false,
+                unknown: false,
+            },
+        )
+        .expect("render");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert!(text.contains("⏳ 终端有对话框在等你"), "{text}");
+        assert!(text.contains("需要在终端处理"), "{text}");
+
+        // A DEAD session's stale prompt row claims nothing: no live
+        // terminal, no "waiting for you" line.
+        let prepared = prepare_telegram_thread_snapshot_delivery(
+            "999",
+            &snapshot,
+            ThreadLiveness {
+                presence: crate::claude::TerminalPresence::Gone,
+                headless: false,
+                unknown: false,
+            },
+        )
+        .expect("render");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert!(
+            !text.contains("⏳ 终端有对话框"),
+            "a ghost session must not claim a waiting terminal: {text}"
+        );
+
+        // Background = no window: claiming "终端有对话框在等你" while the
+        // same message says 无终端窗口 would contradict itself.
+        let prepared = prepare_telegram_thread_snapshot_delivery(
+            "999",
+            &snapshot,
+            ThreadLiveness {
+                presence: crate::claude::TerminalPresence::Background,
+                headless: false,
+                unknown: false,
+            },
+        )
+        .expect("render");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert!(
+            !text.contains("⏳ 终端有对话框"),
+            "a windowless session must not claim a waiting terminal: {text}"
+        );
+    }
+
     /// The liveness line tells the user where a reply to THIS message will
     /// land — the one fact that differs between the three session states.
     #[test]

@@ -103,7 +103,7 @@ fn approval_hook_timeout_seconds() -> u64 {
         .and_then(|config| config.claude)
         .map(|claude| claude.approval_timeout_seconds)
         .unwrap_or(300)
-        .clamp(5, 3600)
+        .clamp(5, 86_400)
         + 15
 }
 

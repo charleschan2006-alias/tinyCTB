@@ -730,6 +730,8 @@ const RESET_RUNTIME_FILES: &[&str] = &[
     "state.db-shm",
     "remote-mode.json",
     "daemon.lock",
+    approvals::PRESENCE_STATE_FILE,
+    approvals::PRESENCE_LOCK_FILE,
 ];
 
 fn reset_result(dry_run: bool) -> Result<Value> {
@@ -789,6 +791,37 @@ fn reset_result(dry_run: bool) -> Result<Value> {
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!("failed to remove runtime state file {}", path.display())
+                })
+            }
+        }
+    }
+    // Crash-leftover probe staging files have dynamic names; sweep by
+    // shape. Failures are LOUD like the static list above — a reset that
+    // reports success while leaving files behind is worse than one that
+    // fails visibly.
+    let entries = fs::read_dir(&state_dir)
+        .with_context(|| format!("failed to list state dir {}", state_dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!("failed to read state dir entry in {}", state_dir.display())
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with(".presence-probe.") && name.ends_with(".tmp")) {
+            continue;
+        }
+        if dry_run {
+            removed.push(name);
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => removed.push(name),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove probe staging file {}",
+                        entry.path().display()
+                    )
                 })
             }
         }
@@ -1219,7 +1252,14 @@ mod tests {
             projects: Vec::new(),
         })
         .expect("write config");
-        for name in ["state.db", "state.db-wal", "remote-mode.json"] {
+        for name in [
+            "state.db",
+            "state.db-wal",
+            "remote-mode.json",
+            "presence-probe.json",
+            "presence-probe.lock",
+            ".presence-probe.4242.tmp",
+        ] {
             fs::write(state.root.join(name), "runtime").expect("write runtime file");
         }
         fs::create_dir_all(state.root.join("events")).expect("events dir");
@@ -1241,6 +1281,9 @@ mod tests {
         assert!(names.contains(&"state.db"));
         assert!(names.contains(&"state.db-wal"));
         assert!(names.contains(&"remote-mode.json"));
+        assert!(names.contains(&"presence-probe.json"));
+        assert!(names.contains(&"presence-probe.lock"));
+        assert!(names.contains(&".presence-probe.4242.tmp"));
         assert!(names.contains(&"events/"));
         assert!(result["removedFiles"].is_null());
         assert!(
@@ -1276,6 +1319,9 @@ mod tests {
             "state.db-shm",
             "remote-mode.json",
             "daemon.lock",
+            "presence-probe.json",
+            "presence-probe.lock",
+            ".presence-probe.4242.tmp",
         ] {
             fs::write(state.root.join(name), "runtime").expect("write runtime file");
         }
@@ -1294,6 +1340,9 @@ mod tests {
             "state.db-shm",
             "remote-mode.json",
             "daemon.lock",
+            "presence-probe.json",
+            "presence-probe.lock",
+            ".presence-probe.4242.tmp",
             "events",
             "logs",
         ] {
