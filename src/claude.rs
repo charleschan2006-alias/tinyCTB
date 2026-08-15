@@ -627,6 +627,19 @@ pub(crate) fn write_hook_event_from_reader<R: Read>(reader: &mut R, now: u64) ->
         .as_deref()
         .map(socket_identity)
         .unwrap_or((None, None));
+    // For a Notification, freeze the transcript boundary AT THIS MOMENT:
+    // everything the file gains afterwards is what happened since the dialog
+    // appeared — the evidence a later scan uses to decide it was dealt with.
+    // (Ingest can run minutes later; measuring there would be too late.)
+    let transcript_bytes = (event_name == "Notification")
+        .then(|| {
+            payload
+                .get("transcript_path")
+                .and_then(Value::as_str)
+                .and_then(|path| fs::metadata(path).ok())
+                .map(|meta| meta.len())
+        })
+        .flatten();
     let envelope = json!({
         "receivedAt": now,
         "hookEventName": event_name,
@@ -634,6 +647,7 @@ pub(crate) fn write_hook_event_from_reader<R: Read>(reader: &mut R, now: u64) ->
         "messagingSocket": messaging_socket,
         "socketInode": socket_inode,
         "socketBootId": socket_boot_id,
+        "transcriptBytes": transcript_bytes,
         "payload": payload
     });
     let file_name = format!("{now:015}-{}-{}.json", std::process::id(), event_name);
@@ -650,21 +664,135 @@ pub(crate) fn write_hook_event_from_reader<R: Read>(reader: &mut R, now: u64) ->
     }))
 }
 
+/// Was this prompt DEALT WITH, judged by what the transcript gained after
+/// the byte boundary recorded when the notification fired?
+///
+/// Definite evidence only, with two review-caught traps excluded:
+/// - SIDECHAIN entries (`isSidechain: true`) are a subagent talking to
+///   itself in the same file — the main session can sit at a permission
+///   dialog while a subagent streams, so they prove nothing;
+/// - a `tool_result` cannot be attributed to THIS approval (the payload
+///   carries no tool_use_id, and a parallel already-allowed tool finishing
+///   first would masquerade as the answer), so results never clear an
+///   approval. They do clear an idle prompt: tool activity means the turn
+///   is running.
+///
+/// What clears what:
+/// - approval: a MAIN-CHAIN assistant entry only. Every outcome of a
+///   permission dialog — allow, deny, cancel — ends with the assistant
+///   continuing on the main chain;
+/// - reply (idle): main-chain assistant, a tool_result, or real user text.
+///
+/// Rows without a boundary (pre-upgrade) are left alone: only their turn's
+/// Stop clears them, exactly the old behaviour.
+fn prompt_resolved_in_transcript(prompt: &PendingPrompt, transcript: &Path) -> bool {
+    let Some(boundary) = prompt.transcript_bytes else {
+        return false;
+    };
+    let Ok(file) = fs::File::open(transcript) else {
+        return false;
+    };
+    use std::io::{BufRead as _, Seek as _};
+    let mut reader = std::io::BufReader::new(file);
+    if reader.seek(std::io::SeekFrom::Start(boundary)).is_err() {
+        return false;
+    }
+    // STREAM the whole tail, line by line, stopping at the first evidence.
+    // A fixed byte window looked cheaper but was wrong twice over: sidechain
+    // chatter can push the real main-chain evidence past any cap (the prompt
+    // would then linger to its Stop forever), and per-line lossy conversion
+    // confines UTF-8 damage to the one mangled line the JSON parse skips.
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        let Ok(read) = reader.read_until(b'\n', &mut buf) else {
+            return false;
+        };
+        if read == 0 {
+            return false; // EOF: no evidence yet
+        }
+        let line = String::from_utf8_lossy(&buf);
+        let Ok(entry) = serde_json::from_str::<Value>(line.trim()) else {
+            continue; // partial trailing line or non-JSON metadata
+        };
+        if entry.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        match entry.get("type").and_then(Value::as_str) {
+            Some("assistant") => return true,
+            Some("user") if prompt.kind != "approval" => {
+                let content = entry.pointer("/message/content");
+                let has_tool_result = content.and_then(Value::as_array).is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    })
+                });
+                let has_text = match content {
+                    Some(Value::String(text)) => !text.trim().is_empty(),
+                    Some(Value::Array(blocks)) => blocks
+                        .iter()
+                        .any(|block| block.get("type").and_then(Value::as_str) == Some("text")),
+                    _ => false,
+                };
+                if has_tool_result || has_text {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Which notification types mean "a dialog is waiting on the user". The
+/// others (auth_success, elicitation_complete/response, agent_completed)
+/// announce things FINISHING — turning those into pending prompts is how
+/// phantom waits used to be born.
+fn notification_waiting_kind(payload: &Value) -> Option<&'static str> {
+    // Text fallback shared by "no field" (older claude) and "unknown type"
+    // (newer claude than us): a DENYLIST of known completions, because an
+    // allowlist would silently drop every wait type invented after this
+    // code was written.
+    let text_kind = || {
+        let lowered = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if lowered.contains("permission") || lowered.contains("approval") {
+            "approval"
+        } else {
+            "reply"
+        }
+    };
+    match payload.get("notification_type").and_then(Value::as_str) {
+        Some("permission_prompt") => Some("approval"),
+        Some("idle_prompt" | "agent_needs_input") => Some("reply"),
+        Some("elicitation_dialog" | "elicitation_url_dialog") => Some("reply"),
+        // Known completions: announcements, never waits.
+        Some(
+            "auth_success" | "elicitation_complete" | "elicitation_response" | "agent_completed",
+        ) => None,
+        Some(unknown) => {
+            eprintln!(
+                "tinyctb: unknown notification_type {unknown:?}; treating as a wait by message text"
+            );
+            Some(text_kind())
+        }
+        None => Some(text_kind()),
+    }
+}
+
 fn pending_prompt_from_notification(
     payload: &Value,
     received_at: u64,
     pending_tool_use: Option<&str>,
+    kind: &str,
+    transcript_bytes: Option<u64>,
 ) -> PendingPrompt {
     let message = payload
         .get("message")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let lowered = message.as_deref().unwrap_or("").to_ascii_lowercase();
-    let kind = if lowered.contains("permission") || lowered.contains("approval") {
-        "approval"
-    } else {
-        "reply"
-    };
     // The hook message alone ("Claude needs your permission to use Bash") says
     // which tool but not what it would do; the transcript-derived pending tool
     // summary carries the actual content the user must judge.
@@ -679,6 +807,7 @@ fn pending_prompt_from_notification(
         kind: kind.to_string(),
         status: "pending".to_string(),
         question,
+        transcript_bytes,
     }
 }
 
@@ -890,27 +1019,42 @@ pub(crate) fn ingest_spool_events(
                 pending_prompt: None,
                 event_uid,
             },
-            "Notification" => BridgeThreadSnapshot {
-                thread_id: session_id.clone(),
-                name: summary
-                    .name
-                    .or_else(|| base.as_ref().and_then(|b| b.name.clone())),
-                cwd: summary
-                    .cwd
-                    .or(payload_cwd)
-                    .or_else(|| base.as_ref().and_then(|b| b.cwd.clone())),
-                updated_at: Some(received_at),
-                status_type: "active".to_string(),
-                status_flags: vec!["waitingOnUserInput".to_string()],
-                last_turn_status: None,
-                last_preview: summary.last_assistant_text,
-                pending_prompt: Some(pending_prompt_from_notification(
-                    &payload,
-                    received_at,
-                    summary.pending_tool_use.as_deref(),
-                )),
-                event_uid,
-            },
+            "Notification" => {
+                // Completion-style notifications (auth_success, elicitation
+                // results, agent_completed) are NOT waits; turning them into
+                // pending prompts is how phantom "waiting on you" rows were
+                // born. They leave the session state untouched.
+                let Some(kind) = notification_waiting_kind(&payload) else {
+                    if let Some(base) = base {
+                        by_session.insert(session_id, base);
+                    }
+                    continue;
+                };
+                let transcript_bytes = envelope.get("transcriptBytes").and_then(Value::as_u64);
+                BridgeThreadSnapshot {
+                    thread_id: session_id.clone(),
+                    name: summary
+                        .name
+                        .or_else(|| base.as_ref().and_then(|b| b.name.clone())),
+                    cwd: summary
+                        .cwd
+                        .or(payload_cwd)
+                        .or_else(|| base.as_ref().and_then(|b| b.cwd.clone())),
+                    updated_at: Some(received_at),
+                    status_type: "active".to_string(),
+                    status_flags: vec!["waitingOnUserInput".to_string()],
+                    last_turn_status: None,
+                    last_preview: summary.last_assistant_text,
+                    pending_prompt: Some(pending_prompt_from_notification(
+                        &payload,
+                        received_at,
+                        summary.pending_tool_use.as_deref(),
+                        kind,
+                        transcript_bytes,
+                    )),
+                    event_uid,
+                }
+            }
             "SessionStart" => BridgeThreadSnapshot {
                 thread_id: session_id.clone(),
                 name: summary.name,
@@ -956,7 +1100,7 @@ fn existing_thread_state(
         .flatten();
     let pending: Option<PendingPrompt> = conn
         .query_row(
-            "SELECT prompt_id, prompt_kind, prompt_status, question
+            "SELECT prompt_id, prompt_kind, prompt_status, question, transcript_bytes
              FROM pending_prompts WHERE thread_id = ?1",
             params![thread_id],
             |row| {
@@ -972,6 +1116,7 @@ fn existing_thread_state(
                             Some(question)
                         }
                     },
+                    transcript_bytes: row.get::<_, Option<i64>>(4)?.map(|bytes| bytes as u64),
                 })
             },
         )
@@ -1023,7 +1168,12 @@ pub(crate) fn sync_state_from_sessions(
         let mut snapshot = scan_snapshot(&info);
         let (last_turn_status, pending) = existing_thread_state(conn, &info.session_id)?;
         snapshot.last_turn_status = last_turn_status;
-        snapshot.pending_prompt = pending;
+        // Without this check an answered dialog stayed "pending" until the
+        // turn's Stop — for a long agentic turn that meant /threads pinning
+        // a phantom "waiting on you" for hours (measured live 2026-08-15:
+        // it talked a user into killing an active session).
+        snapshot.pending_prompt =
+            pending.filter(|prompt| !prompt_resolved_in_transcript(prompt, &info.path));
         upsert_thread_snapshot(conn, &snapshot, now)?;
         threads.push(thread_snapshot_json(&snapshot));
     }
@@ -2376,6 +2526,335 @@ mod tests {
         assert_eq!(messages[0]["text"], "real question");
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[1]["text"], "real answer");
+    }
+
+    /// The resolution rule, judged on transcript CONTENT after the recorded
+    /// boundary — never on mtime. The decisive counterexample (review-
+    /// caught): a background task notification is injected as user text
+    /// while a permission dialog still waits; it advances mtime but must
+    /// not count as the answer.
+    #[test]
+    fn prompt_resolution_needs_definite_evidence() {
+        let dir = std::env::temp_dir().join(format!("tinyctb-resolve-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let transcript = dir.join("t.jsonl");
+        let base = r#"{"type":"user","message":{"role":"user","content":"do the thing"}}
+"#;
+        fs::write(&transcript, base).expect("base");
+        let boundary = base.len() as u64;
+        let prompt = |kind: &str| crate::state::PendingPrompt {
+            prompt_id: "notify:1000".to_string(),
+            kind: kind.to_string(),
+            status: "pending".to_string(),
+            question: Some("Claude needs your permission".to_string()),
+            transcript_bytes: Some(boundary),
+        };
+
+        // Nothing after the boundary: still waiting.
+        assert!(!prompt_resolved_in_transcript(
+            &prompt("approval"),
+            &transcript
+        ));
+
+        // Injected task notification (user TEXT) while the dialog waits:
+        // resolves an idle prompt (the session will process it) but must
+        // NOT resolve a permission dialog.
+        let with_task = format!(
+            "{base}{}
+",
+            r#"{"type":"user","message":{"role":"user","content":"<task-notification>done</task-notification>"}}"#
+        );
+        fs::write(&transcript, &with_task).expect("task");
+        assert!(
+            !prompt_resolved_in_transcript(&prompt("approval"), &transcript),
+            "mtime moved, but a permission dialog may still be on screen"
+        );
+        assert!(prompt_resolved_in_transcript(&prompt("reply"), &transcript));
+
+        // A tool RESULT cannot be attributed to THIS approval — a parallel
+        // already-allowed tool finishing first looks identical — so it must
+        // NOT clear an approval. It does clear an idle prompt.
+        let with_result = format!(
+            "{with_task}{}
+",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#
+        );
+        fs::write(&transcript, &with_result).expect("result");
+        assert!(
+            !prompt_resolved_in_transcript(&prompt("approval"), &transcript),
+            "an unattributable result must not answer for the dialog"
+        );
+        assert!(prompt_resolved_in_transcript(&prompt("reply"), &transcript));
+
+        // A SIDECHAIN assistant entry is a subagent talking in the same
+        // file — the main session may still be sitting at the dialog.
+        fs::write(
+            &transcript,
+            format!(
+                "{base}{}
+",
+                r#"{"type":"assistant","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"subagent"}]}}"#
+            ),
+        )
+        .expect("sidechain");
+        assert!(
+            !prompt_resolved_in_transcript(&prompt("approval"), &transcript),
+            "sidechain output is not the main turn moving"
+        );
+        assert!(
+            !prompt_resolved_in_transcript(&prompt("reply"), &transcript),
+            "not for idle prompts either"
+        );
+
+        // Evidence followed by bytes that are INVALID UTF-8 (as a capped
+        // read can produce by cutting a multi-byte character): the valid
+        // evidence before the damage must still count.
+        let mut damaged = format!(
+            "{base}{}
+",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"onward"}]}}"#
+        )
+        .into_bytes();
+        damaged.extend_from_slice(&[0xE4, 0xB8]); // truncated 中
+        fs::write(&transcript, &damaged).expect("utf8 damage");
+        assert!(
+            prompt_resolved_in_transcript(&prompt("approval"), &transcript),
+            "a mangled tail must not discard evidence that already arrived"
+        );
+
+        // Evidence BEYOND what any fixed byte window would cover: megabytes
+        // of sidechain chatter first, the real main-chain continuation
+        // after. A capped read never saw it and the prompt lingered to its
+        // Stop — streaming must find it.
+        let filler_line = format!(
+            "{}
+",
+            r#"{"type":"assistant","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"PADPADPADPADPADPADPADPADPADPADPADPADPADPADPADPADPADPADPADPADPADPADPADPAD"}]}}"#
+        );
+        let mut huge = String::with_capacity(6 * 1024 * 1024);
+        huge.push_str(base);
+        while huge.len() < 5 * 1024 * 1024 {
+            huge.push_str(&filler_line);
+        }
+        huge.push_str(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"finally"}]}}"#,
+        );
+        huge.push('\n');
+        fs::write(&transcript, &huge).expect("huge transcript");
+        assert!(
+            prompt_resolved_in_transcript(&prompt("approval"), &transcript),
+            "evidence past 4MiB of sidechain chatter must still be found"
+        );
+
+        // Assistant activity is definite for anything.
+        fs::write(
+            &transcript,
+            format!(
+                "{base}{}
+",
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"onward"}]}}"#
+            ),
+        )
+        .expect("assistant");
+        assert!(prompt_resolved_in_transcript(
+            &prompt("approval"),
+            &transcript
+        ));
+
+        // No boundary recorded (pre-upgrade row): never auto-resolved.
+        let legacy = crate::state::PendingPrompt {
+            transcript_bytes: None,
+            ..prompt("approval")
+        };
+        fs::write(&transcript, &with_result).expect("rewrite");
+        assert!(!prompt_resolved_in_transcript(&legacy, &transcript));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// End to end through the scan path: a dialog the user already dealt
+    /// with (tool result after the boundary) is cleared by the next sync,
+    /// while one with only injected task text after it survives. This is
+    /// the bug that pinned a phantom "waiting on you" to /threads for hours
+    /// of a long agentic turn.
+    #[test]
+    fn sync_clears_prompts_the_user_already_answered() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let projects =
+            std::env::temp_dir().join(format!("tinyctb-answered-prompt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&projects);
+        let workspace = projects.join("-home-user-x");
+        fs::create_dir_all(&workspace).expect("projects dir");
+        std::env::set_var("TINYCTB_CLAUDE_PROJECTS_DIR", &projects);
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+
+        let base = r#"{"type":"user","message":{"role":"user","content":"hi"}}
+"#;
+        let transcript = workspace.join("sess-answered.jsonl");
+        fs::write(&transcript, base).expect("transcript");
+        let boundary = base.len() as u64;
+
+        let seed = |bytes: Option<u64>| {
+            crate::state::upsert_thread_snapshot(
+                &conn,
+                &crate::state::BridgeThreadSnapshot {
+                    thread_id: "sess-answered".to_string(),
+                    name: None,
+                    cwd: None,
+                    updated_at: Some(1000),
+                    status_type: "active".to_string(),
+                    status_flags: vec![],
+                    last_turn_status: None,
+                    last_preview: None,
+                    pending_prompt: Some(crate::state::PendingPrompt {
+                        prompt_id: "notify:1000".to_string(),
+                        kind: "approval".to_string(),
+                        status: "pending".to_string(),
+                        question: Some("Claude needs your permission".to_string()),
+                        transcript_bytes: bytes,
+                    }),
+                    event_uid: None,
+                },
+                1000,
+            )
+            .expect("seed");
+        };
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        let count = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM pending_prompts WHERE thread_id = 'sess-answered'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count")
+        };
+
+        // Only injected task text after the boundary: the dialog may still
+        // be on screen — the row must survive the sync.
+        seed(Some(boundary));
+        fs::write(
+            &transcript,
+            format!(
+                "{base}{}
+",
+                r#"{"type":"user","message":{"role":"user","content":"<task-notification>x</task-notification>"}}"#
+            ),
+        )
+        .expect("task text");
+        sync_state_from_sessions(&conn, &config, 5000, 10, false).expect("sync");
+        assert_eq!(
+            count(&conn),
+            1,
+            "task text alone must not clear an approval"
+        );
+
+        // The main chain continues (every dialog outcome ends here): sync
+        // clears the row.
+        fs::write(
+            &transcript,
+            format!(
+                "{base}{}
+",
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"continuing"}]}}"#
+            ),
+        )
+        .expect("assistant continues");
+        sync_state_from_sessions(&conn, &config, 6000, 10, false).expect("sync");
+        assert_eq!(count(&conn), 0, "an answered dialog's row must be cleared");
+
+        std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
+        let _ = fs::remove_dir_all(&projects);
+    }
+
+    /// Completion-style notifications are announcements, not waits: none of
+    /// them may mint a pending prompt. Only the dialog-ish types do — and
+    /// permission_prompt types as approval with the transcript boundary
+    /// recorded at hook time riding along.
+    #[test]
+    fn completion_notifications_do_not_become_waits() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let temp = TempDirGuard::new("spool-types");
+        std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
+        let projects = temp.path.join("projects").join("-home-user-x");
+        fs::create_dir_all(&projects).expect("projects dir");
+        std::env::set_var(
+            "TINYCTB_CLAUDE_PROJECTS_DIR",
+            temp.path.join("projects").display().to_string(),
+        );
+        let transcript = projects.join("sess-types.jsonl");
+        fs::write(
+            &transcript,
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}
+"#,
+        )
+        .expect("transcript");
+        let size = fs::metadata(&transcript).expect("meta").len();
+
+        let spool = |ts: u64, ntype: &str, msg: &str| {
+            let mut payload = std::io::Cursor::new(
+                json!({
+                    "hook_event_name": "Notification",
+                    "session_id": "sess-types",
+                    "transcript_path": transcript.display().to_string(),
+                    "notification_type": ntype,
+                    "message": msg
+                })
+                .to_string(),
+            );
+            write_hook_event_from_reader(&mut payload, ts).expect("spool");
+        };
+
+        // auth_success must vanish without minting a wait.
+        spool(1000, "auth_success", "Authentication successful");
+        let (snapshots, _, _) = ingest_spool_events(2000).expect("ingest");
+        assert!(
+            snapshots
+                .iter()
+                .all(|snapshot| snapshot.pending_prompt.is_none()),
+            "a completion notification must not become a pending prompt: {snapshots:?}"
+        );
+
+        // permission_prompt DOES, as an approval, carrying the transcript
+        // boundary the hook measured.
+        spool(
+            3000,
+            "permission_prompt",
+            "Claude needs your permission to use Bash",
+        );
+        let (snapshots, _, _) = ingest_spool_events(4000).expect("ingest");
+        let prompt = snapshots
+            .iter()
+            .find_map(|snapshot| snapshot.pending_prompt.as_ref())
+            .expect("a permission_prompt must become a pending prompt");
+        assert_eq!(prompt.kind, "approval");
+        assert_eq!(
+            prompt.transcript_bytes,
+            Some(size),
+            "the hook-time transcript boundary must ride along"
+        );
+
+        // A wait type invented AFTER this code was written must not be
+        // silently dropped: unknown types fall back to the message text.
+        spool(
+            5000,
+            "brand_new_wait_type",
+            "Claude needs your permission to use Frobnicator",
+        );
+        let (snapshots, _, _) = ingest_spool_events(6000).expect("ingest");
+        let prompt = snapshots
+            .iter()
+            .find_map(|snapshot| snapshot.pending_prompt.as_ref())
+            .expect("an unknown type must still be treated as a wait");
+        assert_eq!(prompt.kind, "approval", "classified by its message text");
+
+        std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
     }
 
     #[test]

@@ -17,6 +17,11 @@ pub(crate) struct PendingPrompt {
     pub(crate) kind: String,
     pub(crate) status: String,
     pub(crate) question: Option<String>,
+    /// Transcript size (bytes) at the moment the notification FIRED,
+    /// recorded by the hook itself. Everything after this boundary is what
+    /// happened since the prompt appeared — the evidence for deciding it
+    /// was dealt with. `None` on rows from before this column existed.
+    pub(crate) transcript_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -719,6 +724,7 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "telegram_command_routes", "payload_json", "TEXT")?;
     ensure_column(conn, "telegram_callback_routes", "approval_id", "TEXT")?;
     ensure_column(conn, "pending_questions", "multi_select", "INTEGER")?;
+    ensure_column(conn, "pending_prompts", "transcript_bytes", "INTEGER")?;
     ensure_column(conn, "pending_approvals", "headless", "INTEGER")?;
     ensure_column(conn, "telegram_callback_routes", "question_id", "TEXT")?;
     ensure_column(conn, "telegram_callback_routes", "answer", "TEXT")?;
@@ -966,14 +972,15 @@ pub(crate) fn upsert_thread_snapshot(
     match &snapshot.pending_prompt {
         Some(prompt) => {
             conn.execute(
-                "INSERT INTO pending_prompts(thread_id, prompt_id, prompt_kind, prompt_status, question, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO pending_prompts(thread_id, prompt_id, prompt_kind, prompt_status, question, created_at, transcript_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(thread_id) DO UPDATE SET
                     prompt_id = excluded.prompt_id,
                     prompt_kind = excluded.prompt_kind,
                     prompt_status = excluded.prompt_status,
                     question = excluded.question,
-                    created_at = excluded.created_at",
+                    created_at = excluded.created_at,
+                    transcript_bytes = excluded.transcript_bytes",
                 params![
                     snapshot.thread_id,
                     prompt.prompt_id,
@@ -981,6 +988,7 @@ pub(crate) fn upsert_thread_snapshot(
                     prompt.status,
                     prompt.question.clone().unwrap_or_default(),
                     to_sql_i64(now)?,
+                    prompt.transcript_bytes.map(|bytes| bytes as i64),
                 ],
             )?;
         }
@@ -1427,6 +1435,7 @@ pub(crate) fn list_waiting_from_db(
                     kind: prompt_kind.clone(),
                     status: prompt_status,
                     question: Some(question.clone()),
+                    transcript_bytes: None,
                 };
                 let project = derive_project_label(cwd.as_deref());
                 let display_name = derive_thread_display_name(
@@ -1552,6 +1561,7 @@ pub(crate) fn list_recent_thread_snapshots_from_db(
                         kind: prompt_kind.unwrap_or_else(|| "reply".to_string()),
                         status: prompt_status.unwrap_or_else(|| "Needs input".to_string()),
                         question,
+                        transcript_bytes: None,
                     }),
                     event_uid: None,
                 })
@@ -1617,6 +1627,7 @@ pub(crate) fn list_inbox_from_db(
                     kind,
                     status: prompt_status.unwrap_or_else(|| "Needs input".to_string()),
                     question,
+                    transcript_bytes: None,
                 });
                 let snapshot = BridgeThreadSnapshot {
                     thread_id,
@@ -1821,6 +1832,7 @@ pub(crate) fn threads_with_pending_terminal_prompts(
                 kind: row.get(2)?,
                 status: row.get(3)?,
                 question: row.get(4)?,
+                transcript_bytes: None,
             },
             row.get::<_, i64>(5)?,
         ))
@@ -2922,6 +2934,7 @@ mod tests {
                 kind: "approval".to_string(),
                 status: "Needs approval".to_string(),
                 question: Some(format!("preview for {thread_id}")),
+                transcript_bytes: None,
             })
         } else if status_flags_vec
             .iter()
@@ -2932,6 +2945,7 @@ mod tests {
                 kind: "reply".to_string(),
                 status: "Needs input".to_string(),
                 question: Some(format!("preview for {thread_id}")),
+                transcript_bytes: None,
             })
         } else {
             None

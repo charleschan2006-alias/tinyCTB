@@ -1226,6 +1226,7 @@ mod tests {
                 kind: "reply".to_string(),
                 status: "pending".to_string(),
                 question: Some("Can you confirm?".to_string()),
+                transcript_bytes: None,
             }),
             event_uid: None,
         };

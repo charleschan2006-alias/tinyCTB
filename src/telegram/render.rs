@@ -959,6 +959,7 @@ mod tests {
                 kind: "approval".to_string(),
                 status: "pending".to_string(),
                 question: Some("Claude needs your permission".to_string()),
+                transcript_bytes: None,
             }),
             event_uid: None,
         };
@@ -1126,6 +1127,7 @@ mod tests {
                 kind: "approval".to_string(),
                 status: "pending".to_string(),
                 question: Some("问".repeat(9_000)),
+                transcript_bytes: None,
             }),
             event_uid: None,
         };
