@@ -41,7 +41,7 @@ use crate::state::{
 #[cfg(test)]
 use crate::state::{
     deliver_due_outbound_events, enqueue_outbound_event, record_transport_delivery,
-    transport_delivery_exists, OutboxDeliverySummary,
+    transport_delivered_at, OutboxDeliverySummary,
 };
 use crate::telegram::{telegram_setup_result, telegram_status_result, telegram_test_result};
 use clap::Parser;
@@ -374,6 +374,11 @@ fn run() -> Result<i32> {
             let stdin = std::io::stdin();
             let result =
                 approvals::run_question_gate(&mut stdin.lock(), now).unwrap_or_else(|_| json!({}));
+            println!("{}", serde_json::to_string(&result)?);
+        }
+        Commands::PromptContext => {
+            let stdin = std::io::stdin();
+            let result = approvals::run_prompt_context(&mut stdin.lock());
             println!("{}", serde_json::to_string(&result)?);
         }
         Commands::Projects { command } => match command {
@@ -1153,7 +1158,9 @@ mod tests {
         let conn = create_state_db_in_memory().expect("db");
 
         assert!(
-            !transport_delivery_exists(&conn, "event_1", "telegram").expect("lookup"),
+            transport_delivered_at(&conn, "event_1", "telegram")
+                .expect("lookup")
+                .is_none(),
             "transport should not start delivered"
         );
         record_transport_delivery(
@@ -1166,11 +1173,15 @@ mod tests {
         .expect("record delivery");
 
         assert!(
-            transport_delivery_exists(&conn, "event_1", "telegram").expect("lookup"),
+            transport_delivered_at(&conn, "event_1", "telegram")
+                .expect("lookup")
+                .is_some(),
             "recorded transport should be treated as delivered"
         );
         assert!(
-            !transport_delivery_exists(&conn, "event_1", "other").expect("lookup"),
+            transport_delivered_at(&conn, "event_1", "other")
+                .expect("lookup")
+                .is_none(),
             "other transports for the same event must remain pending"
         );
     }
@@ -1227,6 +1238,7 @@ mod tests {
                 status: "pending".to_string(),
                 question: Some("Can you confirm?".to_string()),
                 transcript_bytes: None,
+                notification_type: None,
             }),
             event_uid: None,
         };

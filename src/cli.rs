@@ -105,6 +105,11 @@ pub(crate) enum Commands {
         about = "PreToolUse hook: answer an AskUserQuestion from Telegram while away"
     )]
     QuestionGate,
+    #[command(
+        hide = true,
+        about = "UserPromptSubmit hook: teach away-mode sessions to ask choices via AskUserQuestion"
+    )]
+    PromptContext,
     #[command(about = "Manage the curated project registry for Telegram-created sessions")]
     Projects {
         #[command(subcommand)]
@@ -178,7 +183,7 @@ pub(crate) enum DaemonCommands {
     Run {
         #[arg(long, default_value_t = false)]
         once: bool,
-        #[arg(long = "poll-interval", default_value_t = 1500)]
+        #[arg(long = "poll-interval", default_value_t = 500)]
         poll_interval: u64,
         #[arg(long, default_value_t = 10000)]
         timeout_ms: u64,

@@ -3821,6 +3821,7 @@ mod tests {
                 status: "pending".to_string(),
                 question: Some("Claude needs your permission".to_string()),
                 transcript_bytes: None,
+                notification_type: None,
             }),
             event_uid: None,
         };
@@ -4218,6 +4219,7 @@ mod tests {
                 status: "pending".to_string(),
                 question: Some("Claude needs your permission".to_string()),
                 transcript_bytes: None,
+                notification_type: None,
             }),
             event_uid: None,
         };

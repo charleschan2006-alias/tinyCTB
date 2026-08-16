@@ -469,7 +469,59 @@ fn text_from_message_content(content: &Value) -> Option<String> {
 /// Defensive parse of a Claude Code session transcript. The JSONL format is not
 /// a stable API: unknown record types are skipped, sidechain (subagent) and
 /// meta records are ignored.
+/// Process-wide cache for transcript summaries, keyed by path and validated
+/// by (mtime_ms, len). The daemon's full sync re-summarises up to 50 session
+/// transcripts every ~1.5s, and an active session's transcript runs to tens
+/// of megabytes — re-parsing unchanged files burned ~10% of a core, growing
+/// with conversation length (measured 2026-08-16). A (mtime, size) match
+/// reuses the previous parse; any append or rewrite changes at least one of
+/// the two. CLI one-shot invocations simply run with a cold cache.
+type TranscriptSummaryCache = std::collections::HashMap<PathBuf, (u64, u64, TranscriptSummary)>;
+static TRANSCRIPT_SUMMARY_CACHE: std::sync::Mutex<Option<TranscriptSummaryCache>> =
+    std::sync::Mutex::new(None);
+
+/// Cache growth bound: strictly more than the 50-session scan window, small
+/// enough that a clear-and-rebuild (one sync's worth of parsing) is cheap.
+const TRANSCRIPT_SUMMARY_CACHE_MAX: usize = 128;
+
 pub(crate) fn parse_transcript_summary(path: &Path) -> Result<TranscriptSummary> {
+    let fingerprint = fs::metadata(path).ok().and_then(|meta| {
+        let mtime_ms = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis() as u64;
+        Some((mtime_ms, meta.len()))
+    });
+    if let Some((mtime_ms, len)) = fingerprint {
+        let mut guard = TRANSCRIPT_SUMMARY_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((cached_mtime, cached_len, summary)) = guard
+            .get_or_insert_with(std::collections::HashMap::new)
+            .get(path)
+        {
+            if *cached_mtime == mtime_ms && *cached_len == len {
+                return Ok(summary.clone());
+            }
+        }
+    }
+    let summary = parse_transcript_summary_uncached(path)?;
+    if let Some((mtime_ms, len)) = fingerprint {
+        let mut guard = TRANSCRIPT_SUMMARY_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = guard.get_or_insert_with(std::collections::HashMap::new);
+        if cache.len() >= TRANSCRIPT_SUMMARY_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(path.to_path_buf(), (mtime_ms, len, summary.clone()));
+    }
+    Ok(summary)
+}
+
+fn parse_transcript_summary_uncached(path: &Path) -> Result<TranscriptSummary> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read session transcript at {}", path.display()))?;
     let mut summary = TranscriptSummary::default();
@@ -808,6 +860,10 @@ fn pending_prompt_from_notification(
         status: "pending".to_string(),
         question,
         transcript_bytes,
+        notification_type: payload
+            .get("notification_type")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     }
 }
 
@@ -1100,7 +1156,7 @@ fn existing_thread_state(
         .flatten();
     let pending: Option<PendingPrompt> = conn
         .query_row(
-            "SELECT prompt_id, prompt_kind, prompt_status, question, transcript_bytes
+            "SELECT prompt_id, prompt_kind, prompt_status, question, transcript_bytes, notification_type
              FROM pending_prompts WHERE thread_id = ?1",
             params![thread_id],
             |row| {
@@ -1117,6 +1173,7 @@ fn existing_thread_state(
                         }
                     },
                     transcript_bytes: row.get::<_, Option<i64>>(4)?.map(|bytes| bytes as u64),
+                    notification_type: row.get(5)?,
                 })
             },
         )
@@ -2274,16 +2331,70 @@ pub(crate) fn turn_log_tail(log_path: &Path, max_chars: usize) -> String {
 // ---------------------------------------------------------------------------
 // Daemon wakeup watcher (spool dir + Claude projects dir)
 
+/// What woke the daemon: a hook spool write (push-latency path — the next
+/// cycle must run the full sync immediately) or ordinary transcript churn
+/// in the projects dir (active sessions append constantly; forcing a full
+/// sync per append made the loop spin at max speed — measured ~10% of a
+/// core with one busy session).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatchWake {
+    Spool,
+    Projects,
+}
+
 pub(crate) struct ClaudeWatchReceiver {
-    rx: std::sync::mpsc::Receiver<()>,
+    rx: std::sync::mpsc::Receiver<WatchWake>,
     _watcher: notify::RecommendedWatcher,
 }
 
 impl ClaudeWatchReceiver {
-    pub(crate) fn recv_timeout(&self, timeout: Duration) {
-        let _ = self.rx.recv_timeout(timeout);
-        while self.rx.try_recv().is_ok() {}
+    /// Waits out the full tick unless a SPOOL wake arrives — the signal that
+    /// a hook just fired and the next cycle must sync immediately; returns
+    /// true only then. Transcript churn (Projects wakes) is deliberately
+    /// slept through: an active session streams dozens of transcript writes
+    /// per second, and ending the wait on each one turned the poll interval
+    /// into a fiction — the daemon ticked ~26×/s and burned ~10% of a core
+    /// running fast lanes that transcript writes can never feed (measured).
+    /// The periodic full sync picks transcript changes up on its own cadence.
+    pub(crate) fn recv_timeout(&self, timeout: Duration) -> bool {
+        wait_for_spool_wake(&self.rx, timeout)
     }
+}
+
+/// Bound on the post-wait drain. A watcher flooding the channel faster than
+/// `try_recv` empties it could otherwise pin the loop here forever; anything
+/// left behind is picked up by the next tick's wait (Projects wakes are
+/// skipped there anyway, a leftover Spool wake ends it immediately).
+const WATCH_DRAIN_LIMIT: usize = 4096;
+
+fn wait_for_spool_wake(rx: &std::sync::mpsc::Receiver<WatchWake>, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut spool_woken = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(WatchWake::Spool) => {
+                spool_woken = true;
+                break;
+            }
+            Ok(WatchWake::Projects) => continue,
+            Err(_) => break,
+        }
+    }
+    // Coalesce everything already queued: a burst of hook events must
+    // collapse into ONE spool-woken tick, not schedule a back-to-back full
+    // sync per duplicate wake left sitting in the channel.
+    for _ in 0..WATCH_DRAIN_LIMIT {
+        match rx.try_recv() {
+            Ok(WatchWake::Spool) => spool_woken = true,
+            Ok(WatchWake::Projects) => {}
+            Err(_) => break,
+        }
+    }
+    spool_woken
 }
 
 pub(crate) fn start_claude_watch_receiver() -> Result<ClaudeWatchReceiver> {
@@ -2291,10 +2402,20 @@ pub(crate) fn start_claude_watch_receiver() -> Result<ClaudeWatchReceiver> {
     fs::create_dir_all(&spool).ok();
     let projects = claude_projects_dir()?;
     let (tx, rx) = std::sync::mpsc::channel();
+    let spool_for_watcher = spool.clone();
     let mut watcher = notify::RecommendedWatcher::new(
         move |result: notify::Result<notify::Event>| {
-            if result.is_ok() {
-                let _ = tx.send(());
+            if let Ok(event) = result {
+                let wake = if event
+                    .paths
+                    .iter()
+                    .any(|path| path.starts_with(&spool_for_watcher))
+                {
+                    WatchWake::Spool
+                } else {
+                    WatchWake::Projects
+                };
+                let _ = tx.send(wake);
             }
         },
         notify::Config::default(),
@@ -2350,6 +2471,138 @@ mod tests {
             writeln!(file, "{line}").expect("write transcript line");
         }
         path
+    }
+
+    #[test]
+    fn transcript_summary_cache_sees_appends() {
+        // The summary cache keys on (mtime, size); an append changes the size
+        // even when it lands within the same millisecond, so a cached entry
+        // must never mask new transcript content. This is the direction that
+        // would rot silently: a hit that SHOULD miss shows a stale preview.
+        let temp = TempDirGuard::new("tinyctb-summary-cache");
+        let path = write_transcript(
+            &temp.path,
+            "sess-cache",
+            &[
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "first answer"}
+                ]}}),
+            ],
+        );
+        let first = parse_transcript_summary(&path).expect("first parse");
+        assert_eq!(first.last_assistant_text.as_deref(), Some("first answer"));
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("append");
+        writeln!(
+            file,
+            "{}",
+            json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "second answer"}
+            ]}})
+        )
+        .expect("append line");
+
+        let second = parse_transcript_summary(&path).expect("second parse");
+        assert_eq!(second.last_assistant_text.as_deref(), Some("second answer"));
+    }
+
+    #[test]
+    fn transcript_summary_cache_hits_on_unchanged_fingerprint() {
+        // Proves the cache actually SERVES hits: rewrite the file with
+        // different same-length content and restore the mtime, so only a
+        // cache hit can explain seeing the old text. Deleting the cache
+        // implementation makes this fail — the append test alone would not.
+        let temp = TempDirGuard::new("tinyctb-summary-cache-hit");
+        let path = write_transcript(
+            &temp.path,
+            "sess-cache-hit",
+            &[
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "cache hit one"}
+                ]}}),
+            ],
+        );
+        let first = parse_transcript_summary(&path).expect("first parse");
+        assert_eq!(first.last_assistant_text.as_deref(), Some("cache hit one"));
+
+        let saved_mtime = fs::metadata(&path)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
+        let raw = fs::read_to_string(&path).expect("read");
+        let swapped = raw.replace("cache hit one", "cache hit two");
+        assert_ne!(raw, swapped);
+        assert_eq!(raw.len(), swapped.len(), "rewrite must preserve length");
+        fs::write(&path, swapped).expect("rewrite");
+        let file = fs::File::options().write(true).open(&path).expect("open");
+        file.set_modified(saved_mtime).expect("restore mtime");
+        drop(file);
+
+        let second = parse_transcript_summary(&path).expect("second parse");
+        assert_eq!(
+            second.last_assistant_text.as_deref(),
+            Some("cache hit one"),
+            "an unchanged (mtime, len) fingerprint must be served from cache"
+        );
+    }
+
+    #[test]
+    fn spool_wake_burst_coalesces_into_one_tick() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..5 {
+            tx.send(WatchWake::Spool).expect("send");
+        }
+        tx.send(WatchWake::Projects).expect("send");
+        assert!(wait_for_spool_wake(&rx, Duration::from_millis(200)));
+        // The whole burst was consumed by that one tick — a duplicate wake
+        // must not schedule a second back-to-back forced sync.
+        assert!(!wait_for_spool_wake(&rx, Duration::from_millis(0)));
+    }
+
+    #[test]
+    fn projects_churn_does_not_end_the_wait() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            for _ in 0..30 {
+                let _ = tx.send(WatchWake::Projects);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let start = std::time::Instant::now();
+        let woken = wait_for_spool_wake(&rx, Duration::from_millis(80));
+        assert!(!woken, "transcript churn must never report a spool wake");
+        assert!(
+            start.elapsed() >= Duration::from_millis(80),
+            "projects wakes must not shorten the tick"
+        );
+        producer.join().expect("producer");
+    }
+
+    #[test]
+    fn spool_wake_ends_the_wait_early() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = tx.send(WatchWake::Spool);
+        });
+        let start = std::time::Instant::now();
+        assert!(wait_for_spool_wake(&rx, Duration::from_secs(10)));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a spool wake must cut the wait short"
+        );
+        producer.join().expect("producer");
+    }
+
+    #[test]
+    fn queued_spool_wake_survives_a_zero_timeout_drain() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(WatchWake::Projects).expect("send");
+        tx.send(WatchWake::Spool).expect("send");
+        assert!(wait_for_spool_wake(&rx, Duration::from_millis(0)));
     }
 
     #[test]
@@ -2549,6 +2802,7 @@ mod tests {
             status: "pending".to_string(),
             question: Some("Claude needs your permission".to_string()),
             transcript_bytes: Some(boundary),
+            notification_type: None,
         };
 
         // Nothing after the boundary: still waiting.
@@ -2712,6 +2966,7 @@ mod tests {
                         status: "pending".to_string(),
                         question: Some("Claude needs your permission".to_string()),
                         transcript_bytes: bytes,
+                        notification_type: None,
                     }),
                     event_uid: None,
                 },
@@ -2855,6 +3110,114 @@ mod tests {
         assert_eq!(prompt.kind, "approval", "classified by its message text");
 
         std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
+    }
+
+    /// End-to-end for the field that decides whether a wait may be
+    /// suppressed: Notification hook → spool file → ingest → DB row →
+    /// thread JSON → the daemon's suppression check. Every hop must carry
+    /// the RAW notification_type; a break anywhere makes the daemon read
+    /// None and fail open (noisy but safe) or, if the type were folded on
+    /// the way, silently eat a real question.
+    #[test]
+    fn notification_type_survives_the_whole_hook_to_daemon_path() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let temp = TempDirGuard::new("notification-type-e2e");
+        std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
+        let projects = temp.path.join("projects").join("-home-user-project");
+        fs::create_dir_all(&projects).expect("projects dir");
+        std::env::set_var(
+            "TINYCTB_CLAUDE_PROJECTS_DIR",
+            temp.path.join("projects").display().to_string(),
+        );
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        // Wait events are only emitted while away — that is the mode in
+        // which suppression can happen at all.
+        set_away_mode(&conn, true, 500).expect("away on");
+        let config = crate::config::DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: "thread_waiting,thread_completed".to_string(),
+            telegram: None,
+            claude: None,
+            projects: vec![],
+        };
+
+        // Two waits that fold to the SAME kind ("reply") but mean opposite
+        // things for suppression.
+        for (index, (session, notification_type)) in [
+            ("sess-idle", "idle_prompt"),
+            ("sess-question", "agent_needs_input"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            write_transcript(
+                &projects,
+                session,
+                &[json!({"type": "assistant", "cwd": "/home/user/project",
+                "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "相同的结束语"}
+                ]}})],
+            );
+            let mut payload = std::io::Cursor::new(
+                json!({
+                    "hook_event_name": "Notification",
+                    "session_id": session,
+                    "cwd": "/home/user/project",
+                    "notification_type": notification_type,
+                    "message": "Claude is waiting for your input"
+                })
+                .to_string(),
+            );
+            // Distinct receive times: the spool file name is derived from
+            // this timestamp, so a shared one would overwrite the first hook.
+            write_hook_event_from_reader(&mut payload, 1000 + index as u64).expect("spool");
+        }
+
+        let result = sync_state_from_sessions(&conn, &config, 2000, 50, true).expect("sync");
+        std::env::remove_var("TINYCTB_STATE_DIR");
+        std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
+
+        // Hop 1: the DB row kept the raw type (folded kind is still "reply").
+        for (session, notification_type) in [
+            ("sess-idle", "idle_prompt"),
+            ("sess-question", "agent_needs_input"),
+        ] {
+            let (_, prompt) = existing_thread_state(&conn, session).expect("state");
+            let prompt = prompt.unwrap_or_else(|| panic!("{session} must have a pending prompt"));
+            assert_eq!(
+                prompt.kind, "reply",
+                "{session} folds to reply for rendering"
+            );
+            assert_eq!(
+                prompt.notification_type.as_deref(),
+                Some(notification_type),
+                "{session} must keep its raw notification_type in the DB"
+            );
+        }
+
+        // Hop 2: the events the daemon actually consumes — same call it
+        // makes, so the thread object is attached exactly as in production.
+        let events = watch_events_from_sync_result(&result, None);
+        for (session, notification_type) in [
+            ("sess-idle", "idle_prompt"),
+            ("sess-question", "agent_needs_input"),
+        ] {
+            let event = events
+                .iter()
+                .find(|event| {
+                    event.get("type").and_then(Value::as_str) == Some("thread_waiting")
+                        && event.get("threadId").and_then(Value::as_str) == Some(session)
+                })
+                .unwrap_or_else(|| panic!("{session} must produce a thread_waiting event"));
+            assert_eq!(
+                event
+                    .pointer("/thread/pendingPrompt/notificationType")
+                    .and_then(Value::as_str),
+                Some(notification_type),
+                "{session}: the daemon reads this exact pointer to decide suppression"
+            );
+        }
     }
 
     #[test]

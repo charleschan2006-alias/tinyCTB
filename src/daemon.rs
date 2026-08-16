@@ -19,7 +19,7 @@ use crate::state::{
     create_state_db, delete_setting, deliver_due_outbound_events, enqueue_outbound_event,
     get_setting_text, list_running_bridge_turns, mark_bridge_turn_finished, pending_outbound_count,
     prune_state_logs, record_transport_delivery, set_setting_text, should_emit_for_away_window,
-    state_db_path, transport_delivery_exists, BridgeTurn, OutboxDeliverySummary,
+    state_db_path, transport_delivered_at, BridgeTurn, OutboxDeliverySummary,
 };
 use crate::telegram::{
     deliver_telegram_event, extend_telegram_typing_indicator, process_telegram_updates,
@@ -132,6 +132,50 @@ fn should_enqueue_away_notification(conn: &Connection, event: &Value) -> Result<
     ))
 }
 
+/// Is this event the 60s idle reminder repeating what the user was already
+/// sent? True only when BOTH ends of the echo are positively identified:
+/// the current wait must literally be an `idle_prompt` notification (the
+/// prompt's raw notification_type — the folded "reply" kind also covers
+/// `agent_needs_input` and MCP elicitations, which are genuine questions
+/// that may fire right after a completion while lastPreview still shows the
+/// completion text), and its preview must EXACTLY match a completion push
+/// delivered to the same thread moments ago (type and recency constraints
+/// live in `last_delivered_completion_preview`). Anything unknown or
+/// mismatched keeps the notification — fail open to noise, never to
+/// silence.
+fn redundant_idle_reminder(
+    conn: &Connection,
+    event: &Value,
+    thread_id: Option<&str>,
+    now: u64,
+) -> Result<bool> {
+    if event.get("type").and_then(Value::as_str) != Some("thread_waiting") {
+        return Ok(false);
+    }
+    let notification_type = event
+        .pointer("/thread/pendingPrompt/notificationType")
+        .and_then(Value::as_str);
+    if notification_type != Some("idle_prompt") {
+        return Ok(false);
+    }
+    let Some(thread_id) = thread_id else {
+        return Ok(false);
+    };
+    let preview = event
+        .get("lastPreview")
+        .or_else(|| event.pointer("/thread/lastPreview"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if preview.is_empty() {
+        return Ok(false);
+    }
+    Ok(
+        crate::state::last_delivered_completion_preview(conn, thread_id, now)?.as_deref()
+            == Some(preview),
+    )
+}
+
 pub(crate) fn enqueue_daemon_notification_events(
     conn: &Connection,
     events: &[Value],
@@ -151,6 +195,18 @@ pub(crate) fn enqueue_daemon_notification_events(
             None => false,
         };
         if !owed && !should_enqueue_away_notification(conn, event)? {
+            continue;
+        }
+        // Claude fires an idle reminder 60s after every turn ends, carrying
+        // the SAME text as the completion push a minute earlier — the user
+        // reads every answer twice. An idle wait whose preview matches the
+        // last delivered push adds nothing: drop it. Approval waits and
+        // owed bridge answers are never suppressed.
+        if !owed && redundant_idle_reminder(conn, event, thread_id.as_deref(), now)? {
+            eprintln!(
+                "tinyctb: suppressed redundant idle reminder for {}",
+                thread_id.as_deref().unwrap_or("?")
+            );
             continue;
         }
         // Queueing the answer and settling the debt must be one unit: a crash
@@ -422,6 +478,53 @@ fn away_notifications_enabled_from_status(away_status: &Value) -> bool {
     away_status.get("away").and_then(Value::as_bool) == Some(true)
 }
 
+/// One event's trip through the transports: skip what the transport log
+/// already recorded, send the rest. `send` is the real Telegram call in
+/// production and a stub under test, so the skip/timestamp logic below is
+/// exercised as written rather than re-implemented in the test.
+///
+/// The send-then-record-then-mark sequence is crash-visible at both seams.
+/// When recovery finds a transport record without a delivered outbound row,
+/// the SEND already happened at the logged time — that timestamp travels
+/// back as `deliveredAt` so the outbound row is stamped with when the user
+/// actually saw the message, not with the recovery cycle's clock. Ordering
+/// by a recovery-cycle stamp would rank a message the user read before the
+/// crash *after* everything they received later.
+fn deliver_event_through_transports<S>(
+    conn: &Connection,
+    config: &DaemonConfig,
+    event: &Value,
+    now: u64,
+    send: S,
+) -> Result<Value>
+where
+    S: FnOnce(&crate::TelegramConfig) -> Result<Value>,
+{
+    let event_id = notification_event_id(event);
+    let mut delivered_at = None;
+    let telegram = if let Some(telegram) = config.telegram.as_ref() {
+        match transport_delivered_at(conn, &event_id, "telegram")? {
+            Some(sent_at) => {
+                delivered_at = Some(sent_at);
+                json!({
+                    "ok": true,
+                    "transport": "telegram",
+                    "skipped": "already_delivered",
+                    "sentAt": sent_at
+                })
+            }
+            None => {
+                let result = send(telegram)?;
+                record_transport_delivery(conn, &event_id, "telegram", &result, now)?;
+                result
+            }
+        }
+    } else {
+        Value::Null
+    };
+    Ok(json!({ "telegram": telegram, "deliveredAt": delivered_at }))
+}
+
 fn deliver_outbound_events(
     conn: &Connection,
     config: &DaemonConfig,
@@ -430,19 +533,9 @@ fn deliver_outbound_events(
     deadline: Instant,
 ) -> Result<OutboxDeliverySummary> {
     deliver_due_outbound_events(conn, now, 100, Some(deadline), |event| {
-        let event_id = notification_event_id(event);
-        let telegram = if let Some(telegram) = config.telegram.as_ref() {
-            if transport_delivery_exists(conn, &event_id, "telegram")? {
-                json!({ "ok": true, "transport": "telegram", "skipped": "already_delivered" })
-            } else {
-                let result = deliver_telegram_event(conn, telegram, event, now, timeout)?;
-                record_transport_delivery(conn, &event_id, "telegram", &result, now)?;
-                result
-            }
-        } else {
-            Value::Null
-        };
-        Ok(json!({ "telegram": telegram }))
+        deliver_event_through_transports(conn, config, event, now, |telegram| {
+            deliver_telegram_event(conn, telegram, event, now, timeout)
+        })
     })
 }
 
@@ -487,11 +580,45 @@ fn enqueue_sync_error_notification(
     Ok((events, enqueued))
 }
 
+/// Which lanes a wake runs. The 500ms base tick must stay CHEAP: the full
+/// transcript sync (parsing up to 50 session files) and the Telegram
+/// getUpdates HTTP round trip cannot run on every tick — the first for CPU,
+/// the second because Telegram treats aggressive short-polling as abuse. Local
+/// work (outbound delivery, headless turn logs, socket peek) runs every
+/// wake; the expensive lanes keep their own floors.
+#[derive(Debug, Clone, Copy)]
+struct CycleLanes {
+    telegram_updates: bool,
+    full_sync: bool,
+}
+
+const TELEGRAM_UPDATES_MIN_INTERVAL_MS: u64 = 250;
+const FULL_SYNC_MIN_INTERVAL_MS: u64 = 1500;
+
 fn daemon_cycle(
     conn: &Connection,
     config: &DaemonConfig,
     now: u64,
     timeout: Duration,
+) -> Result<Value> {
+    daemon_cycle_lanes(
+        conn,
+        config,
+        now,
+        timeout,
+        CycleLanes {
+            telegram_updates: true,
+            full_sync: true,
+        },
+    )
+}
+
+fn daemon_cycle_lanes(
+    conn: &Connection,
+    config: &DaemonConfig,
+    now: u64,
+    timeout: Duration,
+    lanes: CycleLanes,
 ) -> Result<Value> {
     let deadline = Instant::now() + daemon_cycle_budget(timeout);
     let filter = parse_event_filter(Some(&config.events));
@@ -500,17 +627,19 @@ fn daemon_cycle(
     // must already find the mapping, or it would fall back to a headless
     // `--resume` and fork the session this feature exists to protect.
     // Non-destructive — the spool is still consumed by the sync below.
-    if let Err(error) = crate::claude::peek_session_sockets(conn, now) {
-        println!(
-            "{}",
-            json!({
-                "ok": false,
-                "action": "session_socket_peek_error",
-                "error": format!("{error:#}")
-            })
-        );
+    if lanes.telegram_updates {
+        if let Err(error) = crate::claude::peek_session_sockets(conn, now) {
+            println!(
+                "{}",
+                json!({
+                    "ok": false,
+                    "action": "session_socket_peek_error",
+                    "error": format!("{error:#}")
+                })
+            );
+        }
     }
-    let telegram_updates = match config.telegram.as_ref() {
+    let telegram_updates = match config.telegram.as_ref().filter(|_| lanes.telegram_updates) {
         Some(telegram) => {
             let mut result =
                 match process_telegram_updates(conn, config, now, timeout, Some(deadline)) {
@@ -547,18 +676,22 @@ fn daemon_cycle(
     };
     // Notification enqueueing happens inside the sync (spool consumption and
     // notification persistence must be atomic from the caller's perspective).
-    let (events, enqueued) = match sync_state_from_sessions(conn, config, now, 50, true) {
-        Ok(sync_result) => {
-            end_sync_error_streak(conn)?;
-            (
-                watch_events_from_sync_result(&sync_result, filter.as_ref()),
-                sync_result
-                    .get("enqueued")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            )
+    let (events, enqueued) = if lanes.full_sync {
+        match sync_state_from_sessions(conn, config, now, 50, true) {
+            Ok(sync_result) => {
+                end_sync_error_streak(conn)?;
+                (
+                    watch_events_from_sync_result(&sync_result, filter.as_ref()),
+                    sync_result
+                        .get("enqueued")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                )
+            }
+            Err(error) => enqueue_sync_error_notification(conn, filter.as_ref(), &error, now)?,
         }
-        Err(error) => enqueue_sync_error_notification(conn, filter.as_ref(), &error, now)?,
+    } else {
+        (Vec::new(), 0)
     };
     // Bridge-turn answers are collected AFTER the sync so the away-duplicate
     // check can see anything the sync just enqueued for the same completion.
@@ -614,21 +747,44 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
     );
     let watch_rx = start_claude_watch_receiver().ok();
     let mut last_prune_at = 0u64;
+    let mut last_updates_at = 0u64;
+    let mut last_sync_at = 0u64;
+    // A spool/projects wake means a hook just fired: the next cycle must run
+    // the full sync immediately, whatever the cadence says — that is the
+    // push-latency path.
+    let mut woken = true;
+    let mut cached_config: Option<DaemonConfig> = None;
     loop {
-        let config = match load_daemon_config() {
-            Ok(config) => config,
-            Err(error) => {
-                println!(
-                    "{}",
-                    json!({
-                        "ok": false,
-                        "action": "daemon_config_error",
-                        "error": format!("{error:#}")
-                    })
-                );
-                thread::sleep(Duration::from_millis(poll_interval));
-                continue;
-            }
+        // Reloading (read + parse) 10x a second is pure waste; the config
+        // refreshes on the sync cadence, which is how often it mattered
+        // before the fast tick existed.
+        if cached_config.is_none()
+            || now_millis()
+                .map(|now| now.saturating_sub(last_sync_at) >= FULL_SYNC_MIN_INTERVAL_MS)
+                .unwrap_or(true)
+        {
+            cached_config = None;
+        }
+        let config = match cached_config.clone() {
+            Some(config) => config,
+            None => match load_daemon_config() {
+                Ok(config) => {
+                    cached_config = Some(config.clone());
+                    config
+                }
+                Err(error) => {
+                    println!(
+                        "{}",
+                        json!({
+                            "ok": false,
+                            "action": "daemon_config_error",
+                            "error": format!("{error:#}")
+                        })
+                    );
+                    thread::sleep(Duration::from_millis(poll_interval));
+                    continue;
+                }
+            },
         };
         let now = match now_millis() {
             Ok(now) => now,
@@ -670,8 +826,37 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
             }
             last_prune_at = now;
         }
-        match daemon_cycle(&conn, &config, now, timeout) {
-            Ok(result) => println!("{}", result),
+        let lanes = CycleLanes {
+            telegram_updates: now.saturating_sub(last_updates_at)
+                >= TELEGRAM_UPDATES_MIN_INTERVAL_MS,
+            full_sync: woken || now.saturating_sub(last_sync_at) >= FULL_SYNC_MIN_INTERVAL_MS,
+        };
+        if lanes.telegram_updates {
+            last_updates_at = now;
+        }
+        if lanes.full_sync {
+            last_sync_at = now;
+        }
+        match daemon_cycle_lanes(&conn, &config, now, timeout, lanes) {
+            // Ten JSON lines a second would drown the log in idle ticks:
+            // fast lanes stay silent unless something actually happened.
+            Ok(result) => {
+                let noteworthy = lanes.full_sync
+                    || result.get("enqueued").and_then(Value::as_u64).unwrap_or(0) > 0
+                    || result
+                        .pointer("/delivery/delivered")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        > 0
+                    || result
+                        .pointer("/bridgeTurns/answered")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        > 0;
+                if noteworthy {
+                    println!("{}", result);
+                }
+            }
             Err(error) => {
                 println!(
                     "{}",
@@ -683,11 +868,13 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
                 );
             }
         }
-        if let Some(rx) = watch_rx.as_ref() {
-            rx.recv_timeout(Duration::from_millis(poll_interval));
-        } else {
-            thread::sleep(Duration::from_millis(poll_interval));
-        }
+        woken = match watch_rx.as_ref() {
+            Some(rx) => rx.recv_timeout(Duration::from_millis(poll_interval)),
+            None => {
+                thread::sleep(Duration::from_millis(poll_interval));
+                false
+            }
+        };
     }
 }
 
@@ -1532,6 +1719,305 @@ mod tests {
         assert!(payloads
             .iter()
             .any(|payload| payload.contains("answer two")));
+    }
+
+    /// The 60s idle reminder repeats the completion push word for word —
+    /// the user reads every answer twice. A reply-kind wait matching the
+    /// last DELIVERED preview is suppressed; a new text, an approval wait,
+    /// or a first-ever push all still go out.
+    #[test]
+    fn idle_reminder_repeating_the_delivered_answer_is_suppressed() {
+        let conn = create_state_db_in_memory().expect("db");
+        let completed = json!({
+            "type": "thread_completed",
+            "threadId": "sess-echo",
+            "updatedAt": 1000,
+            "eventKey": "stop:1",
+            "lastPreview": "最终答案在此",
+            "thread": {"threadId": "sess-echo", "lastPreview": "最终答案在此"}
+        });
+        // Delivered completion push on record.
+        enqueue_outbound_event(&conn, &completed, 1000, "away").expect("enqueue");
+        conn.execute(
+            "UPDATE outbound_events SET delivered_at = 1500, status = 'delivered'",
+            [],
+        )
+        .expect("mark delivered");
+
+        let waiting = |preview: &str, kind: &str, notification_type: &str, key: &str| {
+            json!({
+                "type": "thread_waiting",
+                "threadId": "sess-echo",
+                "updatedAt": 2000,
+                "eventKey": key,
+                "lastPreview": preview,
+                "thread": {
+                    "threadId": "sess-echo",
+                    "lastPreview": preview,
+                    "pendingPrompt": {"promptId": key, "kind": kind, "promptKind": kind,
+                                       "notificationType": notification_type,
+                                       "status": "pending", "question": "Claude is waiting"}
+                }
+            })
+        };
+        crate::claude::set_away_mode(&conn, true, 1900).expect("away on");
+
+        // Same text, literal idle_prompt: suppressed.
+        let n = enqueue_daemon_notification_events(
+            &conn,
+            &[waiting("最终答案在此", "reply", "idle_prompt", "notify:2")],
+            2000,
+        )
+        .expect("enqueue");
+        assert_eq!(n, 0, "the echo reminder must be dropped");
+
+        // Different text: a genuinely new wait goes out.
+        let n = enqueue_daemon_notification_events(
+            &conn,
+            &[waiting(
+                "请选择方案 A 或 B",
+                "reply",
+                "idle_prompt",
+                "notify:3",
+            )],
+            2100,
+        )
+        .expect("enqueue");
+        assert_eq!(n, 1, "new content must still notify");
+
+        // Same text but an APPROVAL wait: never suppressed.
+        let n = enqueue_daemon_notification_events(
+            &conn,
+            &[waiting(
+                "最终答案在此",
+                "approval",
+                "permission_prompt",
+                "notify:4",
+            )],
+            2200,
+        )
+        .expect("enqueue");
+        assert_eq!(n, 1, "approval waits are never dropped");
+
+        // Same text, reply kind, but a GENUINE question that happened to
+        // fire right after the completion (agent_needs_input, MCP
+        // elicitation): the folded kind says "reply", the raw
+        // notification_type says it is not an idle reminder — never drop.
+        for (notification_type, key) in [
+            ("agent_needs_input", "notify:5"),
+            ("elicitation_dialog", "notify:6"),
+        ] {
+            let n = enqueue_daemon_notification_events(
+                &conn,
+                &[waiting("最终答案在此", "reply", notification_type, key)],
+                2300,
+            )
+            .expect("enqueue");
+            assert_eq!(n, 1, "{notification_type} must never be suppressed");
+        }
+
+        // No notificationType at all (rows predating the column, non-hook
+        // prompts): unknown provenance fails open.
+        let mut legacy = waiting("最终答案在此", "reply", "ignored", "notify:7");
+        legacy
+            .pointer_mut("/thread/pendingPrompt")
+            .and_then(Value::as_object_mut)
+            .expect("prompt object")
+            .remove("notificationType");
+        let n = enqueue_daemon_notification_events(&conn, &[legacy], 2400).expect("enqueue");
+        assert_eq!(n, 1, "unknown notification provenance must fail open");
+    }
+
+    /// The suppression is scoped to the completion→reminder echo, nothing
+    /// wider. Two counterexamples that a bare "same preview as last
+    /// delivered" check would get wrong:
+    /// - `events="thread_waiting"` configs never deliver completions, so the
+    ///   last delivered push is a WAIT — the next real wait with identical
+    ///   text is new information, not an echo;
+    /// - a completion delivered long ago cannot vouch for today's wait even
+    ///   if the words match.
+    #[test]
+    fn idle_reminder_suppression_requires_a_recent_completion() {
+        let conn = create_state_db_in_memory().expect("db");
+        crate::claude::set_away_mode(&conn, true, 500).expect("away on");
+        let event = |etype: &str, thread: &str, key: &str, at: u64, kind: &str| {
+            json!({
+                "type": etype,
+                "threadId": thread,
+                "updatedAt": at,
+                "eventKey": key,
+                "lastPreview": "同样的结束语",
+                "thread": {
+                    "threadId": thread,
+                    "lastPreview": "同样的结束语",
+                    "pendingPrompt": {"promptId": key, "kind": kind, "promptKind": kind,
+                                       "notificationType": "idle_prompt",
+                                       "status": "pending", "question": "Claude is waiting"}
+                }
+            })
+        };
+
+        // Prior delivered push is a WAIT (completion was filtered by config):
+        // the next identical wait must still go out.
+        enqueue_outbound_event(
+            &conn,
+            &event("thread_waiting", "sess-wait-only", "wait:1", 1000, "reply"),
+            1000,
+            "away",
+        )
+        .expect("enqueue prior wait");
+        conn.execute(
+            "UPDATE outbound_events SET delivered_at = 1500, status = 'delivered'
+             WHERE thread_id = 'sess-wait-only'",
+            [],
+        )
+        .expect("mark delivered");
+        let n = enqueue_daemon_notification_events(
+            &conn,
+            &[event(
+                "thread_waiting",
+                "sess-wait-only",
+                "wait:2",
+                2000,
+                "reply",
+            )],
+            2000,
+        )
+        .expect("enqueue");
+        assert_eq!(
+            n, 1,
+            "a prior delivered wait must never suppress the next one"
+        );
+
+        // Completion delivered outside the echo window: identical wait is new.
+        enqueue_outbound_event(
+            &conn,
+            &event("thread_completed", "sess-stale", "stop:1", 1000, "reply"),
+            1000,
+            "away",
+        )
+        .expect("enqueue stale completion");
+        conn.execute(
+            "UPDATE outbound_events SET delivered_at = 1500, status = 'delivered'
+             WHERE thread_id = 'sess-stale'",
+            [],
+        )
+        .expect("mark delivered");
+        let long_after = 1500 + crate::state::IDLE_REMINDER_ECHO_WINDOW_MS + 60_000;
+        let n = enqueue_daemon_notification_events(
+            &conn,
+            &[event(
+                "thread_waiting",
+                "sess-stale",
+                "wait:3",
+                long_after,
+                "reply",
+            )],
+            long_after,
+        )
+        .expect("enqueue");
+        assert_eq!(n, 1, "a stale completion cannot vouch for a new wait");
+    }
+
+    /// A crash between "Telegram accepted the message" and "the outbound row
+    /// says delivered" must not rewrite delivery history. The recovery cycle
+    /// re-runs the same production skip path, and the row must end up
+    /// stamped with the ORIGINAL send time — otherwise a completion the user
+    /// read before the crash outranks the wait they received afterwards, and
+    /// idle-echo suppression silently eats a real question.
+    #[test]
+    fn crash_recovery_preserves_the_original_delivery_order() {
+        let conn = create_state_db_in_memory().expect("db");
+        let config = DaemonConfig {
+            telegram: Some(crate::TelegramConfig {
+                bot_token: "token".to_string(),
+                chat_id: "chat".to_string(),
+                allowed_user_id: None,
+            }),
+            ..bridge_test_config()
+        };
+        let completion = json!({
+            "type": "thread_completed",
+            "threadId": "sess-crash",
+            "updatedAt": 1000,
+            "eventKey": "stop:1",
+            "lastPreview": "完成文本"
+        });
+        let wait = json!({
+            "type": "thread_waiting",
+            "threadId": "sess-crash",
+            "updatedAt": 1100,
+            "eventKey": "notify:1",
+            "lastPreview": "完成文本",
+            "thread": {
+                "threadId": "sess-crash",
+                "lastPreview": "完成文本",
+                "pendingPrompt": {"promptId": "notify:1", "kind": "reply",
+                                   "promptKind": "reply", "notificationType": "idle_prompt",
+                                   "status": "pending", "question": "Claude is waiting"}
+            }
+        });
+        enqueue_outbound_event(&conn, &completion, 1000, "away").expect("enqueue completion");
+        enqueue_outbound_event(&conn, &wait, 1100, "away").expect("enqueue wait");
+
+        // t=1200: the completion reaches Telegram and the transport log
+        // records it — then the daemon dies before the outbound row is
+        // marked delivered.
+        deliver_event_through_transports(&conn, &config, &completion, 1200, |_| {
+            Ok(json!({ "ok": true, "messageId": 1 }))
+        })
+        .expect("send completion");
+        assert_eq!(
+            pending_outbound_count(&conn).expect("pending"),
+            2,
+            "the crash left BOTH outbound rows unmarked"
+        );
+
+        // t=9000: the daemon restarts and drains the outbox in one batch.
+        // The completion is skipped (already sent), the wait is sent now.
+        let summary = deliver_due_outbound_events(&conn, 9000, 10, None, |event| {
+            deliver_event_through_transports(&conn, &config, event, 9000, |_| {
+                Ok(json!({ "ok": true, "messageId": 2 }))
+            })
+        })
+        .expect("recovery batch");
+        assert_eq!(summary.delivered, 2);
+
+        // The completion keeps its pre-crash timestamp; the wait carries the
+        // recovery cycle's. Delivery order therefore still reads
+        // completion-then-wait, exactly what the user saw.
+        let stamps: Vec<(String, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT event_type, delivered_at FROM outbound_events
+                     ORDER BY delivered_at ASC",
+                )
+                .expect("stmt");
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("rows");
+            rows
+        };
+        assert_eq!(
+            stamps,
+            vec![
+                ("thread_completed".to_string(), 1200),
+                ("thread_waiting".to_string(), 9000)
+            ],
+            "the crash-orphaned completion must keep its original send time"
+        );
+
+        // And the consequence that matters: the wait delivered after the
+        // completion breaks the vouch, so an identical idle reminder
+        // arriving later is NOT suppressed.
+        assert_eq!(
+            crate::state::last_delivered_completion_preview(&conn, "sess-crash", 9100)
+                .expect("query"),
+            None,
+            "a completion the user saw BEFORE a later wait must not vouch"
+        );
     }
 
     /// Crash consistency of the death verdict, both halves:

@@ -464,6 +464,37 @@ fn away_mode_active() -> bool {
         .unwrap_or(false)
 }
 
+/// UserPromptSubmit hook: while the user is AWAY, teach the session how to
+/// ask them things. An interactive session must use the AskUserQuestion
+/// TOOL (Telegram renders it as buttons); prose questions at the end of a
+/// turn arrive as a plain notification nobody can tap. A headless turn has
+/// no such tool at all (measured 2026-08-12) — it gets the opposite
+/// instruction: list the options at the end and wait for the reply.
+/// At the keyboard (away off) this prints nothing and costs nothing.
+pub(crate) fn run_prompt_context<R: Read>(reader: &mut R) -> Value {
+    // Drain stdin so the hook pipe closes cleanly; the payload itself is
+    // not needed — the decision keys on away mode and the turn token.
+    let mut raw = String::new();
+    let _ = reader.take(1024 * 1024).read_to_string(&mut raw);
+    if !away_mode_active() {
+        return json!({});
+    }
+    let headless = std::env::var(crate::claude::BRIDGE_TURN_ENV)
+        .map(|token| !token.is_empty())
+        .unwrap_or(false);
+    let context = if headless {
+        "用户不在电脑前，正通过 Telegram 手机遥控本会话。本环境没有 AskUserQuestion 工具：需要用户决策时不要猜测——把问题放在回答结尾，清晰列出编号选项，用户会通过 Telegram 回复作答后你再继续。"
+    } else {
+        "用户不在电脑前，正通过 Telegram 手机遥控本会话。需要用户做选择、确认或决策时，必须调用 AskUserQuestion 工具提问（手机上会渲染成可点按钮），不要只在正文里问——正文里的提问在手机上没有按钮可点。是/否类确认同样请用该工具。"
+    };
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context
+        }
+    })
+}
+
 pub(crate) fn run_approval_gate<R: Read>(reader: &mut R, now: u64) -> Result<Value> {
     let payload = read_hook_payload(reader, "PermissionRequest")?;
     gate_tool_call(&payload, GateKind::Interactive, now)
@@ -1974,6 +2005,48 @@ mod tests {
         // Recovery after failures resets the backoff.
         let (_, reset) = next_probe_schedule(Some(Duration::from_secs(1)), backoff);
         assert_eq!(reset, Duration::from_secs(2));
+    }
+
+    /// The away-mode prompt coaching: silent at the keyboard, tool-pushing
+    /// for interactive sessions, options-at-the-end for headless turns
+    /// (which have no AskUserQuestion tool at all).
+    #[test]
+    fn prompt_context_matches_where_the_user_is() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("prompt-context", false, 30);
+        let run = || {
+            let mut reader = std::io::Cursor::new(r#"{"hook_event_name":"UserPromptSubmit"}"#);
+            run_prompt_context(&mut reader)
+        };
+
+        // At the keyboard: no injection at all.
+        assert_eq!(run(), json!({}), "away off must cost nothing");
+
+        // Away, interactive: push the tool.
+        write_away_marker_for_test(true).expect("away on");
+        let value = run();
+        let context = value
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .expect("context");
+        assert!(context.contains("AskUserQuestion"), "{context}");
+        assert!(context.contains("必须调用"), "{context}");
+        assert_eq!(
+            value.pointer("/hookSpecificOutput/hookEventName"),
+            Some(&json!("UserPromptSubmit"))
+        );
+
+        // Away, headless turn: the tool does not exist there — options at
+        // the end instead.
+        std::env::set_var(crate::claude::BRIDGE_TURN_ENV, "turn-x");
+        let value = run();
+        std::env::remove_var(crate::claude::BRIDGE_TURN_ENV);
+        let context = value
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .expect("context");
+        assert!(context.contains("没有 AskUserQuestion"), "{context}");
+        assert!(context.contains("列出编号选项"), "{context}");
     }
 
     /// The gdbus reply carries digits in its TYPE NAME: taking the first

@@ -30,6 +30,10 @@ const QUESTION_HOOK_MARKER: &str = "question-gate";
 /// this off the hot path: without it every tool call in every session would
 /// spawn a hook process.
 const HEADLESS_APPROVAL_HOOK_MARKER: &str = "headless-approval-gate";
+/// Away-mode prompt coaching: tells sessions to ask choices through
+/// AskUserQuestion (buttons on the phone) instead of prose.
+pub(crate) const PROMPT_CONTEXT_HOOK_EVENT: &str = "UserPromptSubmit";
+const PROMPT_CONTEXT_HOOK_MARKER: &str = "prompt-context";
 const HOOK_MARKER: &str = "hook-event";
 const HOOK_TIMEOUT_SECONDS: u64 = 10;
 
@@ -89,7 +93,8 @@ fn is_tinyctb_hook(entry: &Value) -> bool {
                 && (command.contains(HOOK_MARKER)
                     || command.contains(APPROVAL_HOOK_MARKER)
                     || command.contains(QUESTION_HOOK_MARKER)
-                    || command.contains(HEADLESS_APPROVAL_HOOK_MARKER))
+                    || command.contains(HEADLESS_APPROVAL_HOOK_MARKER)
+                    || command.contains(PROMPT_CONTEXT_HOOK_MARKER))
         })
         .unwrap_or(false)
 }
@@ -247,6 +252,23 @@ pub(crate) fn install_hooks(bridge_command: &str, dry_run: bool) -> Result<Value
         installed.push(format!("{QUESTION_HOOK_EVENT}({headless_matcher})"));
     }
 
+    let prompt_context_command = format!("{binary} prompt-context");
+    let groups_value = hooks
+        .entry(PROMPT_CONTEXT_HOOK_EVENT.to_string())
+        .or_insert_with(|| json!([]));
+    let groups = groups_value.as_array_mut().with_context(|| {
+        format!("Claude settings hooks.{PROMPT_CONTEXT_HOOK_EVENT} must be an array")
+    })?;
+    strip_tinyctb_entries(groups);
+    groups.push(json!({
+        "hooks": [{
+            "type": "command",
+            "command": prompt_context_command,
+            "timeout": HOOK_TIMEOUT_SECONDS
+        }]
+    }));
+    installed.push(PROMPT_CONTEXT_HOOK_EVENT.to_string());
+
     if !dry_run {
         write_settings(&path, &settings)?;
         fs::create_dir_all(events_spool_dir()?)?;
@@ -276,6 +298,7 @@ pub(crate) fn uninstall_hooks(dry_run: bool) -> Result<Value> {
             .iter()
             .chain(std::iter::once(&APPROVAL_HOOK_EVENT))
             .chain(std::iter::once(&QUESTION_HOOK_EVENT))
+            .chain(std::iter::once(&PROMPT_CONTEXT_HOOK_EVENT))
         {
             if let Some(groups) = hooks.get_mut(*event).and_then(Value::as_array_mut) {
                 removed += strip_tinyctb_entries(groups);
@@ -382,6 +405,14 @@ pub(crate) fn hooks_status() -> Result<Value> {
     check(
         format!("{QUESTION_HOOK_EVENT}({QUESTION_HOOK_MATCHER})"),
         marker_installed(&settings, QUESTION_HOOK_EVENT, QUESTION_HOOK_MARKER),
+    );
+    check(
+        PROMPT_CONTEXT_HOOK_EVENT.to_string(),
+        marker_installed(
+            &settings,
+            PROMPT_CONTEXT_HOOK_EVENT,
+            PROMPT_CONTEXT_HOOK_MARKER,
+        ),
     );
     // The headless gate counts as installed only with the matcher the current
     // config calls for. A stale matcher is a gate that silently never fires
@@ -537,8 +568,8 @@ mod tests {
         let uninstalled = uninstall_hooks(false).expect("uninstall");
         assert_eq!(
             uninstalled["removed"],
-            (HOOKED_EVENTS.len() + 3) as i64,
-            "the spool hooks plus the PermissionRequest approval gate and BOTH PreToolUse gates"
+            (HOOKED_EVENTS.len() + 4) as i64,
+            "spool hooks + PermissionRequest gate + both PreToolUse gates + prompt context"
         );
         let settings: Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings"))

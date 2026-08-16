@@ -4,16 +4,34 @@ use std::time::Duration;
 
 use crate::config::TelegramConfig;
 
+/// One shared agent per timeout value. Building an agent per call meant a
+/// fresh TLS handshake for every request — measured at ~9% of a core once
+/// the daemon polled Telegram at 4Hz. A cached agent keeps its connection
+/// pool, so repeat calls to api.telegram.org reuse the socket.
+fn shared_agent(timeout: Duration) -> ureq::Agent {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static AGENTS: Mutex<Option<HashMap<u128, ureq::Agent>>> = Mutex::new(None);
+    let mut agents = AGENTS.lock().expect("agent cache lock");
+    let agents = agents.get_or_insert_with(HashMap::new);
+    agents
+        .entry(timeout.as_millis())
+        .or_insert_with(|| {
+            ureq::Agent::config_builder()
+                .timeout_global(Some(timeout))
+                .build()
+                .new_agent()
+        })
+        .clone()
+}
+
 pub(crate) fn telegram_api_post(
     bot_token: &str,
     method: &str,
     payload: &Value,
     timeout: Duration,
 ) -> Result<Value> {
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .build()
-        .new_agent();
+    let agent = shared_agent(timeout);
     let url = format!(
         "https://api.telegram.org/bot{}/{}",
         bot_token.trim(),

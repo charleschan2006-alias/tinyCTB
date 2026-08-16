@@ -22,6 +22,13 @@ pub(crate) struct PendingPrompt {
     /// happened since the prompt appeared — the evidence for deciding it
     /// was dealt with. `None` on rows from before this column existed.
     pub(crate) transcript_bytes: Option<u64>,
+    /// The RAW `notification_type` from the hook payload (`idle_prompt`,
+    /// `agent_needs_input`, ...). The `kind` field folds several of these
+    /// into "reply" for rendering; consumers that must distinguish a mere
+    /// idle reminder from a genuine question (idle-echo suppression) read
+    /// this instead. `None` on rows predating the column or on prompts not
+    /// born from a Notification hook.
+    pub(crate) notification_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -510,7 +517,56 @@ pub(crate) fn prune_state_logs(conn: &Connection, now: u64) -> Result<usize> {
          WHERE created_at < ?1 AND (answer IS NOT NULL OR expires_at < ?1)",
         params![sql_cutoff],
     )?;
-    Ok(inbound + actions + injections + dialogs + turns + approvals + questions)
+    // Delivered pushes are history; a row still awaiting delivery is only
+    // kept while its retry schedule is live — one whose next attempt is
+    // itself a whole retention period old is abandoned, not pending.
+    let outbound = conn.execute(
+        "DELETE FROM outbound_events
+         WHERE created_at < ?1 AND (status = 'delivered' OR next_attempt_at < ?1)",
+        params![sql_cutoff],
+    )?;
+    // The transport log is the idempotence ledger AND (since it carries the
+    // authoritative send time) the delivery-order record. A row may only go
+    // once its outbound event is gone: while that event still exists,
+    // dropping the log entry would re-send a message the user already read.
+    // Deleting outbound rows first, in this same function, is what makes the
+    // NOT EXISTS below safe — an orphan here is a send whose event has
+    // already aged out, so nothing can resurrect it.
+    let transports = conn.execute(
+        "DELETE FROM transport_delivery_log
+         WHERE delivered_at < ?1
+           AND NOT EXISTS (
+             SELECT 1 FROM outbound_events
+             WHERE outbound_events.event_id = transport_delivery_log.event_id
+           )",
+        params![sql_cutoff],
+    )?;
+    // Telegram routes exist so a reply/tap on an old message can find its
+    // thread; past retention the message is unanswerable anyway.
+    let routes = conn.execute(
+        "DELETE FROM telegram_message_routes WHERE created_at < ?1",
+        params![sql_cutoff],
+    )?;
+    let callbacks = conn.execute(
+        "DELETE FROM telegram_callback_routes WHERE created_at < ?1",
+        params![sql_cutoff],
+    )?;
+    let commands = conn.execute(
+        "DELETE FROM telegram_command_routes WHERE created_at < ?1",
+        params![sql_cutoff],
+    )?;
+    Ok(inbound
+        + actions
+        + injections
+        + dialogs
+        + turns
+        + approvals
+        + questions
+        + outbound
+        + transports
+        + routes
+        + callbacks
+        + commands)
 }
 
 /// Injection debts are short-lived by design: settled ones are history and
@@ -725,6 +781,7 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "telegram_callback_routes", "approval_id", "TEXT")?;
     ensure_column(conn, "pending_questions", "multi_select", "INTEGER")?;
     ensure_column(conn, "pending_prompts", "transcript_bytes", "INTEGER")?;
+    ensure_column(conn, "pending_prompts", "notification_type", "TEXT")?;
     ensure_column(conn, "pending_approvals", "headless", "INTEGER")?;
     ensure_column(conn, "telegram_callback_routes", "question_id", "TEXT")?;
     ensure_column(conn, "telegram_callback_routes", "answer", "TEXT")?;
@@ -754,14 +811,20 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "telegram_inbound_log", "result_action", "TEXT")?;
     ensure_column(conn, "telegram_inbound_log", "backend_transport", "TEXT")?;
     ensure_column(conn, "telegram_inbound_log", "backend_pid", "INTEGER")?;
-    // Partial indexes for the /threads open-prompt scan: only unsettled rows
-    // are indexed, so the index stays tiny however much settled history
-    // accumulates (and pruning keeps that bounded too).
+    // Partial indexes for the /threads open-prompt scan and the delivery
+    // tick: only unsettled rows are indexed, so each index stays tiny however
+    // much settled history accumulates (and pruning keeps that bounded too).
+    // The outbound one matters most — the daemon counts and drains pending
+    // outbound events on EVERY tick (10 Hz), and without it both queries
+    // walk the entire delivered history each time (measured: ~90 ms/s of
+    // CPU against a 1.2k-row table).
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_pending_questions_open
              ON pending_questions(expires_at, created_at) WHERE answer IS NULL;
          CREATE INDEX IF NOT EXISTS idx_pending_approvals_open
-             ON pending_approvals(expires_at, created_at) WHERE decision IS NULL;",
+             ON pending_approvals(expires_at, created_at) WHERE decision IS NULL;
+         CREATE INDEX IF NOT EXISTS idx_outbound_events_pending
+             ON outbound_events(next_attempt_at) WHERE status != 'delivered';",
     )?;
     Ok(())
 }
@@ -972,15 +1035,16 @@ pub(crate) fn upsert_thread_snapshot(
     match &snapshot.pending_prompt {
         Some(prompt) => {
             conn.execute(
-                "INSERT INTO pending_prompts(thread_id, prompt_id, prompt_kind, prompt_status, question, created_at, transcript_bytes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO pending_prompts(thread_id, prompt_id, prompt_kind, prompt_status, question, created_at, transcript_bytes, notification_type)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(thread_id) DO UPDATE SET
                     prompt_id = excluded.prompt_id,
                     prompt_kind = excluded.prompt_kind,
                     prompt_status = excluded.prompt_status,
                     question = excluded.question,
                     created_at = excluded.created_at,
-                    transcript_bytes = excluded.transcript_bytes",
+                    transcript_bytes = excluded.transcript_bytes,
+                    notification_type = excluded.notification_type",
                 params![
                     snapshot.thread_id,
                     prompt.prompt_id,
@@ -989,6 +1053,7 @@ pub(crate) fn upsert_thread_snapshot(
                     prompt.question.clone().unwrap_or_default(),
                     to_sql_i64(now)?,
                     prompt.transcript_bytes.map(|bytes| bytes as i64),
+                    prompt.notification_type,
                 ],
             )?;
         }
@@ -1220,7 +1285,8 @@ pub(crate) fn thread_snapshot_json(snapshot: &BridgeThreadSnapshot) -> Value {
             "promptId": prompt.prompt_id,
             "promptKind": prompt.kind,
             "promptStatus": prompt.status,
-            "question": prompt.question
+            "question": prompt.question,
+            "notificationType": prompt.notification_type
         }))
     })
 }
@@ -1436,6 +1502,7 @@ pub(crate) fn list_waiting_from_db(
                     status: prompt_status,
                     question: Some(question.clone()),
                     transcript_bytes: None,
+                    notification_type: None,
                 };
                 let project = derive_project_label(cwd.as_deref());
                 let display_name = derive_thread_display_name(
@@ -1562,6 +1629,7 @@ pub(crate) fn list_recent_thread_snapshots_from_db(
                         status: prompt_status.unwrap_or_else(|| "Needs input".to_string()),
                         question,
                         transcript_bytes: None,
+                        notification_type: None,
                     }),
                     event_uid: None,
                 })
@@ -1628,6 +1696,7 @@ pub(crate) fn list_inbox_from_db(
                     status: prompt_status.unwrap_or_else(|| "Needs input".to_string()),
                     question,
                     transcript_bytes: None,
+                    notification_type: None,
                 });
                 let snapshot = BridgeThreadSnapshot {
                     thread_id,
@@ -1821,7 +1890,7 @@ pub(crate) fn threads_with_pending_terminal_prompts(
     conn: &Connection,
 ) -> Result<Vec<(String, PendingPrompt, u64)>> {
     let mut stmt = conn.prepare(
-        "SELECT thread_id, prompt_id, prompt_kind, prompt_status, question, MAX(created_at)
+        "SELECT thread_id, prompt_id, prompt_kind, prompt_status, question, notification_type, MAX(created_at)
          FROM pending_prompts WHERE prompt_status = 'pending' GROUP BY thread_id",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -1833,8 +1902,9 @@ pub(crate) fn threads_with_pending_terminal_prompts(
                 status: row.get(3)?,
                 question: row.get(4)?,
                 transcript_bytes: None,
+                notification_type: row.get(5)?,
             },
-            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
         ))
     })?;
     let mut result = Vec::new();
@@ -2770,12 +2840,80 @@ pub(crate) fn enqueue_outbound_event(
     Ok(inserted > 0)
 }
 
+/// How long after a completion push its idle-reminder echo is still
+/// recognisable. The reminder fires ~60s after the completion; retries and
+/// delivery lag get generous margin, but a completion older than this can no
+/// longer vouch that an identical wait is an echo rather than a new turn
+/// that happens to end in the same words.
+pub(crate) const IDLE_REMINDER_ECHO_WINDOW_MS: u64 = 5 * 60 * 1000;
+
+/// The lastPreview of the completion push that would make an identical idle
+/// reminder redundant — used to recognise the 60s reminder that repeats,
+/// word for word, the completion push sent a minute earlier.
+///
+/// Returns Some only when the MOST RECENT delivered push for the thread is a
+/// `thread_completed` delivered within the echo window. Both constraints are
+/// causal, not cosmetic: if anything was delivered after the completion, or
+/// the completion is old, an identical-looking wait is a NEW wait (e.g. a
+/// `events="thread_waiting"` config never delivers completions at all, so a
+/// prior delivered WAIT with the same text must never suppress the next
+/// one). Any doubt returns None — fail open to noise, never to silence.
+pub(crate) fn last_delivered_completion_preview(
+    conn: &Connection,
+    thread_id: &str,
+    now: u64,
+) -> Result<Option<String>> {
+    // A delivery batch stamps every row with the same `delivered_at`, so the
+    // timestamp alone cannot say which push the user saw LAST. The
+    // tie-breakers replay the delivery loop's own order (`DELIVER_DUE_
+    // OUTBOUND_SQL` walks created_at ASC, event_id ASC) — the row it sent
+    // last is the maximum under that order, and if that row is not the
+    // completion, something else reached the user after it.
+    let row: Option<(String, String, i64)> = conn
+        .query_row(
+            "SELECT event_type, payload_json, delivered_at FROM outbound_events
+             WHERE thread_id = ?1 AND delivered_at IS NOT NULL
+             ORDER BY delivered_at DESC, created_at DESC, event_id DESC LIMIT 1",
+            params![thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((event_type, payload, delivered_at)) = row else {
+        return Ok(None);
+    };
+    if event_type != "thread_completed" {
+        return Ok(None);
+    }
+    let delivered_at = from_sql_i64(delivered_at)?;
+    if now.saturating_sub(delivered_at) > IDLE_REMINDER_ECHO_WINDOW_MS {
+        return Ok(None);
+    }
+    Ok(serde_json::from_str::<serde_json::Value>(&payload)
+        .ok()
+        .and_then(|event| {
+            event
+                .get("lastPreview")
+                .or_else(|| event.pointer("/thread/lastPreview"))
+                .and_then(serde_json::Value::as_str)
+                .map(|preview| preview.trim().to_string())
+        }))
+}
+
+/// The two queries the daemon runs on EVERY tick. They are constants so the
+/// EXPLAIN QUERY PLAN test pins the access path of the REAL query text: both
+/// must keep the literal `status != 'delivered'` term that matches the
+/// partial index's WHERE clause, or SQLite silently falls back to walking
+/// the full delivered history 2×/tick.
+pub(crate) const PENDING_OUTBOUND_COUNT_SQL: &str =
+    "SELECT COUNT(*) FROM outbound_events WHERE status != 'delivered'";
+pub(crate) const DELIVER_DUE_OUTBOUND_SQL: &str = "SELECT event_id, payload_json, attempts
+     FROM outbound_events
+     WHERE status != 'delivered' AND next_attempt_at <= ?1
+     ORDER BY created_at ASC, event_id ASC
+     LIMIT ?2";
+
 pub(crate) fn pending_outbound_count(conn: &Connection) -> Result<u64> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM outbound_events WHERE status != 'delivered'",
-        [],
-        |row| row.get(0),
-    )?;
+    let count: i64 = conn.query_row(PENDING_OUTBOUND_COUNT_SQL, [], |row| row.get(0))?;
     from_sql_i64(count)
 }
 
@@ -2790,19 +2928,29 @@ pub(crate) fn clear_pending_outbound_events(conn: &Connection) -> Result<usize> 
     Ok(deleted)
 }
 
-pub(crate) fn transport_delivery_exists(
+/// When this event already reached the transport, and at what time the SEND
+/// actually happened. The timestamp is the authority on delivery order:
+/// `outbound_events.delivered_at` is written after the send, so a crash
+/// between the two leaves the outbound row to be stamped by whichever later
+/// cycle notices — long after the user saw the message. Ordering pushes by
+/// that later stamp would put a crash-orphaned completion *after* pushes the
+/// user genuinely received later.
+pub(crate) fn transport_delivered_at(
     conn: &Connection,
     event_id: &str,
     transport: &str,
-) -> Result<bool> {
-    let exists: Option<String> = conn
+) -> Result<Option<u64>> {
+    let delivered_at: Option<i64> = conn
         .query_row(
-            "SELECT event_id FROM transport_delivery_log WHERE event_id = ?1 AND transport = ?2",
+            "SELECT delivered_at FROM transport_delivery_log WHERE event_id = ?1 AND transport = ?2",
             params![event_id, transport],
             |row| row.get(0),
         )
         .optional()?;
-    Ok(exists.is_some())
+    match delivered_at {
+        Some(value) => Ok(Some(from_sql_i64(value)?)),
+        None => Ok(None),
+    }
 }
 
 pub(crate) fn record_transport_delivery(
@@ -2841,13 +2989,7 @@ where
     F: FnMut(&Value) -> Result<Value>,
 {
     let rows = {
-        let mut stmt = conn.prepare(
-            "SELECT event_id, payload_json, attempts
-             FROM outbound_events
-             WHERE status != 'delivered' AND next_attempt_at <= ?1
-             ORDER BY created_at ASC, event_id ASC
-             LIMIT ?2",
-        )?;
+        let mut stmt = conn.prepare(DELIVER_DUE_OUTBOUND_SQL)?;
         let rows = stmt.query_map(params![to_sql_i64(now)?, limit as i64], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -2871,12 +3013,22 @@ where
         let event: Value = serde_json::from_str(&payload_json)
             .with_context(|| format!("outbound event {event_id} contains invalid JSON"))?;
         match sender(&event) {
-            Ok(_) => {
+            Ok(result) => {
+                // A sender that recognised this event as ALREADY sent (its
+                // transport log says so) reports when that send actually
+                // happened. Stamping `now` instead would date a message the
+                // user read before the crash to the recovery cycle, and
+                // every "what did the user see last" question ordered by
+                // this column would answer wrongly.
+                let delivered_at = result
+                    .get("deliveredAt")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(now);
                 conn.execute(
                     "UPDATE outbound_events
                      SET status = 'delivered', attempts = attempts + 1, delivered_at = ?2, last_error = NULL
                      WHERE event_id = ?1",
-                    params![event_id, to_sql_i64(now)?],
+                    params![event_id, to_sql_i64(delivered_at)?],
                 )?;
                 summary.delivered += 1;
             }
@@ -2935,6 +3087,7 @@ mod tests {
                 status: "Needs approval".to_string(),
                 question: Some(format!("preview for {thread_id}")),
                 transcript_bytes: None,
+                notification_type: None,
             })
         } else if status_flags_vec
             .iter()
@@ -2946,6 +3099,7 @@ mod tests {
                 status: "Needs input".to_string(),
                 question: Some(format!("preview for {thread_id}")),
                 transcript_bytes: None,
+                notification_type: None,
             })
         } else {
             None
@@ -3195,6 +3349,90 @@ mod tests {
         assert!(columns.contains(&"result_action".to_string()));
         assert!(columns.contains(&"backend_transport".to_string()));
         assert!(columns.contains(&"backend_pid".to_string()));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// An install upgrading from v0.2.1 has a `pending_prompts` table with
+    /// no `notification_type` column and rows already in it. The migration
+    /// must add the column, leave existing rows readable (NULL type → the
+    /// daemon fails open and never suppresses them), and let new writes
+    /// carry the type.
+    #[test]
+    fn create_state_db_migrates_legacy_pending_prompts_notification_type() {
+        let path = std::env::temp_dir().join(format!(
+            "tinyctb-prompt-type-migrate-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("open legacy db");
+            conn.execute_batch(
+                "
+                CREATE TABLE pending_prompts (
+                    thread_id TEXT PRIMARY KEY,
+                    prompt_id TEXT NOT NULL,
+                    prompt_kind TEXT NOT NULL,
+                    prompt_status TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                INSERT INTO pending_prompts(thread_id, prompt_id, prompt_kind, prompt_status, question, created_at)
+                VALUES ('thr_legacy', 'notify:1', 'reply', 'pending', '旧问题', 1000);
+                ",
+            )
+            .expect("create legacy pending_prompts");
+        }
+
+        let conn = create_state_db(&path).expect("migrated db");
+        let columns = table_columns(&conn, "pending_prompts").expect("columns");
+        assert!(columns.contains(&"notification_type".to_string()));
+        assert!(columns.contains(&"transcript_bytes".to_string()));
+
+        let legacy: Option<String> = conn
+            .query_row(
+                "SELECT notification_type FROM pending_prompts WHERE thread_id = 'thr_legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy row still readable");
+        assert_eq!(
+            legacy, None,
+            "a pre-migration row has no known type — the daemon must fail open on it"
+        );
+
+        // A fresh write through the production upsert carries the type.
+        upsert_thread_snapshot(
+            &conn,
+            &BridgeThreadSnapshot {
+                thread_id: "thr_new".to_string(),
+                name: None,
+                cwd: None,
+                updated_at: Some(2000),
+                status_type: "idle".to_string(),
+                status_flags: Vec::new(),
+                last_turn_status: None,
+                last_preview: None,
+                pending_prompt: Some(PendingPrompt {
+                    prompt_id: "notify:2".to_string(),
+                    kind: "reply".to_string(),
+                    status: "pending".to_string(),
+                    question: Some("新问题".to_string()),
+                    transcript_bytes: None,
+                    notification_type: Some("idle_prompt".to_string()),
+                }),
+                event_uid: None,
+            },
+            2000,
+        )
+        .expect("upsert on migrated db");
+        let fresh: Option<String> = conn
+            .query_row(
+                "SELECT notification_type FROM pending_prompts WHERE thread_id = 'thr_new'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fresh row");
+        assert_eq!(fresh.as_deref(), Some("idle_prompt"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -3574,6 +3812,219 @@ mod tests {
             )
             .expect("recent actions count");
         assert_eq!(recent_actions, 1);
+    }
+
+    #[test]
+    fn outbound_tick_queries_use_the_pending_partial_index() {
+        // The daemon runs these two queries on every tick; without the
+        // partial index they walk the entire delivered history each time.
+        // EXPLAIN QUERY PLAN pins the access path so a query edit that stops
+        // matching the index WHERE clause fails loudly here instead of
+        // silently costing ~10% of a core in production.
+        let conn = create_state_db_in_memory().expect("db");
+        for sql in [PENDING_OUTBOUND_COUNT_SQL, DELIVER_DUE_OUTBOUND_SQL] {
+            let plan: Vec<String> = {
+                let mut stmt = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .expect("explain");
+                let dummy_params =
+                    rusqlite::params_from_iter((0..stmt.parameter_count()).map(|_| 0i64));
+                let rows = stmt
+                    .query_map(dummy_params, |row| row.get::<_, String>(3))
+                    .expect("plan rows");
+                rows.collect::<rusqlite::Result<Vec<_>>>().expect("plan")
+            };
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("idx_outbound_events_pending")),
+                "query not served by the pending partial index: {sql}\nplan: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_preview_respects_same_batch_delivery_order() {
+        // One delivery batch stamps every row with the same delivered_at.
+        // "Most recent" must follow the delivery loop's own order
+        // (created_at ASC, event_id ASC): if the batch delivered something
+        // AFTER the completion, the completion no longer vouches for an
+        // identical-looking idle reminder.
+        let conn = create_state_db_in_memory().expect("db");
+        let insert = |id: &str, etype: &str, created_at: u64| {
+            conn.execute(
+                "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at, delivered_at)
+                 VALUES (?1, ?2, 'sess-batch', ?3, 'delivered', 0, ?4, 1500)",
+                params![
+                    id,
+                    etype,
+                    json!({"lastPreview": "完成文本"}).to_string(),
+                    to_sql_i64(created_at).expect("created")
+                ],
+            )
+            .expect("insert delivered row");
+        };
+        // Completion first, then another push in the SAME batch: no vouch.
+        insert("evt_completion", "thread_completed", 1000);
+        insert("evt_later_answer", "bridge_event", 1100);
+        assert_eq!(
+            last_delivered_completion_preview(&conn, "sess-batch", 2000).expect("query"),
+            None,
+            "a same-batch push delivered after the completion must break the vouch"
+        );
+
+        // Completion genuinely last in the batch: vouches.
+        conn.execute("DELETE FROM outbound_events", [])
+            .expect("clear");
+        insert("evt_earlier_answer", "bridge_event", 1000);
+        insert("evt_completion", "thread_completed", 1100);
+        assert_eq!(
+            last_delivered_completion_preview(&conn, "sess-batch", 2000)
+                .expect("query")
+                .as_deref(),
+            Some("完成文本"),
+        );
+
+        // Last tie-breaker: same delivered_at AND same created_at, so only
+        // event_id separates them — exactly how the delivery loop broke the
+        // tie when it sent them (created_at ASC, event_id ASC).
+        conn.execute("DELETE FROM outbound_events", [])
+            .expect("clear");
+        insert("evt_a_completion", "thread_completed", 1000);
+        insert("evt_b_answer", "bridge_event", 1000);
+        assert_eq!(
+            last_delivered_completion_preview(&conn, "sess-batch", 2000).expect("query"),
+            None,
+            "event_id ordering must place evt_b_answer after the completion"
+        );
+
+        conn.execute("DELETE FROM outbound_events", [])
+            .expect("clear");
+        insert("evt_a_answer", "bridge_event", 1000);
+        insert("evt_b_completion", "thread_completed", 1000);
+        assert_eq!(
+            last_delivered_completion_preview(&conn, "sess-batch", 2000)
+                .expect("query")
+                .as_deref(),
+            Some("完成文本"),
+            "the completion sent last by event_id order still vouches"
+        );
+    }
+
+    #[test]
+    fn prune_state_logs_covers_outbound_and_telegram_routes() {
+        let conn = create_state_db_in_memory().expect("db");
+        let retention_ms: u64 = 30 * 24 * 60 * 60 * 1000;
+        let now = retention_ms + 2000;
+        let insert_outbound = |id: &str, status: &str, next_attempt_at: u64, created_at: u64| {
+            conn.execute(
+                "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at)
+                 VALUES (?1, 'thread_waiting', 'thr_1', '{}', ?2, ?3, ?4)",
+                params![
+                    id,
+                    status,
+                    to_sql_i64(next_attempt_at).expect("next"),
+                    to_sql_i64(created_at).expect("created")
+                ],
+            )
+            .expect("insert outbound");
+        };
+        // Old delivered history goes; an old row still on a LIVE retry
+        // schedule stays; one whose retry schedule is itself ancient is
+        // abandoned and goes.
+        insert_outbound("evt_old_delivered", "delivered", 1000, 1000);
+        insert_outbound("evt_old_retrying", "failed", now, 1000);
+        insert_outbound("evt_abandoned", "failed", 1000, 1000);
+        insert_outbound("evt_recent_delivered", "delivered", now, now);
+        for table in [
+            "telegram_message_routes",
+            "telegram_callback_routes",
+            "telegram_command_routes",
+        ] {
+            for (tag, created_at) in [("old", 1000u64), ("recent", now)] {
+                match table {
+                    "telegram_message_routes" => conn.execute(
+                        "INSERT INTO telegram_message_routes(chat_id, message_id, thread_id, event_id, created_at)
+                         VALUES ('c', ?1, 'thr_1', 'evt', ?2)",
+                        params![if tag == "old" { 1 } else { 2 }, to_sql_i64(created_at).expect("ts")],
+                    ),
+                    "telegram_callback_routes" => conn.execute(
+                        "INSERT INTO telegram_callback_routes(callback_id, chat_id, thread_id, action, created_at)
+                         VALUES (?1, 'c', 'thr_1', 'a', ?2)",
+                        params![format!("cb_{tag}"), to_sql_i64(created_at).expect("ts")],
+                    ),
+                    _ => conn.execute(
+                        "INSERT INTO telegram_command_routes(chat_id, message_id, command, created_at)
+                         VALUES ('c', ?1, 'threads', ?2)",
+                        params![if tag == "old" { 1 } else { 2 }, to_sql_i64(created_at).expect("ts")],
+                    ),
+                }
+                .expect("insert route");
+            }
+        }
+
+        // Transport log rows: one whose outbound event survives the prune
+        // (must stay — it is the idempotence guard against re-sending), one
+        // whose event is pruned in this very call (may go), and a recent one.
+        for (event_id, delivered_at) in [
+            ("evt_old_retrying", 1000u64),
+            ("evt_old_delivered", 1000),
+            ("evt_recent_delivered", now),
+        ] {
+            record_transport_delivery(
+                &conn,
+                event_id,
+                "telegram",
+                &json!({"ok": true}),
+                delivered_at,
+            )
+            .expect("record transport");
+        }
+
+        let removed = prune_state_logs(&conn, now).expect("prune");
+        // evt_old_delivered + evt_abandoned + one old row per route table
+        // + the one orphaned transport row.
+        assert_eq!(removed, 6);
+        let transports: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT event_id FROM transport_delivery_log ORDER BY event_id")
+                .expect("stmt");
+            let rows = stmt
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .expect("rows");
+            rows
+        };
+        assert_eq!(
+            transports,
+            vec!["evt_old_retrying", "evt_recent_delivered"],
+            "a transport row whose outbound event still exists must never be pruned — \
+             dropping it would re-send a message the user already read"
+        );
+        let surviving: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT event_id FROM outbound_events ORDER BY event_id")
+                .expect("stmt");
+            let rows = stmt
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .expect("rows");
+            rows
+        };
+        assert_eq!(surviving, vec!["evt_old_retrying", "evt_recent_delivered"]);
+        for table in [
+            "telegram_message_routes",
+            "telegram_callback_routes",
+            "telegram_command_routes",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("count");
+            assert_eq!(count, 1, "{table} keeps only the recent row");
+        }
     }
 
     #[test]
