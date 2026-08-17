@@ -99,17 +99,24 @@ fn is_tinyctb_hook(entry: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Hook timeout = the configured approval wait plus headroom, so Claude Code
-/// never kills the gate while the answer is still in flight.
+/// Hook timeout = the longest wait any gate can choose, plus headroom, so
+/// Claude Code never kills a gate while the answer is still in flight.
+///
+/// It is a CEILING, not the wait itself: a gate in a session with a terminal
+/// window still gives up after `approvalTimeoutSeconds` and hands the dialog
+/// back, while one in a windowless background session waits far longer
+/// (`WINDOWLESS_APPROVAL_WAIT`) because it has no dialog to hand back to.
+/// Provisioning only the configured wait would let the harness kill the
+/// second kind early and silently recreate the very trap it avoids.
 fn approval_hook_timeout_seconds() -> u64 {
-    crate::config::read_daemon_config_raw()
+    let configured = crate::config::read_daemon_config_raw()
         .ok()
         .flatten()
         .and_then(|config| config.claude)
         .map(|claude| claude.approval_timeout_seconds)
         .unwrap_or(300)
-        .clamp(5, 86_400)
-        + 15
+        .clamp(5, 86_400);
+    configured.max(crate::approvals::WINDOWLESS_APPROVAL_WAIT.as_secs()) + 15
 }
 
 fn read_settings() -> Result<(PathBuf, Map<String, Value>)> {
@@ -636,6 +643,24 @@ mod tests {
     /// A matcher written by an old install no longer covering the configured
     /// tools is a gate that silently never fires for them. Status treats it
     /// as not installed, which makes `/away` reinstall with the current one.
+    /// The hook timeout is a CEILING, and it must cover the longest wait any
+    /// gate can choose — otherwise Claude Code kills a windowless gate part
+    /// way through its day-long window and silently recreates the trap that
+    /// window exists to prevent. Asserted exactly, not "big enough".
+    #[test]
+    fn approval_hook_timeout_covers_the_longest_possible_wait() {
+        let expected = crate::approvals::WINDOWLESS_APPROVAL_WAIT.as_secs() + 15;
+        assert_eq!(
+            approval_hook_timeout_seconds(),
+            expected,
+            "hook timeout must be WINDOWLESS_APPROVAL_WAIT + 15s of headroom"
+        );
+        assert!(
+            expected > 86_400,
+            "and it must outlast a full day of waiting"
+        );
+    }
+
     #[test]
     fn status_flags_a_stale_headless_matcher() {
         let _guard = crate::state::test_env_lock().lock().expect("env lock");

@@ -49,16 +49,45 @@ use crate::state::{
     set_approval_auto_allow, state_db_path, TelegramCallbackAction, TelegramCallbackRoute,
 };
 
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// How often a blocked gate re-reads its answer row. Measured 2026-08-17 on
+/// a waiting gate: 500ms cost 0.17 ms/s of CPU, 100ms costs 1.50 ms/s — and
+/// the process only exists while an approval is actually pending, so even an
+/// hour-long wait totals a few seconds of CPU. Worth it for a Telegram tap
+/// and `/back` landing in a tenth of a second instead of half of one.
+///
+/// This is NOT what bounds the terminal side. Claude Code renders its own
+/// permission dialog while the hook blocks (verified 2026-08-17 with a
+/// sleeping hook under a pty capture: the dialog appeared at hook start, not
+/// at hook return), so the machine in front of the user is answerable the
+/// whole time no matter what this interval says. Handing the remote window
+/// back is bounded by the presence probe's own cadence, deliberately left
+/// slower — chasing it would cost ~8x this for a dialog already on screen.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// If the machine saw keyboard/mouse input this recently when the gate
 /// fires, the user is sitting right there: show the terminal dialog
 /// immediately instead of detouring through Telegram.
 const ACTIVELY_PRESENT_WINDOW: Duration = Duration::from_millis(15_000);
 
+/// How long a gate waits when its session has NO terminal window (Claude
+/// Code's background pty host). Every "hand it back to the terminal" exit —
+/// the presence check, `/back`, the configured timeout — assumes a dialog
+/// the user can see. A background session has none, so those exits do not
+/// resolve the prompt, they hide it: the tool stays blocked and the only
+/// remedy is walking to the machine and attaching (measured 2026-08-17:
+/// 7h09m of a blocked cchess session). For those sessions the Telegram
+/// window IS the dialog, so it stays open for a day rather than an hour.
+///
+/// Not literally forever: the hook it runs inside has a timeout, so an
+/// unbounded wait would be a fiction the harness overrules. A day is the
+/// most `approvalTimeoutSeconds` can be configured to, and the hook timeout
+/// (see `hooks::approval_hook_timeout_seconds`) is provisioned to outlast
+/// exactly this.
+pub(crate) const WINDOWLESS_APPROVAL_WAIT: Duration = Duration::from_secs(86_400);
+
 /// One presence probe per gate process. The real coordination lives in a
 /// SHARED state file + flock lease, because a poll tick every 500ms must
-/// not mean an external process every 500ms, and N concurrent gates must
+/// not mean an external process every poll tick, and N concurrent gates must
 /// not mean N probers:
 /// - the shared state carries the last result (success OR failure), the
 ///   globally agreed `nextProbeAt`, and the failure backoff — every gate
@@ -389,6 +418,276 @@ fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<S
     }
 }
 
+/// Watches the session transcript for proof that this request was already
+/// answered somewhere else — in practice, the terminal dialog Claude Code
+/// shows at the same time this hook blocks.
+///
+/// The evidence rule is borrowed wholesale from the phantom-wait fix: a
+/// main-chain assistant record written after the boundary means the turn
+/// moved past the point where our answer could matter. Deliberately NOT
+/// tool_result records — with parallel tool calls, another already-allowed
+/// tool returning first would frame this one as decided while it still
+/// waits.
+///
+/// Checked once a second rather than on every poll: the tail read is cheap
+/// but not free, and a second of extra life on a dead button is invisible
+/// next to the hour it replaces. Missing a transcript path (or an unreadable
+/// one) simply never fires — the gate then behaves exactly as before.
+struct ResolutionWatch {
+    transcript: Option<std::path::PathBuf>,
+    /// Next byte to read. Starts at the size the transcript had when the
+    /// request was raised and only ever moves forward, so each check reads
+    /// what arrived since the last one.
+    ///
+    /// Re-reading from the original boundary every second (the first cut of
+    /// this) was quadratic in the tail: a session with a 5MiB sidechain tail
+    /// re-read those 5MiB 3600 times an hour, and the cost grew with the
+    /// conversation. An hour-long windowless wait made that ~18GiB of
+    /// pointless I/O.
+    offset: std::cell::Cell<u64>,
+    /// (device, inode) of the file the offset refers to. A transcript that
+    /// is rotated or replaced gets a new identity, and an offset carried
+    /// across that boundary would point into unrelated bytes — history read
+    /// as if it had just arrived.
+    identity: std::cell::Cell<Option<(u64, u64)>>,
+    /// The bytes immediately BEFORE the offset. Identity alone misses an
+    /// in-place rewrite (same inode, same length); if these no longer match,
+    /// the file underneath us is not the one we were reading.
+    fingerprint: std::cell::RefCell<Vec<u8>>,
+    /// The trailing bytes of a line that had not finished being written when
+    /// the last read stopped. Without carrying it, the two halves would be
+    /// parsed separately and both discarded as malformed.
+    partial: std::cell::RefCell<Vec<u8>>,
+    last_checked: std::cell::Cell<std::time::Instant>,
+    #[cfg(test)]
+    bytes_read: std::cell::Cell<u64>,
+}
+
+/// How many bytes before the offset are kept as the continuity check.
+const FINGERPRINT_BYTES: usize = 64;
+
+const RESOLUTION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+impl ResolutionWatch {
+    fn new(payload: &Value, _now: u64) -> Self {
+        let transcript = payload
+            .get("transcript_path")
+            .and_then(Value::as_str)
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_file());
+        // A transcript we cannot stat has no trustworthy boundary, so the
+        // watcher is disabled outright rather than starting from zero and
+        // reading the whole history as if it were new.
+        // One handle for stat AND fingerprint. A transcript we cannot open
+        // or stat has no trustworthy boundary, so the watcher is disabled
+        // outright rather than starting from zero and reading the whole
+        // history as if it had just arrived.
+        let opened = transcript.as_ref().and_then(|path| {
+            let file = std::fs::File::open(path).ok()?;
+            let meta = file.metadata().ok()?;
+            Some((path.clone(), file, meta))
+        });
+        let Some((path, mut file, meta)) = opened else {
+            return Self::disabled();
+        };
+        let watch = Self {
+            transcript: Some(path),
+            offset: std::cell::Cell::new(meta.len()),
+            identity: std::cell::Cell::new(Some(file_identity(&meta))),
+            fingerprint: std::cell::RefCell::new(Vec::new()),
+            partial: std::cell::RefCell::new(Vec::new()),
+            last_checked: std::cell::Cell::new(std::time::Instant::now()),
+            #[cfg(test)]
+            bytes_read: std::cell::Cell::new(0),
+        };
+        if !watch.reseat_fingerprint(&mut file) {
+            return Self::disabled();
+        }
+        watch
+    }
+
+    /// A watcher that never fires: used whenever the transcript cannot be
+    /// read reliably, because a guard that cannot verify must not vouch.
+    fn disabled() -> Self {
+        Self {
+            transcript: None,
+            offset: std::cell::Cell::new(0),
+            identity: std::cell::Cell::new(None),
+            fingerprint: std::cell::RefCell::new(Vec::new()),
+            partial: std::cell::RefCell::new(Vec::new()),
+            last_checked: std::cell::Cell::new(std::time::Instant::now()),
+            #[cfg(test)]
+            bytes_read: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Re-read the bytes just before the offset FROM THE HANDLE WE JUST
+    /// READ, so identity, fingerprint and payload all describe one file at
+    /// one instant. Reopening by path between those steps is a TOCTOU hole:
+    /// the file can be swapped in between and the guard then vouches for
+    /// bytes that came from something else.
+    ///
+    /// Returns false if the fingerprint could not be taken — an empty guard
+    /// that lets the watcher keep running would vouch for everything.
+    fn reseat_fingerprint(&self, file: &mut std::fs::File) -> bool {
+        use std::io::{Read as _, Seek as _};
+        let mut print = self.fingerprint.borrow_mut();
+        print.clear();
+        let offset = self.offset.get();
+        if offset == 0 {
+            return true; // nothing behind us to vouch for yet
+        }
+        let want = FINGERPRINT_BYTES.min(offset as usize);
+        if file
+            .seek(std::io::SeekFrom::Start(offset - want as u64))
+            .is_err()
+        {
+            return false;
+        }
+        let mut buf = vec![0u8; want];
+        if file.read_exact(&mut buf).is_err() {
+            return false;
+        }
+        *print = buf;
+        true
+    }
+
+    /// Forget everything carried between checks. Called on ANY I/O failure:
+    /// a guard that cannot verify must not vouch, and the next successful
+    /// check syncs to the current end rather than resuming blind.
+    fn invalidate(&self) {
+        self.identity.set(None);
+        self.partial.borrow_mut().clear();
+        self.fingerprint.borrow_mut().clear();
+    }
+
+    /// Drop everything carried across and resync to the current end: the
+    /// file we were reading is gone, and nothing already in the new one is
+    /// evidence about a request raised against the old one.
+    fn resync(&self, file: &mut std::fs::File, len: u64, identity: Option<(u64, u64)>) {
+        self.offset.set(len);
+        self.identity.set(identity);
+        self.partial.borrow_mut().clear();
+        if !self.reseat_fingerprint(file) {
+            self.invalidate();
+        }
+    }
+
+    /// Has a main-chain assistant record been written since the last look?
+    ///
+    /// Deliberately NOT tool_result records: with parallel tool calls another
+    /// already-allowed tool returning first would frame this one as decided
+    /// while it still waits. Sidechain records are skipped for the same
+    /// reason — a subagent talking to itself is not this turn moving on.
+    fn decided_elsewhere(&self) -> bool {
+        let Some(transcript) = self.transcript.as_deref() else {
+            return false;
+        };
+        if self.last_checked.get().elapsed() < RESOLUTION_CHECK_INTERVAL {
+            return false;
+        }
+        self.last_checked.set(std::time::Instant::now());
+
+        use std::io::{Read as _, Seek as _};
+        // EVERY I/O failure below invalidates the carried state. Keeping a
+        // stale identity/offset/partial across a failed read is fail-open:
+        // the next check would resume from a position it can no longer
+        // vouch for, and an inode reused at that path would have its history
+        // read as new evidence.
+        let Ok(mut file) = std::fs::File::open(transcript) else {
+            self.invalidate();
+            return false;
+        };
+        let Ok(meta) = file.metadata() else {
+            self.invalidate();
+            return false;
+        };
+        let len = meta.len();
+        let identity = Some(file_identity(&meta));
+
+        // Rotated / replaced, truncated below where we were reading, or
+        // resuming after an invalidation — all resync to the current end.
+        if self.identity.get().is_none()
+            || identity != self.identity.get()
+            || len < self.offset.get()
+        {
+            self.resync(&mut file, len, identity);
+            return false;
+        }
+        if len == self.offset.get() {
+            return false;
+        }
+        // Same file, same length or longer — but an in-place rewrite leaves
+        // both of those intact, so the bytes behind the offset must still be
+        // the ones we read.
+        let want = self.fingerprint.borrow().len();
+        if want > 0 {
+            let mut seen = vec![0u8; want];
+            let ok = file
+                .seek(std::io::SeekFrom::Start(self.offset.get() - want as u64))
+                .is_ok()
+                && file.read_exact(&mut seen).is_ok()
+                && seen == *self.fingerprint.borrow();
+            if !ok {
+                self.resync(&mut file, len, identity);
+                return false;
+            }
+        }
+        if file
+            .seek(std::io::SeekFrom::Start(self.offset.get()))
+            .is_err()
+        {
+            self.invalidate();
+            return false;
+        }
+        let mut fresh = Vec::new();
+        let Ok(read) = file.read_to_end(&mut fresh) else {
+            self.invalidate();
+            return false;
+        };
+        self.offset.set(self.offset.get() + read as u64);
+        #[cfg(test)]
+        self.bytes_read.set(self.bytes_read.get() + read as u64);
+        if !self.reseat_fingerprint(&mut file) {
+            self.invalidate();
+        }
+
+        let mut buf = self.partial.borrow_mut();
+        buf.extend_from_slice(&fresh);
+        let mut decided = false;
+        let mut consumed = 0usize;
+        for line in buf.split_inclusive(|byte| *byte == b'\n') {
+            if !line.ends_with(b"\n") {
+                break; // still being written; keep it for next time
+            }
+            consumed += line.len();
+            let text = String::from_utf8_lossy(line);
+            let Ok(entry) = serde_json::from_str::<Value>(text.trim()) else {
+                continue;
+            };
+            if entry.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            if entry.get("type").and_then(Value::as_str) == Some("assistant") {
+                decided = true;
+            }
+        }
+        buf.drain(..consumed);
+        decided
+    }
+}
+
+#[cfg(unix)]
+fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    (meta.dev(), meta.ino())
+}
+
+#[cfg(not(unix))]
+fn file_identity(_meta: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
 /// "No opinion": the normal permission flow decides. This is the answer for
 /// every path that is not an explicit remote allow/deny.
 fn no_opinion() -> Value {
@@ -555,7 +854,28 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
     // turn has no terminal wherever the user is sitting — Telegram can start
     // one with away off (`/new`, or a Reply while present) — so its gate
     // must not depend on away at all.
-    if kind == GateKind::Interactive && !away_mode_active() {
+    // Two things are settled before any other work, in this order.
+    //
+    // 1. The transcript boundary, because it is a race: it must be the size
+    //    BEFORE the request could possibly be answered. Anything taken later
+    //    — after the windowless probe walks /proc, after config load, the
+    //    database open, the auto-allow lookup — lets a fast terminal answer
+    //    land INSIDE the boundary, where the watcher can never see it, and
+    //    the gate then sits out its whole window for a settled call.
+    //
+    // 2. `windowless`, which must precede the away shortcut below: a
+    //    background session has no terminal dialog anyone can see, so "the
+    //    user is at the keyboard" is not a reason to route the request
+    //    there. Computing it after the shortcut meant a bg-pty session with
+    //    away off fell straight into the trap this path exists to prevent.
+    // The boundary is frozen FIRST — before the windowless `/proc` walk,
+    // before config, before the database. Every one of those takes time in
+    // which a terminal answer can land, and anything that lands before the
+    // stat is inside the boundary where the watcher can never see it.
+    let resolution_watch = ResolutionWatch::new(payload, now);
+    let windowless =
+        kind == GateKind::Interactive && crate::claude::current_session_lacks_terminal_window();
+    if kind == GateKind::Interactive && !windowless && !away_mode_active() {
         return Ok(no_opinion());
     }
     let tool_name = payload
@@ -684,11 +1004,32 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
         )));
     }
     // A user at the machine gets the dialog THERE, immediately — no phone
-    // detour. (Headless turns have no terminal to hand anything to.)
+    // detour. (Headless turns have no terminal to hand anything to, and
+    // neither do background sessions: for them "there" is a pty nobody is
+    // watching, so the detour is the only route that reaches a human.)
+    // PUSH FIRST, hand over second. While away is on, every gated call gets
+    // its buttons pushed to Telegram no matter what the desktop is doing;
+    // only after the request exists does desktop activity decide who ends up
+    // answering it (see the wait loop below).
+    //
+    // The order is the whole point. This check used to sit BEFORE the push
+    // and skip it whenever the desktop had seen input in the last 15s, which
+    // meant a wrong presence reading produced no message at all — a silent
+    // failure the user could not even see happening. Measured 2026-08-17: a
+    // mouse with sensor drift emitted ~600 phantom motion events per second
+    // and pinned the idle timer near zero, so every approval would have been
+    // ruled "user is present" and routed to a terminal nobody sat at, with
+    // nothing on the phone. Pushing first makes the worst case a message
+    // that gets superseded instead of a message that never existed.
+    //
+    // Away OFF still means the terminal owns it outright — that is the user
+    // saying they are here. Windowless sessions push either way: they have
+    // no terminal dialog anyone could see.
+
     let mut presence = PresenceProbe::new();
-    if kind == GateKind::Interactive && presence.user_is_present() {
-        return Ok(no_opinion());
-    }
+    // Where the transcript stood when this gate started. Anything written
+    // past this point is what happened SINCE the request — the evidence for
+    // noticing that the call was already decided without us.
 
     let approval_id = payload
         .get("tool_use_id")
@@ -696,7 +1037,11 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
         .map(str::to_string)
         .unwrap_or_else(|| generate_session_uuid().unwrap_or_else(|_| now.to_string()));
     let summary = tool_call_summary(&tool_name, payload.get("tool_input"));
-    let wait = Duration::from_secs(claude.approval_timeout_seconds.clamp(5, 86_400));
+    let wait = if windowless {
+        WINDOWLESS_APPROVAL_WAIT
+    } else {
+        Duration::from_secs(claude.approval_timeout_seconds.clamp(5, 86_400))
+    };
     create_pending_approval(
         &conn,
         &approval_id,
@@ -747,10 +1092,53 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
                 return apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now);
             }
         }
-        // The user is back (input devices woke up, or /back): hand the
-        // prompt to the terminal RIGHT NOW. Settling is atomic with any
-        // in-flight tap — a tap that already landed still wins.
-        if kind == GateKind::Interactive && presence.terminal_reclaimed() {
+        // The user is back — input devices woke up, or `/back` arrived. Hand
+        // the prompt to the terminal RIGHT NOW so the machine in front of
+        // them wins over the phone in their pocket. Settling is atomic with
+        // any in-flight tap: a tap that already landed still wins.
+        //
+        // A false positive here (a drifting mouse, a screensaver twitch)
+        // costs a prompt that moves to the terminal early — recoverable, and
+        // the user still got the Telegram message telling them it happened.
+        // That is why the push above is unconditional: this check is allowed
+        // to be wrong, the push is not.
+        //
+        // A windowless session is excluded on purpose: there is no terminal
+        // dialog to be "back" at, so handing it over would close the only
+        // channel that can answer while the tool stays blocked regardless.
+        // The dialog Claude Code renders in the terminal runs CONCURRENTLY
+        // with this hook (verified 2026-08-17 under a pty capture), so the
+        // call can be decided over there while we are still polling. Nothing
+        // tells us when that happens — the hook is simply left running. Left
+        // unchecked it polls out its whole window, holding a dead button on
+        // the user's phone for an already-executed command (measured: 21
+        // orphaned gates, 58 stale pushes in one afternoon).
+        // INTERACTIVE ONLY. Under `bypassPermissions` a headless turn reads
+        // `{}` as "nobody objected" and runs the tool, so letting transcript
+        // evidence produce a no-opinion here would execute an unapproved
+        // call. A headless gate has exactly two honest endings: an explicit
+        // Telegram decision, or a timeout that denies.
+        if kind == GateKind::Interactive && resolution_watch.decided_elsewhere() {
+            // Same atomic rule as every other exit: a tap that already landed
+            // WINS. Discarding what `expire_or_take_decision` hands back
+            // would throw away a decision the user paid a tap for and show
+            // them "已允许" while the session quietly did its own thing.
+            //
+            // Settling and cancelling the unsent push are ONE transaction: a
+            // crash between them would leave a settled request whose button
+            // still ships minutes later on the retry schedule.
+            return match crate::state::settle_expired_and_cancel_push(
+                &conn,
+                crate::state::SettleTarget::Approval(&approval_id),
+                now,
+            )? {
+                crate::state::SettleOutcome::Answered(decision) => {
+                    apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now)
+                }
+                crate::state::SettleOutcome::Expired => Ok(no_opinion()),
+            };
+        }
+        if kind == GateKind::Interactive && !windowless && presence.terminal_reclaimed() {
             return match crate::state::expire_or_take_decision(&conn, &approval_id, now)? {
                 Some(decision) => {
                     apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now)
@@ -805,7 +1193,12 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     let payload: Value =
         serde_json::from_str(raw.trim()).context("PreToolUse payload is not valid JSON")?;
 
-    if !away_mode_active() {
+    // Same ordering rule as the approval gate: a windowless session is not
+    // covered by the away shortcut (its terminal dialog is invisible), and
+    // the transcript boundary must predate any chance of an answer.
+    let resolution_watch = ResolutionWatch::new(&payload, now);
+    let windowless = crate::claude::current_session_lacks_terminal_window();
+    if !windowless && !away_mode_active() {
         return Ok(no_opinion());
     }
     if payload.get("tool_name").and_then(Value::as_str) != Some("AskUserQuestion") {
@@ -870,13 +1263,21 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         .unwrap_or_default();
 
     let claude = config.claude.clone().unwrap_or_default();
-    let wait = Duration::from_secs(claude.approval_timeout_seconds.clamp(5, 86_400));
-    // Same presence rule as the approval gate: a user at the machine gets
-    // the question dialog in the terminal, immediately.
+    // A windowless session gets the long window for the same reason the
+    // approval gate does: there is no terminal dialog to fall back to, so
+    // expiring early hides the question instead of relocating it.
+    let wait = if windowless {
+        WINDOWLESS_APPROVAL_WAIT
+    } else {
+        Duration::from_secs(claude.approval_timeout_seconds.clamp(5, 86_400))
+    };
+    // Same rule as the approval gate: away on means the question is pushed
+    // to Telegram whatever the desktop looks like (activity decides who
+    // answers, not whether it is sent), away off means the terminal owns it,
+    // and a windowless background session has no terminal dialog to own it
+    // so it asks remotely either way.
+
     let mut presence = PresenceProbe::new();
-    if presence.user_is_present() {
-        return Ok(no_opinion());
-    }
     let conn = create_state_db(&state_db_path()?)?;
     let question_id = format!("q{}", generate_session_uuid()?.replace('-', ""));
     crate::state::create_pending_question(
@@ -936,7 +1337,25 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         }
         // The user is back (input devices or /back): give them the question
         // dialog in the terminal, honouring any answer that raced in first.
-        if presence.terminal_reclaimed() {
+        // The AskUserQuestion dialog runs in the terminal alongside this
+        // hook too, so it can be answered there while we poll. Same evidence
+        // rule, same reason: otherwise the gate holds a dead button for the
+        // rest of its window — a full day for a windowless session.
+        if resolution_watch.decided_elsewhere() {
+            return match crate::state::settle_expired_and_cancel_push(
+                &conn,
+                crate::state::SettleTarget::Question(&question_id),
+                now,
+            )? {
+                crate::state::SettleOutcome::Answered(answer) => Ok(answered(
+                    &questions,
+                    &question_raw,
+                    &resolve_answer(&answer, &options),
+                )),
+                crate::state::SettleOutcome::Expired => Ok(no_opinion()),
+            };
+        }
+        if !windowless && presence.terminal_reclaimed() {
             return match crate::state::expire_or_take_answer(&conn, &question_id, now)? {
                 Some(answer) => Ok(answered(
                     &questions,
@@ -1237,6 +1656,9 @@ mod tests {
             std::env::remove_var(crate::claude::BRIDGE_TURN_ENV);
             // And no leftover fake idle: presence must be opt-in per test.
             std::env::remove_var("TINYCTB_TEST_IDLE_MS");
+            // Same for the windowless override: every test starts as a
+            // session that HAS a terminal window.
+            std::env::remove_var("TINYCTB_TEST_SESSION_WINDOWLESS");
             crate::config::write_daemon_config(&DaemonConfig {
                 version: 1,
                 bridge_command: "tinyctb".to_string(),
@@ -2093,9 +2515,9 @@ mod tests {
     }
 
     /// A user at the machine when the prompt fires gets the dialog in the
-    /// terminal, instantly — no Telegram detour, no approval row, no push.
+    /// terminal, instantly — the push still goes out; presence only decides who ends up answering.
     #[test]
-    fn gate_steps_aside_for_a_present_user() {
+    fn gate_steps_aside_for_a_present_user_but_still_pushes() {
         let _guard = crate::state::test_env_lock().lock().expect("env lock");
         let _env = GateEnv::new("present-user", true, 30);
         std::env::set_var("TINYCTB_TEST_IDLE_MS", "500");
@@ -2106,17 +2528,796 @@ mod tests {
         assert_eq!(
             result,
             json!({}),
-            "the terminal dialog must appear directly"
+            "a user at the machine still gets the dialog in the terminal"
         );
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "and immediately"
         );
+        // ...but the phone was told regardless. The push is unconditional
+        // while away is on precisely because THIS check can be wrong: a
+        // mouse with sensor drift reads as "present" forever, and the old
+        // order (presence decides whether to send) turned that into total
+        // silence on the phone. Now the worst case is a message that gets
+        // superseded, which the user can see and act on.
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let pushed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events WHERE event_type = 'approval_request'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
         assert_eq!(
-            crate::state::pending_outbound_count(&conn).expect("pending"),
-            0,
-            "no Telegram push for a user who is right there"
+            pushed, 1,
+            "away mode owes the phone a message even when the desktop looks busy"
+        );
+    }
+
+    /// The terminal dialog runs alongside this hook, so a request can be
+    /// settled over there while the gate is still polling — and nothing tells
+    /// the gate. Without an exit condition it polls out its whole window,
+    /// leaving a dead button on the phone for a command that already ran
+    /// (measured 2026-08-17: 21 orphaned gates, 58 stale pushes).
+    #[test]
+    fn gate_stops_when_the_call_is_decided_in_the_terminal() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("decided-elsewhere", true, 120);
+        let transcript = std::env::temp_dir().join(format!(
+            "tinyctb-gate-transcript-{}.jsonl",
+            std::process::id()
+        ));
+        // Real shape at gate time: the transcript already ends with the
+        // assistant record carrying THIS tool_use. Seeding only a user line
+        // made the test easier than production, where the boundary always
+        // has an assistant record immediately behind it.
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                json!({"type": "user", "message": {"role": "user", "content": "go"}}),
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_probe", "name": "Bash",
+                     "input": {"command": "rm -rf build/"}}
+                ]}})
+            ),
+        )
+        .expect("seed transcript");
+        let mut payload = bash_payload();
+        payload["transcript_path"] = json!(transcript.display().to_string());
+
+        let writer = {
+            let transcript = transcript.clone();
+            std::thread::spawn(move || {
+                // The user answers in the terminal; the tool runs and the
+                // turn moves on, appending a main-chain assistant record.
+                std::thread::sleep(Duration::from_millis(1500));
+                use std::io::Write as _;
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&transcript)
+                    .expect("append");
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"type": "assistant", "message": {"role": "assistant",
+                            "content": [{"type": "text", "text": "done"}]}})
+                )
+                .expect("write");
+            })
+        };
+        let started = std::time::Instant::now();
+        let mut reader = std::io::Cursor::new(payload.to_string());
+        let result = run_approval_gate(&mut reader, 1000).expect("gate");
+        writer.join().expect("writer");
+        let _ = fs::remove_file(&transcript);
+
+        assert_eq!(result, json!({}), "the terminal already decided it");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the gate must give up on the evidence, not sit out its 120s window: {:?}",
+            started.elapsed()
+        );
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let decision: Option<String> = conn
+            .query_row("SELECT decision FROM pending_approvals", [], |row| {
+                row.get(0)
+            })
+            .expect("row");
+        assert_eq!(
+            decision.as_deref(),
+            Some("expired"),
+            "and it must settle the row so /threads stops offering a dead button"
+        );
+    }
+
+    /// The boundary is a race, and this pins which side must win. A terminal
+    /// answer that lands while the gate is still starting up (config load,
+    /// database open, auto-allow lookup) must still be VISIBLE to the
+    /// watcher — i.e. the boundary has to predate it. Freeze the boundary
+    /// late and the assistant record falls inside it, invisible forever,
+    /// and the gate waits out its whole window for a settled call.
+    ///
+    /// Each check must read only what ARRIVED SINCE THE LAST CHECK. The big
+    /// sidechain is appended AFTER the watcher exists, so it sits past the
+    /// boundary where the old implementation genuinely did re-read it every
+    /// second — that is what made the cost quadratic (~18GiB/h on a 5MiB
+    /// tail). Also pins the half-line carry across checks, and that a file
+    /// rewritten underneath us never passes off history as new evidence.
+    #[test]
+    fn the_watcher_reads_only_what_arrived_since_last_time() {
+        let transcript =
+            std::env::temp_dir().join(format!("tinyctb-incremental-{}.jsonl", std::process::id()));
+        fs::write(&transcript, "").expect("seed");
+        let watch = ResolutionWatch::new(
+            &json!({ "transcript_path": transcript.display().to_string() }),
+            1000,
+        );
+        use std::io::Write as _;
+        let append = |text: &str| {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .expect("append");
+            write!(file, "{text}").expect("write");
+        };
+
+        // A large sidechain tail lands past the boundary.
+        let bulk = json!({"type": "user", "isSidechain": true,
+                          "message": {"role": "user", "content": "x".repeat(200_000)}})
+        .to_string();
+        append(&format!("{bulk}\n"));
+        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
+        assert!(
+            !watch.decided_elsewhere(),
+            "sidechain noise is not evidence"
+        );
+        let after_bulk = watch.bytes_read.get();
+        assert!(
+            after_bulk > 100_000,
+            "the first look must actually read the new tail: {after_bulk}"
+        );
+
+        // Nothing new: not one byte more.
+        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
+        assert!(!watch.decided_elsewhere());
+        assert_eq!(
+            watch.bytes_read.get(),
+            after_bulk,
+            "an unchanged transcript must cost no reads at all"
+        );
+
+        // A record arrives in two writes; the first half is not yet a line.
+        let record = json!({"type": "assistant", "message": {"role": "assistant",
+                             "content": [{"type": "text", "text": "done"}]}})
+        .to_string();
+        let (head, tail) = record.split_at(record.len() / 2);
+        append(head);
+        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
+        assert!(
+            !watch.decided_elsewhere(),
+            "half a record is not evidence yet"
+        );
+        append(&format!("{tail}\n"));
+        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
+        assert!(
+            watch.decided_elsewhere(),
+            "the carried half-line must be joined and parsed once complete"
+        );
+        assert!(
+            watch.bytes_read.get() - after_bulk < 10_000,
+            "only the delta may be read, never the 200KiB tail again: {}",
+            watch.bytes_read.get() - after_bulk
+        );
+        let _ = fs::remove_file(&transcript);
+    }
+
+    /// A transcript replaced underneath the watcher must never have its
+    /// history mistaken for new evidence. Each half isolates ONE guard by
+    /// making the other one blind to the change:
+    ///  - rotation keeps the prefix byte-identical, so only the inode says
+    ///    anything;
+    ///  - the in-place rewrite keeps the inode, so only the prefix does.
+    ///
+    /// In both cases an assistant record sits PAST the old offset — exactly
+    /// where an unguarded reader would find it and close the prompt.
+    #[test]
+    fn a_rewritten_transcript_is_resynced_not_replayed() {
+        let dir = std::env::temp_dir().join(format!("tinyctb-rewrite-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let transcript = dir.join("t.jsonl");
+        let assistant = json!({"type": "assistant", "message": {"role": "assistant",
+                                "content": [{"type": "text", "text": "history"}]}})
+        .to_string();
+        let filler =
+            json!({"type": "user", "message": {"role": "user", "content": "pad"}}).to_string();
+        let prefix = format!("{filler}\n{filler}\n");
+
+        // 1. Replaced by a DIFFERENT file (different bytes behind the
+        //    offset) with an assistant record right after where we stopped.
+        //    Note: an identical-prefix replacement is deliberately NOT a
+        //    violation — appending through a rename is indistinguishable
+        //    from appending in place, and the record really is new.
+        let other =
+            json!({"type": "user", "message": {"role": "user", "content": "PAD"}}).to_string();
+        let other_prefix = format!("{other}\n{other}\n");
+        assert_eq!(other_prefix.len(), prefix.len());
+        fs::write(&transcript, &prefix).expect("seed");
+        let watch = ResolutionWatch::new(
+            &json!({ "transcript_path": transcript.display().to_string() }),
+            1000,
+        );
+        fs::remove_file(&transcript).expect("rotate");
+        fs::write(&transcript, format!("{other_prefix}{assistant}\n")).expect("replace");
+        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
+        assert!(
+            !watch.decided_elsewhere(),
+            "a different file's records must not be read through a stale offset"
+        );
+
+        // 2. Rewritten in place: same inode, different bytes behind the
+        //    offset, assistant record after it.
+        fs::write(&transcript, &prefix).expect("reset");
+        let watch = ResolutionWatch::new(
+            &json!({ "transcript_path": transcript.display().to_string() }),
+            1000,
+        );
+        let other =
+            json!({"type": "user", "message": {"role": "user", "content": "PAD"}}).to_string();
+        let rewritten_prefix = format!("{other}\n{other}\n");
+        assert_eq!(
+            rewritten_prefix.len(),
+            prefix.len(),
+            "the rewrite must keep the length so only the fingerprint can tell"
+        );
+        {
+            use std::io::Write as _;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .open(&transcript)
+                .expect("open for rewrite");
+            file.write_all(format!("{rewritten_prefix}{assistant}\n").as_bytes())
+                .expect("rewrite in place");
+        }
+        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
+        assert!(
+            !watch.decided_elsewhere(),
+            "an in-place rewrite must be resynced, not replayed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An I/O failure must not leave the watcher resuming from a position
+    /// it can no longer vouch for. The contract is: once a check cannot
+    /// read, forget everything and resync on the next one — because during
+    /// the blind window anything may have happened to that file.
+    ///
+    /// The file is renamed ASIDE and BACK, so its inode never changes and
+    /// the bytes behind the offset stay identical. Neither the identity
+    /// guard nor the fingerprint can notice — only having invalidated on the
+    /// failed open makes the difference, which is exactly what this pins.
+    /// (Deleting and recreating instead would usually hand the file a new
+    /// inode and let the identity guard pass the test on its own.)
+    #[test]
+    fn an_io_failure_invalidates_instead_of_resuming_blind() {
+        let dir = std::env::temp_dir().join(format!("tinyctb-iofail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let transcript = dir.join("t.jsonl");
+        let sidecar = dir.join("moved.jsonl");
+        let filler =
+            json!({"type": "user", "message": {"role": "user", "content": "pad"}}).to_string();
+        let assistant = json!({"type": "assistant", "message": {"role": "assistant",
+                                "content": [{"type": "text", "text": "written while blind"}]}})
+        .to_string();
+        fs::write(&transcript, format!("{filler}\n{filler}\n")).expect("seed");
+        let watch = ResolutionWatch::new(
+            &json!({ "transcript_path": transcript.display().to_string() }),
+            1000,
+        );
+        let inode_before = fs::metadata(&transcript)
+            .map(|meta| file_identity(&meta))
+            .expect("identity before");
+
+        // 1. Moved aside: the watched path cannot be opened at all.
+        fs::rename(&transcript, &sidecar).expect("rename aside");
+        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
+        assert!(
+            !watch.decided_elsewhere(),
+            "an unreadable transcript is not evidence"
+        );
+
+        // 2. History grows while we are blind to it.
+        {
+            use std::io::Write as _;
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&sidecar)
+                .expect("append");
+            writeln!(file, "{assistant}").expect("write");
+        }
+
+        // 3. Moved back: SAME inode, same bytes behind the old offset.
+        fs::rename(&sidecar, &transcript).expect("rename back");
+        let inode_after = fs::metadata(&transcript)
+            .map(|meta| file_identity(&meta))
+            .expect("identity after");
+        assert_eq!(
+            inode_before, inode_after,
+            "the round trip must preserve the inode, or this proves nothing"
+        );
+
+        // 4. Only the invalidation from step 1 can hold the line here.
+        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
+        assert!(
+            !watch.decided_elsewhere(),
+            "records written while the watcher was blind must not be replayed \
+             through a stale offset"
+        );
+
+        // And it still tracks the file normally afterwards.
+        {
+            use std::io::Write as _;
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .expect("append");
+            writeln!(file, "{assistant}").expect("write");
+        }
+        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
+        assert!(
+            watch.decided_elsewhere(),
+            "a genuinely new record after resync must still be seen"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The boundary race, pinned by a production seam rather than a sleep.
+    /// The writer is released at the exact instant `ResolutionWatch` has
+    /// stat'd the transcript, and the seam then holds the gate inside its
+    /// remaining startup — so an answer that lands during config load, the
+    /// database open and the auto-allow lookup MUST still be visible. Move
+    /// the boundary back behind any of that and the record falls inside it,
+    /// invisible forever, and the gate sits out its whole window.
+    #[test]
+    fn a_fast_terminal_answer_is_not_swallowed_by_the_boundary() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("fast-answer", true, 120);
+        let transcript =
+            std::env::temp_dir().join(format!("tinyctb-fast-answer-{}.jsonl", std::process::id()));
+        // Real shape at gate time: the transcript already ends with the
+        // assistant record carrying THIS tool_use. Seeding only a user line
+        // made the test easier than production, where the boundary always
+        // has an assistant record immediately behind it.
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                json!({"type": "user", "message": {"role": "user", "content": "go"}}),
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_probe", "name": "Bash",
+                     "input": {"command": "rm -rf build/"}}
+                ]}})
+            ),
+        )
+        .expect("seed transcript");
+        let mut payload = bash_payload();
+        payload["transcript_path"] = json!(transcript.display().to_string());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        *crate::claude::WINDOWLESS_PROBE_SEAM
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(tx);
+        let writer = {
+            let transcript = transcript.clone();
+            std::thread::spawn(move || {
+                let ack = rx.recv().expect("windowless probe signal");
+                use std::io::Write as _;
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&transcript)
+                    .expect("append");
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"type": "assistant", "message": {"role": "assistant",
+                            "content": [{"type": "text", "text": "answered at the terminal"}]}})
+                )
+                .expect("write");
+                // Only now may the probe (and the rest of startup) proceed.
+                let _ = ack.send(());
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let mut reader = std::io::Cursor::new(payload.to_string());
+        let result = run_approval_gate(&mut reader, 1000).expect("gate");
+        writer.join().expect("writer");
+        *crate::claude::WINDOWLESS_PROBE_SEAM
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        let _ = fs::remove_file(&transcript);
+
+        assert_eq!(result, json!({}));
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "an answer landing right after the boundary must be seen: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A tap landing while the transcript also moves on must still decide
+    /// the call. This exercises the ordinary decision poll (the tap is seen
+    /// first); the settle-vs-tap contract on the evidence path itself is
+    /// pinned at the state layer by
+    /// `settling_honours_a_tap_and_only_withdraws_withdrawable_pushes`.
+    #[test]
+    fn a_tap_during_the_wait_decides_even_as_the_transcript_moves_on() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("tap-wins-race", true, 120);
+        let transcript =
+            std::env::temp_dir().join(format!("tinyctb-tap-race-{}.jsonl", std::process::id()));
+        // Real shape at gate time: the transcript already ends with the
+        // assistant record carrying THIS tool_use. Seeding only a user line
+        // made the test easier than production, where the boundary always
+        // has an assistant record immediately behind it.
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                json!({"type": "user", "message": {"role": "user", "content": "go"}}),
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_probe", "name": "Bash",
+                     "input": {"command": "rm -rf build/"}}
+                ]}})
+            ),
+        )
+        .expect("seed transcript");
+        let mut payload = bash_payload();
+        payload["transcript_path"] = json!(transcript.display().to_string());
+
+        let writer = {
+            let transcript = transcript.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1200));
+                // The tap lands FIRST...
+                let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+                let id: String = conn
+                    .query_row("SELECT approval_id FROM pending_approvals", [], |row| {
+                        row.get(0)
+                    })
+                    .expect("approval row");
+                crate::state::record_approval_decision(&conn, &id, "allow", 2000).expect("tap");
+                // ...and only then does the transcript move on.
+                use std::io::Write as _;
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&transcript)
+                    .expect("append");
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"type": "assistant", "message": {"role": "assistant",
+                            "content": [{"type": "text", "text": "moved on"}]}})
+                )
+                .expect("write");
+            })
+        };
+        let mut reader = std::io::Cursor::new(payload.to_string());
+        let result = run_approval_gate(&mut reader, 1000).expect("gate");
+        writer.join().expect("writer");
+        let _ = fs::remove_file(&transcript);
+
+        assert_eq!(
+            result["hookSpecificOutput"]["decision"]["behavior"], "allow",
+            "the tap the user already saw accepted must be what the hook returns: {result}"
+        );
+    }
+
+    /// A HEADLESS turn must never be waved through by transcript evidence.
+    /// Under `bypassPermissions` a `{}` reply means "run it", so a foreign
+    /// assistant record — a parallel branch, a subagent's parent turn moving
+    /// on — landing while the gate waits must NOT become permission. The
+    /// only honest endings stay: an explicit Telegram decision, or deny.
+    #[test]
+    fn headless_gate_is_not_released_by_a_foreign_assistant_record() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("headless-foreign-assistant", true, 5);
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        enter_bridge_turn(&conn, "sess-headless");
+        drop(conn);
+        let transcript = std::env::temp_dir().join(format!(
+            "tinyctb-headless-foreign-{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(&transcript, "").expect("seed");
+        let mut payload = headless_payload();
+        payload["transcript_path"] = json!(transcript.display().to_string());
+
+        let writer = {
+            let transcript = transcript.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                use std::io::Write as _;
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&transcript)
+                    .expect("append");
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"type": "assistant", "message": {"role": "assistant",
+                            "content": [{"type": "text", "text": "some other branch"}]}})
+                )
+                .expect("write");
+            })
+        };
+        let started = std::time::Instant::now();
+        let result = headless_gate(payload);
+        writer.join().expect("writer");
+        let _ = fs::remove_file(&transcript);
+
+        assert_eq!(
+            result["hookSpecificOutput"]["permissionDecision"], "deny",
+            "transcript evidence must never authorise a headless call: {result}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "and it must wait out its window rather than exit on the record: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// away OFF hands the dialog to the terminal — but a windowless session
+    /// has no terminal anyone is looking at, so the shortcut must not apply
+    /// to it. Both gates.
+    #[test]
+    fn windowless_sessions_ask_remotely_even_with_away_off() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("windowless-away-off", false, 5);
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
+        // A windowless gate waits a DAY, so each half needs the transcript
+        // evidence that ends it — the configured 5s never applies here.
+        let transcript = std::env::temp_dir().join(format!(
+            "tinyctb-windowless-away-off-{}.jsonl",
+            std::process::id()
+        ));
+        let release = |delay_ms: u64| {
+            let transcript = transcript.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                use std::io::Write as _;
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&transcript)
+                    .expect("append");
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"type": "assistant", "message": {"role": "assistant",
+                            "content": [{"type": "text", "text": "handled locally"}]}})
+                )
+                .expect("write");
+            })
+        };
+
+        fs::write(&transcript, "").expect("seed");
+        let mut approval_payload = bash_payload();
+        approval_payload["transcript_path"] = json!(transcript.display().to_string());
+        let writer = release(800);
+        let approval = {
+            let mut reader = std::io::Cursor::new(approval_payload.to_string());
+            run_approval_gate(&mut reader, 1000).expect("gate")
+        };
+        writer.join().expect("writer");
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        // The request was MINTED remotely rather than waved through to a
+        // terminal nobody can see. (The push itself is withdrawn again when
+        // the evidence lands — that is the self-settle contract — so the row
+        // is what proves the gate engaged.)
+        let minted: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_approvals", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        drop(conn);
+        assert_eq!(approval, json!({}), "the terminal resolved it in the end");
+        assert_eq!(
+            minted, 1,
+            "a windowless approval must be raised remotely even with away off"
+        );
+
+        fs::write(&transcript, "").expect("reseed");
+        let mut q_payload = question_payload();
+        q_payload["transcript_path"] = json!(transcript.display().to_string());
+        let writer = release(800);
+        let question = question_gate(q_payload);
+        writer.join().expect("writer");
+        let _ = fs::remove_file(&transcript);
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let asked: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_questions", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        std::env::remove_var("TINYCTB_TEST_SESSION_WINDOWLESS");
+        assert_eq!(question, json!({}));
+        assert_eq!(
+            asked, 1,
+            "a windowless question must be raised remotely even with away off"
+        );
+    }
+
+    /// The mirror: a session that DOES have a terminal window, with away off,
+    /// belongs to the terminal outright — no row, no push, no wait.
+    #[test]
+    fn windowed_question_with_away_off_returns_immediately() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("windowed-away-off", false, 30);
+
+        let started = std::time::Instant::now();
+        let result = question_gate(question_payload());
+        assert_eq!(result, json!({}));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the terminal owns it, so the gate must not wait: {:?}",
+            started.elapsed()
+        );
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let asked: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_questions", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(asked, 0, "and must not mint a question row");
+    }
+
+    /// The question gate's two windowless behaviours, together: the row gets
+    /// the day-long window (not the configured 30s), and a terminal answer
+    /// still ends the wait early through the transcript watcher.
+    #[test]
+    fn windowless_question_gets_the_long_window_and_still_exits_on_evidence() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("windowless-question", true, 30);
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
+        let transcript = std::env::temp_dir().join(format!(
+            "tinyctb-windowless-question-{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(&transcript, "").expect("seed");
+        let mut payload = question_payload();
+        payload["transcript_path"] = json!(transcript.display().to_string());
+
+        let writer = {
+            let transcript = transcript.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1200));
+                use std::io::Write as _;
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&transcript)
+                    .expect("append");
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"type": "assistant", "message": {"role": "assistant",
+                            "content": [{"type": "text", "text": "answered in the terminal"}]}})
+                )
+                .expect("write");
+            })
+        };
+        let started = std::time::Instant::now();
+        let result = question_gate(payload);
+        writer.join().expect("writer");
+        std::env::remove_var("TINYCTB_TEST_SESSION_WINDOWLESS");
+        let _ = fs::remove_file(&transcript);
+
+        assert_eq!(result, json!({}));
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the terminal answer must end the wait, not the 24h window: {:?}",
+            started.elapsed()
+        );
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let (created_at, expires_at): (i64, i64) = conn
+            .query_row(
+                "SELECT created_at, expires_at FROM pending_questions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("question row");
+        assert_eq!(
+            expires_at - created_at,
+            WINDOWLESS_APPROVAL_WAIT.as_millis() as i64,
+            "a windowless question must get the day-long window, not the configured 30s"
+        );
+    }
+
+    /// A session with NO terminal window (background pty host) has nowhere
+    /// to step aside TO: the dialog would land in a pty nobody is watching
+    /// and the tool would stay blocked. Measured 2026-08-17: exactly this
+    /// froze a cchess session for 7h09m. So presence must not divert it —
+    /// the push goes out and the remote window stays open for a full day,
+    /// which is also what makes /threads able to re-offer the buttons.
+    #[test]
+    fn windowless_session_keeps_the_remote_window_open() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("windowless-present", true, 30);
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
+        // User is at the keyboard — for a windowed session this alone would
+        // hand the dialog straight to the terminal.
+        std::env::set_var("TINYCTB_TEST_IDLE_MS", "0");
+
+        let answerer = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(1500));
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            let id: String = conn
+                .query_row("SELECT approval_id FROM pending_approvals", [], |row| {
+                    row.get(0)
+                })
+                .expect("an approval row must exist despite the present user");
+            crate::state::record_approval_decision(&conn, &id, "allow", 1000).expect("tap");
+        });
+        let result = gate(bash_payload());
+        answerer.join().expect("answerer");
+        std::env::remove_var("TINYCTB_TEST_IDLE_MS");
+        std::env::remove_var("TINYCTB_TEST_SESSION_WINDOWLESS");
+
+        assert_eq!(
+            result["hookSpecificOutput"]["decision"]["behavior"], "allow",
+            "the remote tap must decide it, not a terminal that does not exist: {result}"
+        );
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let (created_at, expires_at): (i64, i64) = conn
+            .query_row(
+                "SELECT created_at, expires_at FROM pending_approvals",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("approval row");
+        assert_eq!(
+            expires_at - created_at,
+            WINDOWLESS_APPROVAL_WAIT.as_millis() as i64,
+            "a windowless session must get the long window, not the configured 30s"
+        );
+    }
+
+    /// The mirror of `gate_releases_to_the_terminal_when_the_user_returns`:
+    /// for a windowless session the returning user must NOT take the prompt
+    /// away, because "the terminal" is a pty with no window on it. The tool
+    /// stays blocked either way — the difference is whether the phone can
+    /// still clear it.
+    #[test]
+    fn returning_user_does_not_steal_a_windowless_prompt() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = GateEnv::new("windowless-returns", true, 30);
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
+        std::env::set_var("TINYCTB_TEST_IDLE_MS", "3600000");
+
+        let script = std::thread::spawn(|| {
+            // The user comes back to the machine...
+            std::thread::sleep(Duration::from_millis(800));
+            std::env::set_var("TINYCTB_TEST_IDLE_MS", "50");
+            // ...and only later answers from the phone. If the return had
+            // released the prompt, the gate would already have returned {}.
+            std::thread::sleep(Duration::from_millis(1200));
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            let id: String = conn
+                .query_row("SELECT approval_id FROM pending_approvals", [], |row| {
+                    row.get(0)
+                })
+                .expect("approval row");
+            crate::state::record_approval_decision(&conn, &id, "deny", 1000).expect("tap");
+        });
+        let result = gate(bash_payload());
+        script.join().expect("script");
+        std::env::remove_var("TINYCTB_TEST_IDLE_MS");
+        std::env::remove_var("TINYCTB_TEST_SESSION_WINDOWLESS");
+
+        assert_eq!(
+            result["hookSpecificOutput"]["decision"]["behavior"], "deny",
+            "the phone answer must still be the one that lands: {result}"
         );
     }
 

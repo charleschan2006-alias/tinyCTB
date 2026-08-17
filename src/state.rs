@@ -782,6 +782,14 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "pending_questions", "multi_select", "INTEGER")?;
     ensure_column(conn, "pending_prompts", "transcript_bytes", "INTEGER")?;
     ensure_column(conn, "pending_prompts", "notification_type", "TEXT")?;
+    ensure_column(conn, "outbound_events", "claimed_at", "INTEGER")?;
+    ensure_column(conn, "outbound_events", "claim_token", "TEXT")?;
+    ensure_column(
+        conn,
+        "outbound_events",
+        "cancel_requested",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     ensure_column(conn, "pending_approvals", "headless", "INTEGER")?;
     ensure_column(conn, "telegram_callback_routes", "question_id", "TEXT")?;
     ensure_column(conn, "telegram_callback_routes", "answer", "TEXT")?;
@@ -823,8 +831,9 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
              ON pending_questions(expires_at, created_at) WHERE answer IS NULL;
          CREATE INDEX IF NOT EXISTS idx_pending_approvals_open
              ON pending_approvals(expires_at, created_at) WHERE decision IS NULL;
-         CREATE INDEX IF NOT EXISTS idx_outbound_events_pending
-             ON outbound_events(next_attempt_at) WHERE status != 'delivered';",
+         DROP INDEX IF EXISTS idx_outbound_events_pending;
+         CREATE INDEX IF NOT EXISTS idx_outbound_events_active
+             ON outbound_events(next_attempt_at) WHERE status IN ('pending', 'failed');",
     )?;
     Ok(())
 }
@@ -2872,7 +2881,7 @@ pub(crate) fn last_delivered_completion_preview(
     let row: Option<(String, String, i64)> = conn
         .query_row(
             "SELECT event_type, payload_json, delivered_at FROM outbound_events
-             WHERE thread_id = ?1 AND delivered_at IS NOT NULL
+             WHERE thread_id = ?1 AND delivered_at IS NOT NULL AND status = 'delivered'
              ORDER BY delivered_at DESC, created_at DESC, event_id DESC LIMIT 1",
             params![thread_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -2901,14 +2910,39 @@ pub(crate) fn last_delivered_completion_preview(
 
 /// The two queries the daemon runs on EVERY tick. They are constants so the
 /// EXPLAIN QUERY PLAN test pins the access path of the REAL query text: both
-/// must keep the literal `status != 'delivered'` term that matches the
+/// must keep the literal active-status term that matches the
 /// partial index's WHERE clause, or SQLite silently falls back to walking
 /// the full delivered history 2×/tick.
 pub(crate) const PENDING_OUTBOUND_COUNT_SQL: &str =
-    "SELECT COUNT(*) FROM outbound_events WHERE status != 'delivered'";
+    "SELECT COUNT(*) FROM outbound_events WHERE status IN ('pending', 'failed')";
+/// How long a delivery claim is honoured before another cycle may take the
+/// row back. A claim without an expiry is a permanent lock: a daemon killed
+/// between claiming and sending would leave the row claimed forever, never
+/// delivered — and because the batch query is `LIMIT 100`, a hundred such
+/// orphans would starve every notification behind them for good.
+/// DELIVERY SEMANTICS: **at-least-once**, chosen deliberately.
+///
+/// The send and the transport-log write cannot be one atomic step — the
+/// first crosses the network, the second is local — so a daemon killed
+/// between them leaves an undecidable window: Telegram accepted the message
+/// but nothing here knows it. The recovery path re-sends, which can show the
+/// user the same request twice.
+///
+/// The alternative (log first, then send = at-most-once) trades a visible
+/// duplicate for a silent disappearance, and the whole point of this outbox
+/// is that a request the user must answer never vanishes. A duplicate is
+/// obvious and answerable; a lost approval looks exactly like a session that
+/// hung. One-answer-per-row means the second copy is harmless: tapping it
+/// gets "已经处理过了".
+pub(crate) const CLAIM_LEASE_MS: u64 = 5 * 60 * 1000;
+
+/// Rows a cycle may take: due, undelivered, and either unclaimed or holding
+/// a claim whose lease has run out. Excluding LIVE claims keeps a batch of
+/// in-flight rows from consuming the limit that later notifications need.
 pub(crate) const DELIVER_DUE_OUTBOUND_SQL: &str = "SELECT event_id, payload_json, attempts
      FROM outbound_events
-     WHERE status != 'delivered' AND next_attempt_at <= ?1
+     WHERE status IN ('pending', 'failed') AND next_attempt_at <= ?1
+       AND (claimed_at IS NULL OR claimed_at <= ?3)
      ORDER BY created_at ASC, event_id ASC
      LIMIT ?2";
 
@@ -2920,9 +2954,84 @@ pub(crate) fn pending_outbound_count(conn: &Connection) -> Result<u64> {
 /// /back clears the away-notification backlog only. Answers to turns the user
 /// started from Telegram (origin 'bridge') stay queued: they were explicitly
 /// requested and must survive a delivery failure followed by /back.
+/// What settling a prompt from inside the gate actually found.
+pub(crate) enum SettleOutcome {
+    /// A Telegram answer had already landed. It stands — the phone showed
+    /// the user "已接受" and the hook must honour exactly that.
+    Answered(String),
+    /// Nobody answered remotely; the request is now expired and any unsent
+    /// push was withdrawn.
+    Expired,
+}
+
+pub(crate) enum SettleTarget<'a> {
+    Approval(&'a str),
+    Question(&'a str),
+}
+
+/// Settle a prompt the gate has decided it no longer owns, and withdraw its
+/// push — as ONE transaction, because the two halves contradict each other
+/// if only one lands: a settled request whose button still ships, or a
+/// withdrawn button for a request still waiting.
+///
+/// The linearization point against the daemon is the outbound row's claim.
+/// Cancelling only touches rows that are unclaimed AND carry no transport
+/// record: once delivery has claimed a row it may already be on the wire, so
+/// the honest move is to leave it and let the callback answer "已超时".
+pub(crate) fn settle_expired_and_cancel_push(
+    conn: &Connection,
+    target: SettleTarget<'_>,
+    now: u64,
+) -> Result<SettleOutcome> {
+    let tx = conn.unchecked_transaction()?;
+    let (answer, event_key) = match target {
+        SettleTarget::Approval(id) => (
+            expire_or_take_decision(conn, id, now)?,
+            format!("approval:{id}"),
+        ),
+        SettleTarget::Question(id) => (
+            expire_or_take_answer(conn, id, now)?,
+            format!("question:{id}"),
+        ),
+    };
+    if let Some(answer) = answer {
+        // A tap won the race. Keep its push exactly as it is.
+        tx.commit()?;
+        return Ok(SettleOutcome::Answered(answer));
+    }
+    let stale_cutoff = to_sql_i64(now.saturating_sub(CLAIM_LEASE_MS))?;
+    // Withdraw outright what nobody is holding.
+    conn.execute(
+        "DELETE FROM outbound_events
+         WHERE delivered_at IS NULL
+           AND status IN ('pending', 'failed')
+           AND (claimed_at IS NULL OR claimed_at <= ?2)
+           AND json_extract(payload_json, '$.eventKey') = ?1
+           AND NOT EXISTS (
+             SELECT 1 FROM transport_delivery_log
+             WHERE transport_delivery_log.event_id = outbound_events.event_id
+           )",
+        params![event_key, stale_cutoff],
+    )?;
+    // A row inside a live lease cannot be deleted — its owner may already be
+    // mid-send. But that owner can also be DEAD (claimed, then the daemon
+    // was killed), and five minutes later the reclaim would post a button
+    // for a request settled long ago. Record the intent instead: whoever
+    // ends up holding the row honours it before sending.
+    conn.execute(
+        "UPDATE outbound_events SET cancel_requested = 1
+         WHERE delivered_at IS NULL
+           AND status IN ('pending', 'failed')
+           AND json_extract(payload_json, '$.eventKey') = ?1",
+        params![event_key],
+    )?;
+    tx.commit()?;
+    Ok(SettleOutcome::Expired)
+}
+
 pub(crate) fn clear_pending_outbound_events(conn: &Connection) -> Result<usize> {
     let deleted = conn.execute(
-        "DELETE FROM outbound_events WHERE status != 'delivered' AND origin = 'away'",
+        "DELETE FROM outbound_events WHERE status IN ('pending', 'failed') AND origin = 'away'",
         [],
     )?;
     Ok(deleted)
@@ -2990,13 +3099,20 @@ where
 {
     let rows = {
         let mut stmt = conn.prepare(DELIVER_DUE_OUTBOUND_SQL)?;
-        let rows = stmt.query_map(params![to_sql_i64(now)?, limit as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![
+                to_sql_i64(now)?,
+                limit as i64,
+                to_sql_i64(now.saturating_sub(CLAIM_LEASE_MS))?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
@@ -3009,9 +3125,85 @@ where
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             break;
         }
+        // CLAIM the row before sending. The rows above were read in one
+        // batch, so between that read and this send a gate may have settled
+        // its prompt and withdrawn the push; without a claim the stale
+        // in-memory payload would still go out as a dead button. The claim
+        // and the gate's cancel contend on the same row, and whichever lands
+        // first decides — that is the linearization point.
+        // A malformed payload is QUARANTINED, never propagated. Returning
+        // `?` here aborted the whole batch and left the bad row first in
+        // line next cycle — one corrupt event silently froze every
+        // notification behind it, forever.
+        let event: Value = match serde_json::from_str(&payload_json) {
+            Ok(event) => event,
+            Err(error) => {
+                eprintln!("tinyctb: quarantining unparseable outbound event {event_id}: {error}");
+                conn.execute(
+                    "UPDATE outbound_events
+                     SET status = 'invalid', last_error = ?2,
+                         claimed_at = NULL, claim_token = NULL
+                     WHERE event_id = ?1",
+                    params![event_id, format!("unparseable payload: {error}")],
+                )?;
+                summary.failed += 1;
+                continue;
+            }
+        };
+        // The claim is a LEASE with an owner token. The lease lets a later
+        // cycle reclaim a row whose owner died mid-send; the token makes the
+        // dead owner harmless if it ever wakes up, because every settling
+        // update below insists on holding the same token.
+        let token =
+            crate::claude::generate_session_uuid().unwrap_or_else(|_| format!("{event_id}:{now}"));
+        let claimed = conn.execute(
+            "UPDATE outbound_events SET claimed_at = ?2, claim_token = ?3
+             WHERE event_id = ?1
+               AND delivered_at IS NULL
+               AND status IN ('pending', 'failed')
+               AND (claimed_at IS NULL OR claimed_at <= ?4)",
+            params![
+                event_id,
+                to_sql_i64(now)?,
+                token,
+                to_sql_i64(now.saturating_sub(CLAIM_LEASE_MS))?
+            ],
+        )?;
+        if claimed == 0 {
+            continue; // withdrawn, already delivered, or in flight elsewhere
+        }
+        // Honour a cancellation recorded while this row was claimed by an
+        // owner that then died. If the transport log says it never reached
+        // Telegram, drop it; if it did, settle it as the delivery it was
+        // rather than sending a second copy.
+        let cancel_requested: i64 = conn
+            .query_row(
+                "SELECT cancel_requested FROM outbound_events WHERE event_id = ?1",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if cancel_requested != 0 {
+            match transport_delivered_at(conn, &event_id, "telegram")? {
+                Some(sent_at) => {
+                    conn.execute(
+                        "UPDATE outbound_events
+                         SET status = 'delivered', delivered_at = ?2, claimed_at = NULL,
+                             claim_token = NULL
+                         WHERE event_id = ?1 AND claim_token = ?3",
+                        params![event_id, to_sql_i64(sent_at)?, token],
+                    )?;
+                }
+                None => {
+                    conn.execute(
+                        "DELETE FROM outbound_events WHERE event_id = ?1 AND claim_token = ?2",
+                        params![event_id, token],
+                    )?;
+                }
+            }
+            continue;
+        }
         summary.attempted += 1;
-        let event: Value = serde_json::from_str(&payload_json)
-            .with_context(|| format!("outbound event {event_id} contains invalid JSON"))?;
         match sender(&event) {
             Ok(result) => {
                 // A sender that recognised this event as ALREADY sent (its
@@ -3027,23 +3219,27 @@ where
                 conn.execute(
                     "UPDATE outbound_events
                      SET status = 'delivered', attempts = attempts + 1, delivered_at = ?2, last_error = NULL
-                     WHERE event_id = ?1",
-                    params![event_id, to_sql_i64(delivered_at)?],
+                     WHERE event_id = ?1 AND claim_token = ?3",
+                    params![event_id, to_sql_i64(delivered_at)?, token],
                 )?;
                 summary.delivered += 1;
             }
             Err(error) => {
                 let next_attempts = from_sql_i64(attempts)?.saturating_add(1);
                 let next_attempt_at = now.saturating_add(retry_delay_ms(next_attempts));
+                // Release the claim: a failed send must be re-claimable
+                // when its retry comes due, or the row would be stranded.
                 conn.execute(
                     "UPDATE outbound_events
-                     SET status = 'failed', attempts = ?2, next_attempt_at = ?3, last_error = ?4
-                     WHERE event_id = ?1",
+                     SET status = 'failed', attempts = ?2, next_attempt_at = ?3, last_error = ?4,
+                         claimed_at = NULL, claim_token = NULL
+                     WHERE event_id = ?1 AND claim_token = ?5",
                     params![
                         event_id,
                         to_sql_i64(next_attempts)?,
                         to_sql_i64(next_attempt_at)?,
-                        format!("{error:#}")
+                        format!("{error:#}"),
+                        token
                     ],
                 )?;
                 summary.failed += 1;
@@ -3120,6 +3316,11 @@ mod tests {
 
     #[test]
     fn state_schema_matches_ts_bridge_contract() {
+        // Serialised with every other test that touches the process-wide
+        // away marker: these write it through the shared state dir, and an
+        // unlocked writer flipping it mid-run is what made the question-gate
+        // tests fail intermittently.
+        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
         let conn = create_state_db_in_memory().expect("db");
         let tables = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -3836,10 +4037,40 @@ mod tests {
             };
             assert!(
                 plan.iter()
-                    .any(|step| step.contains("idx_outbound_events_pending")),
+                    .any(|step| step.contains("idx_outbound_events_active")),
                 "query not served by the pending partial index: {sql}\nplan: {plan:?}"
             );
         }
+    }
+
+    /// Rows quarantined by an older build carry `delivered_at` without ever
+    /// having been sent. They must not count as "what the user last saw",
+    /// or an idle reminder gets suppressed on the strength of a message
+    /// that never left the machine.
+    #[test]
+    fn a_quarantined_row_is_not_treated_as_the_last_delivery() {
+        let conn = create_state_db_in_memory().expect("db");
+        // Legacy shape: status 'invalid' AND a delivered_at stamp.
+        conn.execute(
+            "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at, delivered_at)
+             VALUES ('evt_legacy', 'thread_waiting', 'sess', ?1, 'invalid', 0, 2000, 2500)",
+            params![json!({"lastPreview": "从未送达"}).to_string()],
+        )
+        .expect("legacy row");
+        conn.execute(
+            "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at, delivered_at)
+             VALUES ('evt_real', 'thread_completed', 'sess', ?1, 'delivered', 0, 1000, 1500)",
+            params![json!({"lastPreview": "真的完成推送"}).to_string()],
+        )
+        .expect("real row");
+
+        assert_eq!(
+            last_delivered_completion_preview(&conn, "sess", 2600)
+                .expect("query")
+                .as_deref(),
+            Some("真的完成推送"),
+            "a never-sent quarantined row must not outrank the real delivery"
+        );
     }
 
     #[test]
@@ -4025,6 +4256,550 @@ mod tests {
                 .expect("count");
             assert_eq!(count, 1, "{table} keeps only the recent row");
         }
+    }
+
+    /// The contract the gate depends on when it settles itself.
+    #[test]
+    fn settling_honours_a_tap_and_only_withdraws_withdrawable_pushes() {
+        let seed = |conn: &Connection, key: &str, claimed: Option<i64>, logged: bool| {
+            conn.execute(
+                "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at, claimed_at)
+                 VALUES (?1, 'approval_request', 'thr', ?2, 'pending', 0, 0, ?3)",
+                params![key, json!({"eventKey": key}).to_string(), claimed],
+            )
+            .expect("seed outbound");
+            if logged {
+                record_transport_delivery(conn, key, "telegram", &json!({"ok": true}), 1)
+                    .expect("log");
+            }
+        };
+        let open_approval = |conn: &Connection, id: &str| {
+            create_pending_approval(conn, id, "thr", "Bash", "s", false, 1000, 9_000_000_000)
+                .expect("approval");
+        };
+
+        // 1. A tap that landed first must survive: answer returned, push kept.
+        let conn = create_state_db_in_memory().expect("db");
+        open_approval(&conn, "a1");
+        seed(&conn, "approval:a1", None, false);
+        record_approval_decision(&conn, "a1", "allow", 1500).expect("tap");
+        let outcome = settle_expired_and_cancel_push(&conn, SettleTarget::Approval("a1"), 2000)
+            .expect("settle");
+        assert!(
+            matches!(outcome, SettleOutcome::Answered(ref d) if d == "allow"),
+            "a tap the user already saw accepted must be returned, never discarded"
+        );
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM outbound_events", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(kept, 1, "the push behind an accepted answer stays");
+
+        // 2. Nobody answered: expired, and the unclaimed push is withdrawn.
+        let conn = create_state_db_in_memory().expect("db");
+        open_approval(&conn, "a2");
+        seed(&conn, "approval:a2", None, false);
+        let outcome = settle_expired_and_cancel_push(&conn, SettleTarget::Approval("a2"), 2000)
+            .expect("settle");
+        assert!(matches!(outcome, SettleOutcome::Expired));
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM outbound_events", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(left, 0, "an unsent, unclaimed push must be withdrawn");
+
+        // 3. A CLAIMED row is already delivery's business — it may be on the
+        //    wire, so it is never yanked out from under the sender.
+        let conn = create_state_db_in_memory().expect("db");
+        open_approval(&conn, "a3");
+        seed(&conn, "approval:a3", Some(1234), false);
+        settle_expired_and_cancel_push(&conn, SettleTarget::Approval("a3"), 2000).expect("settle");
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM outbound_events", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(left, 1, "a claimed push must not be cancelled mid-flight");
+
+        // 4. Same for one the transport log says already went out.
+        let conn = create_state_db_in_memory().expect("db");
+        open_approval(&conn, "a4");
+        seed(&conn, "approval:a4", None, true);
+        settle_expired_and_cancel_push(&conn, SettleTarget::Approval("a4"), 2000).expect("settle");
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM outbound_events", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(
+            left, 1,
+            "a push with a transport record has reached the user"
+        );
+    }
+
+    /// The delivery loop reads its batch up front, so a push withdrawn after
+    /// that read must still not go out. The per-row claim is what enforces
+    /// it: this test cancels row two from inside row one's send.
+    /// The retry schedule is the long tail of a dead button: a push whose
+    /// first send failed sits in the outbox waiting to try again, and if the
+    /// terminal settles the request in the meantime that retry would hand
+    /// the user a button for something already decided. Settling must be
+    /// able to withdraw a FAILED row, and the next cycle must send nothing.
+    #[test]
+    fn a_failed_push_settled_at_the_terminal_is_never_retried() {
+        let conn = create_state_db_in_memory().expect("db");
+        create_pending_approval(&conn, "ap1", "thr", "Bash", "s", false, 1000, 9_000_000_000)
+            .expect("approval");
+        enqueue_outbound_event(
+            &conn,
+            &json!({
+                "type": "approval_request",
+                "threadId": "thr",
+                "eventKey": "approval:ap1",
+                "updatedAt": 1000
+            }),
+            1000,
+            "bridge",
+        )
+        .expect("enqueue");
+
+        // First send fails: the row stays, claim released, retry scheduled.
+        let summary = deliver_due_outbound_events(&conn, 1000, 10, None, |_| {
+            Err(anyhow::anyhow!("telegram unreachable"))
+        })
+        .expect("first attempt");
+        assert_eq!(summary.failed, 1);
+        let (status, claimed): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT status, claimed_at FROM outbound_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(status, "failed");
+        assert_eq!(claimed, None, "a failed send must release its claim");
+
+        // The terminal answers it; the gate settles and withdraws the push.
+        let outcome = settle_expired_and_cancel_push(&conn, SettleTarget::Approval("ap1"), 2000)
+            .expect("settle");
+        assert!(matches!(outcome, SettleOutcome::Expired));
+
+        // The retry cycle must find nothing to send.
+        let sent = std::cell::Cell::new(0usize);
+        let summary = deliver_due_outbound_events(&conn, 9_000_000, 10, None, |_| {
+            sent.set(sent.get() + 1);
+            Ok(json!({ "ok": true }))
+        })
+        .expect("retry cycle");
+        assert_eq!(sent.get(), 0, "the withdrawn push must never be retried");
+        assert_eq!(summary.attempted, 0);
+    }
+
+    /// The same recovery chain, but every step goes through PRODUCTION
+    /// code: the claim is taken by a real delivery cycle whose sender panics
+    /// the way a killed daemon would, the connection is dropped and the
+    /// database reopened, and only then does the terminal settle and a later
+    /// cycle reclaim. Hand-filling `claimed_at`/`claim_token` proved the
+    /// query shapes; this proves the chain.
+    #[test]
+    fn the_crash_recovery_chain_holds_through_a_real_claim_and_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("tinyctb-crash-chain-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = create_state_db(&path).expect("db");
+            create_pending_approval(&conn, "ap", "thr", "Bash", "s", false, 1000, 9_000_000_000)
+                .expect("approval");
+            enqueue_outbound_event(
+                &conn,
+                &json!({
+                    "type": "approval_request",
+                    "threadId": "thr",
+                    "eventKey": "approval:ap",
+                    "updatedAt": 1000
+                }),
+                1000,
+                "bridge",
+            )
+            .expect("enqueue");
+
+            // A real cycle claims the row, then the "daemon" dies mid-send:
+            // the sender unwinds and the connection is dropped without any
+            // settling update ever running.
+            let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = deliver_due_outbound_events(&conn, 1000, 10, None, |_| {
+                    panic!("daemon killed mid-send");
+                });
+            }));
+            assert!(crashed.is_err(), "the sender must have died");
+        } // connection dropped == process gone
+
+        // Reopen, exactly like a restarted daemon.
+        let conn = create_state_db(&path).expect("reopen");
+        let (status, claimed, token): (String, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT status, claimed_at, claim_token FROM outbound_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("row survives the crash");
+        assert_eq!(status, "pending", "no settling update ran");
+        assert!(
+            claimed.is_some() && token.is_some(),
+            "the claim is orphaned"
+        );
+
+        // The terminal answers it while the orphaned lease is still live.
+        settle_expired_and_cancel_push(&conn, SettleTarget::Approval("ap"), 1500).expect("settle");
+
+        // Lease lapses; a later real cycle reclaims and must send nothing.
+        let sent = std::cell::Cell::new(0usize);
+        deliver_due_outbound_events(&conn, CLAIM_LEASE_MS * 3, 10, None, |_| {
+            sent.set(sent.get() + 1);
+            Ok(json!({ "ok": true }))
+        })
+        .expect("recovery cycle");
+        assert_eq!(
+            sent.get(),
+            0,
+            "a request settled during the orphaned lease must never be posted"
+        );
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM outbound_events", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(left, 0, "and the withdrawn push is gone");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The narrow window Sol named: the daemon claims a row, then dies; the
+    /// terminal settles the request while the lease is still live; five
+    /// minutes later the reclaim would post a button for a settled call.
+    /// The settle records its intent on the claimed row, and whoever picks
+    /// the row up afterwards honours it instead of sending.
+    #[test]
+    fn a_settle_during_a_live_claim_is_honoured_when_the_row_is_reclaimed() {
+        for logged in [false, true] {
+            let conn = create_state_db_in_memory().expect("db");
+            create_pending_approval(&conn, "ap", "thr", "Bash", "s", false, 1000, 9_000_000_000)
+                .expect("approval");
+            conn.execute(
+                "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at, claimed_at, claim_token)
+                 VALUES ('evt', 'approval_request', 'thr', ?1, 'pending', 0, 0, 1000, 'dead-owner')",
+                params![json!({"eventKey": "approval:ap"}).to_string()],
+            )
+            .expect("seed claimed row");
+            if logged {
+                record_transport_delivery(&conn, "evt", "telegram", &json!({"ok": true}), 1500)
+                    .expect("log");
+            }
+
+            // Terminal settles while the (dead) owner still holds the lease.
+            settle_expired_and_cancel_push(&conn, SettleTarget::Approval("ap"), 2000)
+                .expect("settle");
+            let flagged: i64 = conn
+                .query_row(
+                    "SELECT cancel_requested FROM outbound_events WHERE event_id = 'evt'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("flag");
+            assert_eq!(flagged, 1, "the intent must survive on the claimed row");
+
+            // Lease lapses; the row is reclaimed by a later cycle.
+            let sent = std::cell::Cell::new(0usize);
+            deliver_due_outbound_events(&conn, CLAIM_LEASE_MS * 3, 10, None, |_| {
+                sent.set(sent.get() + 1);
+                Ok(json!({ "ok": true }))
+            })
+            .expect("reclaim cycle");
+            assert_eq!(
+                sent.get(),
+                0,
+                "a settled request must never be posted on reclaim (logged={logged})"
+            );
+
+            let row: Option<(String, Option<i64>)> = conn
+                .query_row(
+                    "SELECT status, delivered_at FROM outbound_events WHERE event_id = 'evt'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .expect("row");
+            if logged {
+                let (status, delivered_at) = row.expect("a delivered row is kept as history");
+                assert_eq!(status, "delivered");
+                assert_eq!(
+                    delivered_at,
+                    Some(1500),
+                    "recovery must record the time it ACTUALLY went out"
+                );
+            } else {
+                assert!(row.is_none(), "an unsent, settled push is dropped");
+            }
+        }
+    }
+
+    /// One corrupt payload used to abort the whole batch and stay first in
+    /// line, freezing every notification behind it forever. It must be
+    /// quarantined and the rest of the queue must flow.
+    #[test]
+    fn a_malformed_event_is_quarantined_and_the_queue_keeps_moving() {
+        let conn = create_state_db_in_memory().expect("db");
+        conn.execute(
+            "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at)
+             VALUES ('evt_bad', 'approval_request', 'thr', '{not json', 'pending', 0, 1)",
+            [],
+        )
+        .expect("seed bad");
+        conn.execute(
+            "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at)
+             VALUES ('evt_good', 'thread_completed', 'thr', ?1, 'pending', 0, 2)",
+            params![json!({"eventKey": "good"}).to_string()],
+        )
+        .expect("seed good");
+
+        let sent = std::cell::RefCell::new(Vec::new());
+        let summary = deliver_due_outbound_events(&conn, 1000, 10, None, |event| {
+            sent.borrow_mut().push(
+                event
+                    .get("eventKey")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            Ok(json!({ "ok": true }))
+        })
+        .expect("batch must not abort");
+
+        assert_eq!(
+            sent.into_inner(),
+            vec!["good".to_string()],
+            "the event behind the corrupt one must still go out"
+        );
+        assert_eq!(summary.delivered, 1);
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM outbound_events WHERE event_id = 'evt_bad'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("bad row");
+        assert_eq!(status, "invalid", "and the corrupt row must be terminal");
+        // Terminal means terminal: the row must leave the ACTIVE set, or it
+        // gets re-parsed every tick and 100 of them fill the batch limit.
+        assert_eq!(
+            pending_outbound_count(&conn).expect("pending"),
+            0,
+            "a quarantined row must not count as pending work"
+        );
+        let picked = std::cell::Cell::new(0usize);
+        let summary = deliver_due_outbound_events(&conn, 2000, 10, None, |_| {
+            picked.set(picked.get() + 1);
+            Ok(json!({ "ok": true }))
+        })
+        .expect("second cycle");
+        assert_eq!(picked.get(), 0, "nothing left to send");
+        assert_eq!(
+            summary.failed, 0,
+            "and the corrupt row must not be re-parsed at all — a second \
+             quarantine here means it is still in the queue"
+        );
+    }
+
+    /// A daemon killed between claiming a row and sending it must not
+    /// strand that row forever. The claim is a lease: once it expires the
+    /// next cycle takes the row back and delivers it.
+    #[test]
+    fn a_claim_orphaned_by_a_crash_is_reclaimed_after_its_lease() {
+        let seed = |conn: &Connection, id: &str, claimed_at: i64, logged: bool| {
+            conn.execute(
+                "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at, claimed_at, claim_token)
+                 VALUES (?1, 'approval_request', 'thr', ?2, 'pending', 0, 0, ?3, 'dead-owner')",
+                params![id, json!({"eventKey": id}).to_string(), claimed_at],
+            )
+            .expect("seed");
+            if logged {
+                record_transport_delivery(conn, id, "telegram", &json!({"ok": true}), 1)
+                    .expect("log");
+            }
+        };
+        let now = CLAIM_LEASE_MS * 3;
+
+        // Lease expired, nothing was ever sent: reclaim and deliver.
+        let conn = create_state_db_in_memory().expect("db");
+        seed(&conn, "evt_orphan", 1, false);
+        let summary =
+            deliver_due_outbound_events(&conn, now, 10, None, |_| Ok(json!({"ok": true})))
+                .expect("deliver");
+        assert_eq!(
+            summary.delivered, 1,
+            "a crash-orphaned claim must be reclaimed once its lease lapses"
+        );
+
+        // Lease expired but the transport log says it DID reach Telegram:
+        // still reclaimable, and the sender's own idempotence is what keeps
+        // it from being sent twice — so the row settles without a re-send.
+        let conn = create_state_db_in_memory().expect("db");
+        seed(&conn, "evt_logged", 1, true);
+        let sent = std::cell::Cell::new(0usize);
+        deliver_due_outbound_events(&conn, now, 10, None, |event| {
+            let id = event
+                .get("eventKey")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if transport_delivered_at(&conn, id, "telegram")?.is_none() {
+                sent.set(sent.get() + 1);
+            }
+            Ok(json!({"ok": true}))
+        })
+        .expect("deliver");
+        assert_eq!(
+            sent.get(),
+            0,
+            "a row already in the transport log must not be re-sent on reclaim"
+        );
+
+        // A LIVE claim is left alone.
+        let conn = create_state_db_in_memory().expect("db");
+        seed(&conn, "evt_live", to_sql_i64(now).expect("now"), false);
+        let summary =
+            deliver_due_outbound_events(&conn, now, 10, None, |_| Ok(json!({"ok": true})))
+                .expect("deliver");
+        assert_eq!(
+            summary.attempted, 0,
+            "a claim still inside its lease belongs to whoever holds it"
+        );
+    }
+
+    /// A hundred corrupt rows must not fill the batch limit forever. This
+    /// is what "terminal" has to mean: quarantined rows leave the active
+    /// set, so the next real notification still gets through on the SAME
+    /// cycle rather than queueing behind garbage that never drains.
+    #[test]
+    fn a_hundred_malformed_events_do_not_starve_the_queue() {
+        let conn = create_state_db_in_memory().expect("db");
+        for index in 0..100 {
+            conn.execute(
+                "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at)
+                 VALUES (?1, 'approval_request', 'thr', '{not json', 'pending', 0, ?2)",
+                params![format!("evt_bad_{index:03}"), index],
+            )
+            .expect("seed bad");
+        }
+        conn.execute(
+            "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at)
+             VALUES ('evt_good', 'thread_completed', 'thr', ?1, 'pending', 0, 999)",
+            params![json!({"eventKey": "good"}).to_string()],
+        )
+        .expect("seed good");
+
+        // First cycle: the limit is 100, so the good row is behind them all.
+        let sent = std::cell::RefCell::new(Vec::new());
+        deliver_due_outbound_events(&conn, 1000, 100, None, |event| {
+            sent.borrow_mut().push(
+                event
+                    .get("eventKey")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            Ok(json!({ "ok": true }))
+        })
+        .expect("first cycle");
+
+        // Second cycle: with the bad rows terminal, the good one is now
+        // first in line. If quarantine did not remove them from the active
+        // set they would fill the limit again, forever.
+        deliver_due_outbound_events(&conn, 2000, 100, None, |event| {
+            sent.borrow_mut().push(
+                event
+                    .get("eventKey")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            Ok(json!({ "ok": true }))
+        })
+        .expect("second cycle");
+
+        assert_eq!(
+            sent.into_inner(),
+            vec!["good".to_string()],
+            "the real notification must get out despite 100 corrupt rows"
+        );
+    }
+
+    /// The batch is `LIMIT 100`. If in-flight rows counted against it, a
+    /// hundred stuck claims would starve every later notification forever —
+    /// which is exactly what an unbounded claim produced. Live claims are
+    /// excluded from the query, so the fresh row still gets through.
+    #[test]
+    fn a_hundred_in_flight_claims_do_not_starve_the_queue() {
+        let conn = create_state_db_in_memory().expect("db");
+        let now = CLAIM_LEASE_MS * 3;
+        for index in 0..100 {
+            conn.execute(
+                "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at, claimed_at, claim_token)
+                 VALUES (?1, 'approval_request', 'thr', '{}', 'pending', 0, ?2, ?3, 'holder')",
+                params![format!("evt_stuck_{index:03}"), index, to_sql_i64(now).expect("now")],
+            )
+            .expect("seed stuck");
+        }
+        conn.execute(
+            "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at)
+             VALUES ('evt_fresh', 'thread_completed', 'thr', ?1, 'pending', 0, 999)",
+            params![json!({"eventKey": "fresh"}).to_string()],
+        )
+        .expect("seed fresh");
+
+        let sent = std::cell::RefCell::new(Vec::new());
+        deliver_due_outbound_events(&conn, now, 100, None, |event| {
+            sent.borrow_mut().push(
+                event
+                    .get("eventKey")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            Ok(json!({"ok": true}))
+        })
+        .expect("deliver");
+        assert_eq!(
+            sent.into_inner(),
+            vec!["fresh".to_string()],
+            "a queue full of in-flight claims must not block the next notification"
+        );
+    }
+
+    #[test]
+    fn a_push_withdrawn_after_the_batch_read_is_not_sent() {
+        let conn = create_state_db_in_memory().expect("db");
+        for (id, key) in [("evt_1", "approval:one"), ("evt_2", "approval:two")] {
+            conn.execute(
+                "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at)
+                 VALUES (?1, 'approval_request', 'thr', ?2, 'pending', 0, 0)",
+                params![id, json!({"eventKey": key, "type": "approval_request"}).to_string()],
+            )
+            .expect("seed");
+        }
+        let sent = std::cell::RefCell::new(Vec::new());
+        let summary = deliver_due_outbound_events(&conn, 1000, 10, None, |event| {
+            let key = event
+                .get("eventKey")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if key == "approval:one" {
+                // The gate settles the second request while we are busy.
+                conn.execute("DELETE FROM outbound_events WHERE event_id = 'evt_2'", [])
+                    .expect("withdraw");
+            }
+            sent.borrow_mut().push(key);
+            Ok(json!({ "ok": true }))
+        })
+        .expect("deliver");
+
+        assert_eq!(
+            sent.into_inner(),
+            vec!["approval:one".to_string()],
+            "the withdrawn push must never reach the transport"
+        );
+        assert_eq!(summary.delivered, 1);
     }
 
     #[test]

@@ -1578,6 +1578,11 @@ mod tests {
 
     #[test]
     fn daemon_notification_policy_only_enqueues_events_while_away() {
+        // Serialised with every other test that touches the process-wide
+        // away marker: these write it through the shared state dir, and an
+        // unlocked writer flipping it mid-run is what made the question-gate
+        // tests fail intermittently.
+        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
         let conn = create_state_db_in_memory().expect("db");
         let event = json!({
             "type": "thread_waiting",
@@ -1622,6 +1627,11 @@ mod tests {
     /// answer comes from the turn's own log, away off, and survives /back.
     #[test]
     fn bridge_turn_result_is_pushed_from_its_log_and_survives_back() {
+        // Serialised with every other test that touches the process-wide
+        // away marker: these write it through the shared state dir, and an
+        // unlocked writer flipping it mid-run is what made the question-gate
+        // tests fail intermittently.
+        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
         let conn = create_state_db_in_memory().expect("db");
         let log = write_turn_log(
             "sess-log-1000",
@@ -1727,6 +1737,11 @@ mod tests {
     /// or a first-ever push all still go out.
     #[test]
     fn idle_reminder_repeating_the_delivered_answer_is_suppressed() {
+        // Serialised with every other test that touches the process-wide
+        // away marker: these write it through the shared state dir, and an
+        // unlocked writer flipping it mid-run is what made the question-gate
+        // tests fail intermittently.
+        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
         let conn = create_state_db_in_memory().expect("db");
         let completed = json!({
             "type": "thread_completed",
@@ -1838,6 +1853,11 @@ mod tests {
     ///   if the words match.
     #[test]
     fn idle_reminder_suppression_requires_a_recent_completion() {
+        // Serialised with every other test that touches the process-wide
+        // away marker: these write it through the shared state dir, and an
+        // unlocked writer flipping it mid-run is what made the question-gate
+        // tests fail intermittently.
+        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
         let conn = create_state_db_in_memory().expect("db");
         crate::claude::set_away_mode(&conn, true, 500).expect("away on");
         let event = |etype: &str, thread: &str, key: &str, at: u64, kind: &str| {
@@ -2433,6 +2453,11 @@ mod tests {
 
     #[test]
     fn daemon_notification_policy_skips_events_before_away_started() {
+        // Serialised with every other test that touches the process-wide
+        // away marker: these write it through the shared state dir, and an
+        // unlocked writer flipping it mid-run is what made the question-gate
+        // tests fail intermittently.
+        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
         let conn = create_state_db_in_memory().expect("db");
         set_away_mode(&conn, true, 2000).expect("away on");
         let events = vec![
@@ -2456,6 +2481,11 @@ mod tests {
 
     #[test]
     fn daemon_notification_policy_accepts_second_granularity_timestamps() {
+        // Serialised with every other test that touches the process-wide
+        // away marker: these write it through the shared state dir, and an
+        // unlocked writer flipping it mid-run is what made the question-gate
+        // tests fail intermittently.
+        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
         let conn = create_state_db_in_memory().expect("db");
         set_away_mode(&conn, true, 1_776_219_288_240).expect("away on");
         let events = vec![
@@ -2480,6 +2510,11 @@ mod tests {
 
     #[test]
     fn thread_error_streak_notifies_once_and_rearms_after_recovery() {
+        // Serialised with every other test that touches the process-wide
+        // away marker: these write it through the shared state dir, and an
+        // unlocked writer flipping it mid-run is what made the question-gate
+        // tests fail intermittently.
+        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
         let conn = create_state_db_in_memory().expect("db");
         let no_filter: Option<&std::collections::BTreeSet<String>> = None;
 
@@ -2542,6 +2577,11 @@ mod tests {
     /// would stay silent for the entire next away session.
     #[test]
     fn thread_error_streak_rearms_when_away_turns_off() {
+        // Serialised with every other test that touches the process-wide
+        // away marker: these write it through the shared state dir, and an
+        // unlocked writer flipping it mid-run is what made the question-gate
+        // tests fail intermittently.
+        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
         let conn = create_state_db_in_memory().expect("db");
         let no_filter: Option<&std::collections::BTreeSet<String>> = None;
 
@@ -2576,6 +2616,11 @@ mod tests {
 
     #[test]
     fn away_off_clears_pending_daemon_notifications() {
+        // Serialised with every other test that touches the process-wide
+        // away marker: these write it through the shared state dir, and an
+        // unlocked writer flipping it mid-run is what made the question-gate
+        // tests fail intermittently.
+        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
         let conn = create_state_db_in_memory().expect("db");
         set_away_mode(&conn, true, 1000).expect("away on");
         let event = json!({

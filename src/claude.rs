@@ -737,7 +737,7 @@ pub(crate) fn write_hook_event_from_reader<R: Read>(reader: &mut R, now: u64) ->
 ///
 /// Rows without a boundary (pre-upgrade) are left alone: only their turn's
 /// Stop clears them, exactly the old behaviour.
-fn prompt_resolved_in_transcript(prompt: &PendingPrompt, transcript: &Path) -> bool {
+pub(crate) fn prompt_resolved_in_transcript(prompt: &PendingPrompt, transcript: &Path) -> bool {
     let Some(boundary) = prompt.transcript_bytes else {
         return false;
     };
@@ -2031,6 +2031,65 @@ pub(crate) fn session_terminal_presence(
     } else {
         Ok(TerminalPresence::Window)
     }
+}
+
+/// Signalled the instant the windowless probe starts, then stalls it. Lets a
+/// test drop a transcript record into the exact window that separates a
+/// boundary frozen before this probe from one frozen after it.
+#[cfg(test)]
+pub(crate) static WINDOWLESS_PROBE_SEAM: std::sync::Mutex<
+    Option<std::sync::mpsc::Sender<std::sync::mpsc::Sender<()>>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn windowless_probe_seam() {
+    let sender = WINDOWLESS_PROBE_SEAM
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(sender) = sender {
+        // Signal, then WAIT for the test to confirm it has written — no
+        // fixed sleep to be unlucky with under load.
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        if sender.send(ack_tx).is_ok() {
+            let _ = ack_rx.recv_timeout(Duration::from_secs(10));
+        }
+    }
+}
+
+/// Does the session running THIS hook lack a terminal window? Hooks are
+/// children of the session process and inherit its messaging socket, whose
+/// file name is the session pid — so a gate can classify itself without any
+/// database lookup or stale cache.
+///
+/// This matters because "no window" removes the fallback the approval gate
+/// assumes exists. Handing a prompt back to a background session's terminal
+/// puts the dialog somewhere nobody is looking: measured 2026-08-17, a
+/// cchess background session sat blocked for 7h09m that way, and the only
+/// person who could clear it had to walk to the machine.
+///
+/// Every uncertainty answers `false` (assume a window): that keeps the
+/// established behaviour and never invents an unbounded wait out of a
+/// missing /proc entry. Non-Linux has no /proc at all and lands there too.
+pub(crate) fn current_session_lacks_terminal_window() -> bool {
+    // Test seam: this probe walks /proc and takes real time, which is
+    // exactly why the transcript boundary must be frozen BEFORE it. A test
+    // signals here and stalls, so an answer landing inside this window is
+    // only visible if the boundary already predates it.
+    #[cfg(test)]
+    windowless_probe_seam();
+    #[cfg(test)]
+    if let Ok(raw) = env::var("TINYCTB_TEST_SESSION_WINDOWLESS") {
+        return raw == "1";
+    }
+    let Ok(socket) = env::var("CLAUDE_CODE_MESSAGING_SOCKET") else {
+        return false;
+    };
+    Path::new(&socket)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.parse::<u32>().ok())
+        .is_some_and(parent_is_bg_pty_host)
 }
 
 fn parent_is_bg_pty_host(pid: u32) -> bool {

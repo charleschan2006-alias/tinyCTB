@@ -661,14 +661,14 @@ pub(crate) fn telegram_help_text() -> String {
         "",
         "/away - start remote Claude mode",
         "/back - stop remote Claude mode",
-        "/repair - re-check hooks and the claude binary",
-        "/status - show remote status",
         "/threads - show the 5 most recent Claude sessions",
         "/threads <count> - show that many recent Claude sessions",
         "/new <prompt> - start a new Claude session",
         "/new - ask for a prompt in a reply",
         "/project - list projects",
         "/project <id> - switch the current project",
+        "/status - show remote status",
+        "/repair - re-check hooks and the claude binary",
     ]
     .join("\n")
 }

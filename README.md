@@ -1,6 +1,6 @@
 # tinyCTB
 
-**Claude Code × Telegram away-mode bridge.** A port of
+**Claude Code × Telegram away-mode Bridge.** A port of
 [codex-telegram-bridge](https://github.com/HanifCarroll/codex-telegram-bridge)
 that replaces the Codex backend with local **Claude Code** sessions.
 
@@ -19,6 +19,7 @@ The product rule is simple:
 - turns started **from Telegram** (a reply or `/new`) always push their answer
   back to Telegram, whether or not away mode is on — away only gates
   notifications about local terminal sessions
+- use `/threads` to check the message on the background, and you can approve those pending proposals again.
 
 Linux (Ubuntu, systemd user service) is the primary platform. macOS (launchd
 user agent) has experimental support, not yet verified on real hardware:

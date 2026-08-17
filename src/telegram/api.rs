@@ -149,17 +149,25 @@ pub(crate) fn telegram_send_chat_action(
     }))
 }
 
+/// The command list Telegram shows the moment the user types `/`. Array
+/// order IS display order, and the top of that list is prime real estate on
+/// a phone: `/away`, `/back` and `/threads` are the three used mid-errand,
+/// one-handed, so they lead. Setup-time and diagnostic commands (`/start`,
+/// `/repair`, `/help`) are typed once and sink to the bottom.
+///
+/// Changing this order changes what the user's thumb lands on — treat it as
+/// UI, not as a list of capabilities.
 pub(crate) fn telegram_bot_commands() -> Vec<Value> {
     vec![
-        json!({ "command": "start", "description": "Pair and show remote control help" }),
-        json!({ "command": "help", "description": "Show Telegram remote control commands" }),
         json!({ "command": "away", "description": "Start remote Claude mode" }),
         json!({ "command": "back", "description": "Stop remote Claude mode" }),
-        json!({ "command": "repair", "description": "Fix remote Claude mode" }),
-        json!({ "command": "status", "description": "Show remote Claude status" }),
         json!({ "command": "threads", "description": "Show recent Claude sessions" }),
         json!({ "command": "new", "description": "Start a new Claude session" }),
         json!({ "command": "project", "description": "Show or switch the current project" }),
+        json!({ "command": "status", "description": "Show remote Claude status" }),
+        json!({ "command": "start", "description": "Pair and show remote control help" }),
+        json!({ "command": "repair", "description": "Fix remote Claude mode" }),
+        json!({ "command": "help", "description": "Show Telegram remote control commands" }),
     ]
 }
 
@@ -246,9 +254,17 @@ mod tests {
             .filter_map(|command| command.get("command").and_then(Value::as_str))
             .collect::<Vec<_>>();
 
+        // Order is the phone UI: the three one-handed commands lead, and a
+        // reshuffle that buries them must fail here rather than surprise the
+        // user's thumb.
+        assert_eq!(
+            &names[..3],
+            &["away", "back", "threads"],
+            "away/back/threads must be the first three entries of the / menu"
+        );
         assert_eq!(
             names,
-            vec!["start", "help", "away", "back", "repair", "status", "threads", "new", "project",]
+            vec!["away", "back", "threads", "new", "project", "status", "start", "repair", "help",]
         );
         for removed in [
             "away_on",
