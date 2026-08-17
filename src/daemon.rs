@@ -7,6 +7,10 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -713,6 +717,402 @@ fn daemon_cycle_lanes(
     }))
 }
 
+/// Where the keyboard listener records the last keypress it saw.
+pub(crate) const INPUT_ACTIVITY_FILE: &str = "input-activity.json";
+
+/// One write per this interval is plenty: the gates compare against a 15s
+/// window, and a burst of typing would otherwise rewrite the file per key.
+const INPUT_ACTIVITY_MIN_GAP: Duration = Duration::from_millis(1000);
+/// How long a watcher waits before reconnecting to its own candidate.
+const INPUT_LISTENER_RETRY: Duration = Duration::from_secs(5);
+/// How often the supervisor re-scans for X sessions appearing or vanishing.
+const INPUT_LISTENER_RESCAN: Duration = Duration::from_secs(30);
+
+type XCandidate = (String, Option<String>);
+
+/// A live `xinput` stream and the process behind it. The child is carried
+/// alongside the reader, never dropped on the floor: a forgotten child is a
+/// zombie, and a watcher reconnecting every 5s would mint ~720 an hour until
+/// the PID or task quota ran out.
+struct XSession {
+    reader: Box<dyn std::io::BufRead + Send>,
+    child: Option<std::process::Child>,
+}
+
+type XStreamOpener = dyn Fn(&XCandidate) -> Option<XSession> + Send + Sync;
+
+/// Serialises publication across every watcher thread. They share one PID
+/// and one destination, so without this they truncate each other's staging
+/// file and a gate can read half a JSON object — and each thread throttling
+/// itself would let N sessions write N times a second.
+#[derive(Default)]
+struct ActivityPublisher {
+    last_write: std::sync::Mutex<Option<Instant>>,
+    /// Test-only fault injection: pretend the write failed AFTER the staging
+    /// file was created, which is the case that leaks — the name carries an
+    /// ever-increasing sequence, so every failure would leave another
+    /// partial file behind.
+    #[cfg(test)]
+    fail_after_create: std::sync::atomic::AtomicBool,
+}
+
+impl ActivityPublisher {
+    /// Publish if the shared gap has elapsed. Returns whether it wrote.
+    fn publish(&self, dir: &Path, now_ms: u64, min_gap: Duration) -> bool {
+        let mut last = self
+            .last_write
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Monotonic, never wall clock: a wall-clock comparison would refuse
+        // to record real keypresses for as long as a backwards jump lasted.
+        if last.is_some_and(|at| at.elapsed() < min_gap) {
+            return false;
+        }
+        // Unique staging name per write: same pid, many threads.
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let staged = dir.join(format!(".input-activity.{}.{seq}.tmp", std::process::id()));
+        let payload = json!({ "lastInputAtMs": now_ms }).to_string();
+        #[cfg(test)]
+        let injected = self.fail_after_create.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        let injected = false;
+        if injected {
+            // Simulate the half-written file the real failure would leave.
+            let _ = std::fs::write(&staged, &payload[..payload.len() / 2]);
+        }
+        if injected || std::fs::write(&staged, payload).is_err() {
+            // Clean up either way: the name carries an ever-increasing
+            // sequence, so a persistent write failure would otherwise pile
+            // up partial files without bound.
+            let _ = std::fs::remove_file(&staged);
+            return false;
+        }
+        // Rename is what makes a reader see either the old file or the whole
+        // new one, never a partial write.
+        if std::fs::rename(&staged, dir.join(INPUT_ACTIVITY_FILE)).is_err() {
+            let _ = std::fs::remove_file(&staged);
+            return false;
+        }
+        *last = Some(Instant::now());
+        true
+    }
+}
+
+/// Is this line a keypress at all?
+///
+/// The whole point of the listener is what it IGNORES: `RawMotion` is what a
+/// drifting mouse sensor emits by the hundred per second, and counting it is
+/// what made every approval look like "the user is at the keyboard".
+fn is_keypress_line(line: &str) -> bool {
+    line.contains("RawKeyPress")
+}
+
+/// Drain one stream, publishing as keypresses arrive. Returns when the
+/// stream ends — for a real session that means the child exited, which the
+/// caller reaps before reconnecting. The count is for tests only: nothing in
+/// production branches on it, since each candidate has its own watcher and
+/// there is no "try the next one" decision left to make.
+fn record_keypresses<R: std::io::BufRead>(
+    reader: R,
+    dir: &Path,
+    publisher: &ActivityPublisher,
+    min_gap: Duration,
+    clock: &dyn Fn() -> u64,
+) -> usize {
+    let mut written = 0usize;
+    for line in reader.lines().map_while(Result::ok) {
+        if is_keypress_line(&line) && publisher.publish(dir, clock(), min_gap) {
+            written += 1;
+        }
+    }
+    written
+}
+
+/// A watcher's cancellation state and the child it currently holds, under
+/// ONE lock.
+///
+/// They were two separate fields and that was a deadlock: `cancel` could
+/// observe an empty child slot (the opener had not returned yet), conclude
+/// there was nothing to kill, and go straight to `join` — while the worker
+/// then registered a live, silent child and blocked reading it forever, with
+/// nobody left holding a handle to kill. Sol hit exactly this on a full test
+/// run: the watcher never finished. Sharing the lock makes "am I cancelled"
+/// and "here is my child" a single ordered decision.
+#[derive(Default)]
+struct WorkerState {
+    stopping: bool,
+    child: Option<std::process::Child>,
+}
+
+/// One candidate's watcher.
+struct Worker {
+    state: Arc<std::sync::Mutex<WorkerState>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+fn lock_state(state: &std::sync::Mutex<WorkerState>) -> std::sync::MutexGuard<'_, WorkerState> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Kill and reap a child. A forgotten child is a zombie, and killing is also
+/// what interrupts a read that would otherwise never return.
+fn reap(child: Option<std::process::Child>) {
+    if let Some(mut child) = child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+impl Worker {
+    /// Stop the watcher, reap whatever it holds, and wait for its thread.
+    fn cancel(mut self) {
+        let child = {
+            let mut state = lock_state(&self.state);
+            state.stopping = true;
+            state.child.take()
+        };
+        reap(child);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Start one watcher for a candidate. Every candidate gets its own thread on
+/// purpose: the drain blocks until its stream ends, so trying candidates in
+/// sequence let a session that CONNECTS but stays silent — an idle or wrong
+/// X server, or one emitting nothing but the pointer motion we ignore — hold
+/// every later candidate and every rescan behind it forever.
+fn spawn_worker(
+    dir: PathBuf,
+    candidate: XCandidate,
+    open: Arc<XStreamOpener>,
+    publisher: Arc<ActivityPublisher>,
+    min_gap: Duration,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    retry: Duration,
+) -> Worker {
+    let state = Arc::new(std::sync::Mutex::new(WorkerState::default()));
+    let thread_state = Arc::clone(&state);
+    let handle = std::thread::spawn(move || loop {
+        if lock_state(&thread_state).stopping {
+            break;
+        }
+        if let Some(mut session) = open(&candidate) {
+            let child = session.child.take();
+            // Re-check UNDER THE LOCK before committing to a blocking read:
+            // a cancel that landed while the opener was running has already
+            // given up on finding a child here, so this one must be reaped
+            // right now rather than read from.
+            let orphan = {
+                let mut state = lock_state(&thread_state);
+                if state.stopping {
+                    child
+                } else {
+                    state.child = child;
+                    None
+                }
+            };
+            let rejected = orphan.is_some();
+            reap(orphan);
+            if rejected {
+                // Cancel landed while the opener was running: this child was
+                // never visible to `cancel`, so reap it here and stop.
+                break;
+            }
+            record_keypresses(session.reader, &dir, &publisher, min_gap, &|| clock());
+            // EOF: the child is gone or going. Reap it — a forgotten child
+            // becomes a zombie, once per reconnect.
+            let child = lock_state(&thread_state).child.take();
+            reap(child);
+        }
+        // Interruptible wait: a cancel must not have to sit out the retry
+        // delay, or switching candidates costs N × retry.
+        if wait_or_cancelled(&thread_state, retry) {
+            break;
+        }
+    });
+    Worker {
+        state,
+        handle: Some(handle),
+    }
+}
+
+/// Sleep for `delay`, returning early (true) as soon as the worker is
+/// cancelled. Polled rather than condvar-signalled to keep the state lock a
+/// plain mutex that is never held across the blocking kill/wait; 20ms
+/// granularity is well inside what "cancel returns promptly" needs.
+fn wait_or_cancelled(state: &std::sync::Mutex<WorkerState>, delay: Duration) -> bool {
+    let deadline = Instant::now() + delay;
+    while Instant::now() < deadline {
+        if lock_state(state).stopping {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20).min(delay));
+    }
+    lock_state(state).stopping
+}
+
+/// Bring the running watchers in line with the candidates that exist now:
+/// start one for each new candidate, cancel and join the ones whose session
+/// is gone. Without the removal half, a rotated session leaves a worker
+/// retrying a dead display forever and both threads and children grow
+/// without bound.
+fn reconcile_workers(
+    workers: &mut std::collections::HashMap<XCandidate, Worker>,
+    candidates: Vec<XCandidate>,
+    mut start: impl FnMut(&XCandidate) -> Worker,
+) {
+    let wanted: std::collections::HashSet<XCandidate> = candidates.iter().cloned().collect();
+    let gone = workers
+        .keys()
+        .filter(|key| !wanted.contains(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in gone {
+        if let Some(worker) = workers.remove(&key) {
+            worker.cancel();
+        }
+    }
+    for candidate in candidates {
+        if let std::collections::hash_map::Entry::Vacant(slot) = workers.entry(candidate.clone()) {
+            slot.insert(start(&candidate));
+        }
+    }
+}
+
+/// Open a real `xinput` stream for one candidate.
+fn open_xinput_stream(candidate: &XCandidate) -> Option<XSession> {
+    let (display, xauthority) = candidate;
+    let mut command = std::process::Command::new("xinput");
+    command
+        .args(["test-xi2", "--root"])
+        .env("DISPLAY", display)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    match xauthority {
+        Some(path) => {
+            command.env("XAUTHORITY", path);
+        }
+        // No XAUTHORITY is legitimate — Xlib then falls back to
+        // $HOME/.Xauthority, which is the common setup.
+        None => {
+            command.env_remove("XAUTHORITY");
+        }
+    }
+    let mut child = command.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    Some(XSession {
+        reader: Box::new(std::io::BufReader::new(stdout)),
+        child: Some(child),
+    })
+}
+
+/// Watches the X server for KEYSTROKES ONLY and stamps a file the approval
+/// gates read.
+///
+/// The desktop idle timer cannot serve this: it counts pointer motion, and a
+/// mouse with a drifting sensor emits it continuously — measured 2026-08-17,
+/// ~600 phantom events a second holding idle at 1-48ms for hours while the
+/// user was out. Every approval was ruled "user is at the keyboard" and
+/// handed to the terminal one poll tick after its buttons reached the phone.
+/// Mutter exposes only a combined `/Core` monitor, so separating the two
+/// means filtering raw events, and `xinput test-xi2` does it without needing
+/// membership of the `input` group.
+///
+/// Failure is silent and total: no X session, no xinput, a crashed child —
+/// the file simply stops advancing, gates read "no recent keypress", and
+/// away mode keeps the prompt on the phone. That is the safe direction.
+fn spawn_keyboard_listener() {
+    std::thread::spawn(|| {
+        let Ok(dir) = crate::state::state_dir_path() else {
+            return;
+        };
+        let publisher = Arc::new(ActivityPublisher::default());
+        let mut workers: std::collections::HashMap<XCandidate, Worker> =
+            std::collections::HashMap::new();
+        loop {
+            let candidates = x_environment_candidates();
+            reconcile_workers(&mut workers, candidates, |candidate| {
+                spawn_worker(
+                    dir.clone(),
+                    candidate.clone(),
+                    Arc::new(open_xinput_stream),
+                    Arc::clone(&publisher),
+                    INPUT_ACTIVITY_MIN_GAP,
+                    Arc::new(|| now_millis().unwrap_or(0)),
+                    INPUT_LISTENER_RETRY,
+                )
+            });
+            std::thread::sleep(INPUT_LISTENER_RESCAN);
+        }
+    });
+}
+
+/// Every X session we could plausibly attach to, best first.
+///
+/// `DISPLAY` is required; `XAUTHORITY` is not — a session that relies on the
+/// default `$HOME/.Xauthority` is perfectly normal, and demanding the
+/// variable skipped those entirely.
+fn x_environment_candidates() -> Vec<(String, Option<String>)> {
+    let mut candidates = Vec::new();
+    let mut push = |display: String, xauthority: Option<String>| {
+        if display.is_empty() {
+            return;
+        }
+        let entry = (display, xauthority.filter(|value| !value.is_empty()));
+        if !candidates.contains(&entry) {
+            candidates.push(entry);
+        }
+    };
+    // Ours first: a daemon started from the desktop session already has the
+    // right credentials, on any compositor.
+    if let Ok(display) = env::var("DISPLAY") {
+        push(display, env::var("XAUTHORITY").ok());
+    }
+    // Then borrow from compositor processes. The extraction happens INSIDE
+    // the scan so an unreadable or incomplete candidate is skipped rather
+    // than ending the search.
+    let compositors = ["gnome-shell", "kwin_x11", "xfwm4", "mutter", "cinnamon"];
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
+                continue;
+            };
+            if !compositors.contains(&comm.trim()) {
+                continue;
+            }
+            let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+                continue;
+            };
+            let mut display = None;
+            let mut xauthority = None;
+            for field in environ.split(|byte| *byte == 0) {
+                let text = String::from_utf8_lossy(field);
+                if let Some(value) = text.strip_prefix("DISPLAY=") {
+                    display = Some(value.to_string());
+                } else if let Some(value) = text.strip_prefix("XAUTHORITY=") {
+                    xauthority = Some(value.to_string());
+                }
+            }
+            if let Some(display) = display {
+                push(display, xauthority);
+            }
+        }
+    }
+    candidates
+}
+
 pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> Result<()> {
     let _daemon_lock = acquire_daemon_lock()?;
     let db_path = state_db_path()?;
@@ -723,6 +1123,8 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
         println!("{}", serde_json::to_string(&result)?);
         return Ok(());
     }
+
+    spawn_keyboard_listener();
 
     let telegram_commands = config.telegram.as_ref().map(|telegram| {
         telegram_set_my_commands(telegram, timeout)
@@ -1553,6 +1955,571 @@ mod tests {
                 std::env::remove_var("TINYCTB_SERVICE_DIR");
             }
             let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn text_session(text: &str) -> XSession {
+        XSession {
+            reader: Box::new(std::io::Cursor::new(text.to_string())),
+            child: None,
+        }
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tinyctb-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    /// Candidates are watched IN PARALLEL, so one that connects but never
+    /// says anything useful cannot hold the others hostage. Trying them in
+    /// sequence deadlocked exactly here: the drain blocks until EOF, and a
+    /// live-but-silent stream never reaches it.
+    ///
+    /// The wait happens on ANOTHER thread with a channel timeout, so a
+    /// regression to serial blocking fails this test instead of hanging it.
+    #[test]
+    fn a_silent_candidate_does_not_block_a_working_one() {
+        let dir = temp_dir("parallel");
+        let publisher = Arc::new(ActivityPublisher::default());
+        let open: Arc<XStreamOpener> = Arc::new(|candidate: &XCandidate| {
+            if candidate.0 != ":silent" {
+                return Some(text_session("EVENT type 13 (RawKeyPress)\n"));
+            }
+            // A REAL child that connects, never stops, and only ever emits
+            // the motion we ignore — the exact shape that deadlocked the
+            // serial version. Being a real child also makes it cancellable,
+            // which is how production interrupts a blocked read.
+            // A single process (no grandchildren to keep the pipe open when
+            // the parent is killed) writing motion lines without pause.
+            let mut child = std::process::Command::new("yes")
+                .arg("EVENT type 17 (RawMotion)")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .ok()?;
+            let stdout = child.stdout.take()?;
+            Some(XSession {
+                reader: Box::new(std::io::BufReader::new(stdout)),
+                child: Some(child),
+            })
+        });
+        let mut workers = std::collections::HashMap::new();
+        reconcile_workers(
+            &mut workers,
+            vec![
+                (":silent".to_string(), None),
+                (":works".to_string(), Some("/tmp/xauth".to_string())),
+            ],
+            |candidate| {
+                spawn_worker(
+                    dir.clone(),
+                    candidate.clone(),
+                    Arc::clone(&open),
+                    Arc::clone(&publisher),
+                    Duration::from_millis(0),
+                    Arc::new(|| 4_242_000),
+                    Duration::from_millis(50),
+                )
+            },
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watched = dir.join(INPUT_ACTIVITY_FILE);
+        std::thread::spawn(move || {
+            while !watched.exists() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = tx.send(());
+        });
+        let landed = rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        for (_, worker) in workers.drain() {
+            worker.cancel();
+        }
+        assert!(
+            landed,
+            "the working candidate must land its keypress while the silent one keeps talking"
+        );
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join(INPUT_ACTIVITY_FILE)).expect("read"))
+                .expect("json");
+        assert_eq!(value["lastInputAtMs"], 4_242_000);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every child a watcher opens must be reaped. A forgotten one becomes a
+    /// zombie, and a watcher reconnecting every few seconds mints them
+    /// steadily until the PID or task quota runs out.
+    /// Linux-only: the assertion reads process state from `/proc`, and on a
+    /// platform without it an unreadable file would silently pass.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_child_a_watcher_opens_is_reaped() {
+        let dir = temp_dir("reap");
+        let publisher = Arc::new(ActivityPublisher::default());
+        let pids = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&pids);
+        let open: Arc<XStreamOpener> = Arc::new(move |_: &XCandidate| {
+            // A real child that exits immediately: EOF arrives at once, so
+            // the watcher reconnects and mints another.
+            let mut child = std::process::Command::new("true")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .ok()?;
+            let stdout = child.stdout.take()?;
+            seen.lock().expect("lock").push(child.id());
+            Some(XSession {
+                reader: Box::new(std::io::BufReader::new(stdout)),
+                child: Some(child),
+            })
+        });
+        let worker = spawn_worker(
+            dir.clone(),
+            (":reap".to_string(), None),
+            open,
+            publisher,
+            Duration::from_millis(0),
+            Arc::new(|| 1),
+            Duration::from_millis(20),
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        worker.cancel();
+
+        let pids = pids.lock().expect("lock").clone();
+        assert!(
+            pids.len() >= 2,
+            "the watcher must have reconnected: {pids:?}"
+        );
+        for pid in pids {
+            // A reaped pid may be gone entirely (NotFound is fine); any
+            // OTHER read error means the check did not actually run and
+            // must not be mistaken for a pass.
+            match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(state) => assert!(
+                    !state.contains(") Z"),
+                    "pid {pid} was left as a zombie: {state}"
+                ),
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => panic!("could not inspect pid {pid}: {error}"),
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every watcher shares one destination and one PID, so publication has
+    /// to be serialised: two of them writing at once must never let a reader
+    /// see a partial file, and the throttle is GLOBAL, not per thread.
+    #[test]
+    fn concurrent_watchers_publish_atomically_and_throttle_globally() {
+        let dir = temp_dir("publish");
+        let publisher = Arc::new(ActivityPublisher::default());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let reader_stop = Arc::new(AtomicBool::new(false));
+
+        // A reader hammering the file for the whole run: every read that
+        // sees a file must see a COMPLETE JSON object.
+        let watched = dir.join(INPUT_ACTIVITY_FILE);
+        let stop_reading = Arc::clone(&reader_stop);
+        let reader = std::thread::spawn(move || {
+            let mut partial = 0usize;
+            let mut complete = 0usize;
+            while !stop_reading.load(Ordering::Relaxed) {
+                if let Ok(text) = fs::read_to_string(&watched) {
+                    if serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|value| value.get("lastInputAtMs").and_then(Value::as_u64))
+                        .is_none()
+                    {
+                        partial += 1;
+                    } else {
+                        complete += 1;
+                    }
+                }
+            }
+            (partial, complete)
+        });
+
+        let writers = (0..2)
+            .map(|_| {
+                let dir = dir.clone();
+                let publisher = Arc::clone(&publisher);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut wrote = 0usize;
+                    for _ in 0..200 {
+                        if publisher.publish(&dir, 9_000, Duration::from_secs(30)) {
+                            wrote += 1;
+                        }
+                    }
+                    wrote
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let total: usize = writers.into_iter().map(|w| w.join().expect("writer")).sum();
+        // Do not stop the reader until it has demonstrably read the file at
+        // least once, or `partial == 0` below could be vacuously true.
+        let watched_again = dir.join(INPUT_ACTIVITY_FILE);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !watched_again.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        reader_stop.store(true, Ordering::Relaxed);
+        let (partial, complete) = reader.join().expect("reader");
+
+        assert_eq!(
+            total, 1,
+            "the gap is global: 400 attempts across two threads must write once"
+        );
+        assert_eq!(
+            partial, 0,
+            "a reader must never observe a half-written file"
+        );
+        // Without this the assertion above is vacuous: a reader that never
+        // managed to open the file would also report zero partials.
+        assert!(
+            complete > 0,
+            "the reader must actually have read the published file at least once"
+        );
+        // And no staging leftovers.
+        let staged = fs::read_dir(&dir)
+            .expect("dir")
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(staged, 0, "staging files must be renamed away, not left");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Sessions come and go. The supervisor must add watchers for new
+    /// candidates AND cancel the ones whose session vanished — otherwise a
+    /// rotated display leaves a worker retrying forever and thread and child
+    /// counts grow without bound.
+    #[test]
+    fn workers_follow_candidates_appearing_and_disappearing() {
+        let dir = temp_dir("lifecycle");
+        let publisher = Arc::new(ActivityPublisher::default());
+        let open: Arc<XStreamOpener> =
+            Arc::new(|_: &XCandidate| Some(text_session("EVENT type 17 (RawMotion)\n")));
+        let start = |candidate: &XCandidate| {
+            spawn_worker(
+                dir.clone(),
+                candidate.clone(),
+                Arc::clone(&open),
+                Arc::clone(&publisher),
+                Duration::from_millis(0),
+                Arc::new(|| 1),
+                Duration::from_millis(20),
+            )
+        };
+        let a = (":a".to_string(), None);
+        let b = (":b".to_string(), None);
+        let mut workers = std::collections::HashMap::new();
+
+        reconcile_workers(&mut workers, vec![a.clone()], start);
+        assert_eq!(workers.keys().collect::<Vec<_>>(), vec![&a]);
+
+        reconcile_workers(&mut workers, vec![a.clone(), b.clone()], start);
+        assert_eq!(workers.len(), 2, "a new session gets its own watcher");
+
+        // A disappears: its worker must be cancelled and joined, not leaked.
+        reconcile_workers(&mut workers, vec![b.clone()], start);
+        assert_eq!(
+            workers.keys().collect::<Vec<_>>(),
+            vec![&b],
+            "the vanished candidate's worker must be dropped"
+        );
+
+        for (_, worker) in workers.drain() {
+            worker.cancel();
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The retry wait must be interruptible AT THE PRODUCTION DELAY. With a
+    /// 20ms retry an uninterruptible `sleep(retry)` would pass too, so this
+    /// uses the real 5s: workers are pushed into their retry gap, then two
+    /// of them are removed at once and both must join promptly while the new
+    /// candidate starts immediately rather than queueing behind `N × 5s`.
+    #[test]
+    fn removing_workers_does_not_wait_out_the_production_retry() {
+        let dir = temp_dir("retry-cancel");
+        let publisher = Arc::new(ActivityPublisher::default());
+        let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&started);
+        // An immediately-empty stream: the worker drains it at once and goes
+        // straight into the retry gap, which is where we want it.
+        let open: Arc<XStreamOpener> = Arc::new(move |candidate: &XCandidate| {
+            seen.lock().expect("lock").push(candidate.0.clone());
+            Some(text_session(""))
+        });
+        let start = |candidate: &XCandidate| {
+            spawn_worker(
+                dir.clone(),
+                candidate.clone(),
+                Arc::clone(&open),
+                Arc::clone(&publisher),
+                Duration::from_millis(0),
+                Arc::new(|| 1),
+                INPUT_LISTENER_RETRY, // the production 5s
+            )
+        };
+        let a = (":a".to_string(), None);
+        let b = (":b".to_string(), None);
+        let c = (":c".to_string(), None);
+        let mut workers = std::collections::HashMap::new();
+        reconcile_workers(&mut workers, vec![a.clone(), b.clone()], start);
+
+        // Wait until both have consumed their stream and are sitting in the
+        // 5s gap.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while started.lock().expect("lock").len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            started.lock().expect("lock").len(),
+            2,
+            "both workers must have entered their retry gap"
+        );
+
+        // Remove BOTH and add a third: an uninterruptible sleep would make
+        // this take 2 × 5s before :c even starts.
+        let swap_started = Instant::now();
+        reconcile_workers(&mut workers, vec![c.clone()], start);
+        let elapsed = swap_started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancelling two workers mid-retry must not wait out {:?} each: took {elapsed:?}",
+            INPUT_LISTENER_RETRY
+        );
+        assert_eq!(workers.keys().collect::<Vec<_>>(), vec![&c]);
+        // The replacement's thread is already spawned; give it a moment to
+        // reach its opener. The point of the assertion is that it does not
+        // have to wait out the removed workers' retry gaps first.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !started.lock().expect("lock").contains(&":c".to_string())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            started.lock().expect("lock").contains(&":c".to_string()),
+            "the replacement must start without waiting out the removed workers' retries"
+        );
+        for (_, worker) in workers.drain() {
+            worker.cancel();
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A write that fails AFTER creating the staging file must not leave it
+    /// behind — the name carries an ever-increasing sequence, so每 failure
+    /// would otherwise add another partial file forever. The throttle must
+    /// also stay unarmed, so the next real keypress still publishes.
+    #[test]
+    fn a_failed_publish_cleans_up_and_does_not_arm_the_throttle() {
+        let dir = temp_dir("publish-fail");
+        let publisher = ActivityPublisher::default();
+        publisher.fail_after_create.store(true, Ordering::Relaxed);
+
+        assert!(
+            !publisher.publish(&dir, 111, Duration::from_secs(30)),
+            "an injected failure must report failure"
+        );
+        let leftovers = fs::read_dir(&dir)
+            .expect("dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "a failed write must leave nothing behind: {leftovers:?}"
+        );
+
+        // The gap is 30s, but the failed attempt must not have started it.
+        publisher.fail_after_create.store(false, Ordering::Relaxed);
+        assert!(
+            publisher.publish(&dir, 222, Duration::from_secs(30)),
+            "the next attempt must publish, not be throttled by a failure"
+        );
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join(INPUT_ACTIVITY_FILE)).expect("read"))
+                .expect("json");
+        assert_eq!(value["lastInputAtMs"], 222);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The deadlock Sol hit on a real run: `cancel` looks for a child, the
+    /// opener has not returned one yet, so it finds nothing to kill and goes
+    /// straight to `join` — while the worker then registers a live silent
+    /// child and blocks on it forever, with no handle left to interrupt it.
+    ///
+    /// TWO handshakes, not one barrier. A single barrier deadlocked the test
+    /// itself: if cancel won the start, the worker saw `stopping` at the top
+    /// of its loop and exited WITHOUT ever entering the opener, leaving the
+    /// main thread waiting on a barrier participant that would never arrive
+    /// (Sol reproduced it on the 21st consecutive run). Waiting for the
+    /// opener to be entered FIRST makes the interleaving the test claims to
+    /// exercise the only one it can produce.
+    #[test]
+    fn a_cancel_racing_child_registration_still_finishes() {
+        let dir = temp_dir("cancel-race");
+        let publisher = Arc::new(ActivityPublisher::default());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let open: Arc<XStreamOpener> = Arc::new(move |_: &XCandidate| {
+            // 1. Tell the test we are inside the opener...
+            let _ = entered_tx.send(());
+            // 2. ...and hold the child back until it says cancel has landed.
+            let _ = release_rx.lock().expect("release lock").recv();
+            let mut child = std::process::Command::new("sleep")
+                .arg("300")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .ok()?;
+            let stdout = child.stdout.take()?;
+            Some(XSession {
+                reader: Box::new(std::io::BufReader::new(stdout)),
+                child: Some(child),
+            })
+        });
+        let worker = spawn_worker(
+            dir.clone(),
+            (":racy".to_string(), None),
+            open,
+            publisher,
+            Duration::from_millis(0),
+            Arc::new(|| 1),
+            Duration::from_millis(20),
+        );
+
+        // The worker must be INSIDE the opener before cancel starts, or it
+        // would exit at the top of its loop and never reach the race.
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker must reach the opener");
+
+        let observed = Arc::clone(&worker.state);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let canceller = std::thread::spawn(move || {
+            worker.cancel();
+            let _ = done_tx.send(());
+        });
+
+        // Wait for cancel's linearization point: stopping set, child slot
+        // taken (still empty). This is exactly the window the old code lost.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let state = lock_state(&observed);
+                if state.stopping && state.child.is_none() {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancel never reached its linearization point"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Now let the opener hand a live child into an already-stopping
+        // worker: it must reap it itself rather than block reading it.
+        release_tx.send(()).expect("release opener");
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "cancel must finish even when a child is registered underneath it"
+        );
+        canceller.join().expect("canceller");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A worker blocked on a silent stream must still stop promptly when
+    /// cancelled — killing its child is what interrupts the read.
+    #[test]
+    fn a_silent_worker_can_still_be_cancelled_promptly() {
+        let dir = temp_dir("cancel");
+        let publisher = Arc::new(ActivityPublisher::default());
+        let open: Arc<XStreamOpener> = Arc::new(|_: &XCandidate| {
+            // `sleep` holds the pipe open and says nothing: the read blocks
+            // until the child is killed.
+            let mut child = std::process::Command::new("sleep")
+                .arg("300")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .ok()?;
+            let stdout = child.stdout.take()?;
+            Some(XSession {
+                reader: Box::new(std::io::BufReader::new(stdout)),
+                child: Some(child),
+            })
+        });
+        let worker = spawn_worker(
+            dir.clone(),
+            (":quiet".to_string(), None),
+            open,
+            publisher,
+            Duration::from_millis(0),
+            Arc::new(|| 1),
+            Duration::from_millis(20),
+        );
+        std::thread::sleep(Duration::from_millis(100));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            worker.cancel();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "cancelling must interrupt a blocked read, not wait for a stream that never ends"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `XAUTHORITY` is optional: a session using the default
+    /// `$HOME/.Xauthority` is normal, and demanding the variable skipped
+    /// those sessions entirely. `DISPLAY` alone must still be a candidate,
+    /// and ours must come first so a desktop-launched daemon uses its own.
+    #[test]
+    fn x_candidates_accept_display_without_xauthority() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let previous = (env::var("DISPLAY").ok(), env::var("XAUTHORITY").ok());
+        env::set_var("DISPLAY", ":99");
+        env::remove_var("XAUTHORITY");
+        let candidates = x_environment_candidates();
+        assert_eq!(
+            candidates.first(),
+            Some(&(":99".to_string(), None)),
+            "DISPLAY alone must be tried, ours first: {candidates:?}"
+        );
+
+        env::set_var("XAUTHORITY", "/tmp/does-not-matter");
+        let candidates = x_environment_candidates();
+        assert_eq!(
+            candidates.first(),
+            Some(&(":99".to_string(), Some("/tmp/does-not-matter".to_string())))
+        );
+
+        // An empty DISPLAY is not a candidate at all.
+        env::set_var("DISPLAY", "");
+        assert!(
+            !x_environment_candidates()
+                .iter()
+                .any(|(display, _)| display.is_empty()),
+            "an empty DISPLAY must never be offered"
+        );
+
+        match previous.0 {
+            Some(value) => env::set_var("DISPLAY", value),
+            None => env::remove_var("DISPLAY"),
+        }
+        match previous.1 {
+            Some(value) => env::set_var("XAUTHORITY", value),
+            None => env::remove_var("XAUTHORITY"),
         }
     }
 

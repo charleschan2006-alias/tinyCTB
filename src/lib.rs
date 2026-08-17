@@ -737,6 +737,7 @@ const RESET_RUNTIME_FILES: &[&str] = &[
     "daemon.lock",
     approvals::PRESENCE_STATE_FILE,
     approvals::PRESENCE_LOCK_FILE,
+    daemon::INPUT_ACTIVITY_FILE,
 ];
 
 fn reset_result(dry_run: bool) -> Result<Value> {
@@ -811,7 +812,9 @@ fn reset_result(dry_run: bool) -> Result<Value> {
             format!("failed to read state dir entry in {}", state_dir.display())
         })?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !(name.starts_with(".presence-probe.") && name.ends_with(".tmp")) {
+        let staged = (name.starts_with(".presence-probe.") || name.starts_with(".input-activity."))
+            && name.ends_with(".tmp");
+        if !staged {
             continue;
         }
         if dry_run {
@@ -1271,7 +1274,9 @@ mod tests {
             "remote-mode.json",
             "presence-probe.json",
             "presence-probe.lock",
+            "input-activity.json",
             ".presence-probe.4242.tmp",
+            ".input-activity.4242.tmp",
         ] {
             fs::write(state.root.join(name), "runtime").expect("write runtime file");
         }
@@ -1294,6 +1299,17 @@ mod tests {
         assert!(names.contains(&"state.db"));
         assert!(names.contains(&"state.db-wal"));
         assert!(names.contains(&"remote-mode.json"));
+        // The keypress record and its staging files are runtime state too:
+        // a reset that leaves them behind hands the next run a stale
+        // "someone was at the keyboard" reading.
+        assert!(
+            names.contains(&"input-activity.json"),
+            "dry run must report the keypress record: {names:?}"
+        );
+        assert!(
+            names.contains(&".input-activity.4242.tmp"),
+            "and its staging leftovers: {names:?}"
+        );
         assert!(names.contains(&"presence-probe.json"));
         assert!(names.contains(&"presence-probe.lock"));
         assert!(names.contains(&".presence-probe.4242.tmp"));
@@ -1335,6 +1351,8 @@ mod tests {
             "presence-probe.json",
             "presence-probe.lock",
             ".presence-probe.4242.tmp",
+            "input-activity.json",
+            ".input-activity.4242.tmp",
         ] {
             fs::write(state.root.join(name), "runtime").expect("write runtime file");
         }
@@ -1356,6 +1374,8 @@ mod tests {
             "presence-probe.json",
             "presence-probe.lock",
             ".presence-probe.4242.tmp",
+            "input-activity.json",
+            ".input-activity.4242.tmp",
             "events",
             "logs",
         ] {
