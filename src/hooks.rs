@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     fn install_is_idempotent_and_preserves_foreign_hooks() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let env = HookTestEnv::new("idempotent");
         let settings_path = env.root.join("settings.json");
         fs::write(
@@ -593,7 +593,7 @@ mod tests {
     /// gate would never arrive and every Telegram turn would run unchecked.
     #[test]
     fn status_flags_an_install_missing_the_headless_gate() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let env = HookTestEnv::new("stale-install");
         install_hooks("tinyctb", false).expect("install");
         let settings_path = env.root.join("settings.json");
@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn status_flags_a_stale_headless_matcher() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let env = HookTestEnv::new("stale-matcher");
         install_hooks("tinyctb", false).expect("install");
         let settings_path = env.root.join("settings.json");

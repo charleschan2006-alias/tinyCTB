@@ -20,6 +20,7 @@ The product rule is simple:
   back to Telegram, whether or not away mode is on — away only gates
   notifications about local terminal sessions
 - use `/threads` to check the message on the background, and you can approve those pending proposals again.
+- `/stop` — stop every running headless turn; `/stop <session-id>` stops just that one
 
 Linux (Ubuntu, systemd user service) is the primary platform. macOS (launchd
 user agent) has experimental support, not yet verified on real hardware:
@@ -141,6 +142,7 @@ send `/back`.
 | `/back` | disable notifications, clear the pending queue |
 | `/status` | away state, backend health, waiting sessions |
 | `/threads [n]` | one message per recent session; reply to any of them to continue it |
+| `/stop` | stop every running headless turn; `/stop <session-id>` stops just that one |
 | `/new <prompt>` | start a new session in the current project |
 | `/project [id]` | list / switch the project used by `/new` |
 | `/repair` | re-install hooks and re-check the claude binary |
@@ -215,12 +217,20 @@ config.
 - The session JSONL format is internal to Claude Code and may change between
   versions; the parser skips anything it does not recognize, and hooks (a
   stable, documented interface) carry the load-bearing signals.
-- Killing a timed-out headless turn after a **daemon restart** requires the
-  Linux process-identity chain (boot id + process group + starttime ticks).
-  On macOS this cannot be verified, so such turns are reported and marked
-  expired but deliberately NOT signalled — killing on weak identity risks
-  hitting an innocent reused PID. (Turns owned by the current daemon process
-  are killed and reaped normally on both platforms.)
+- **Process supervision (Linux)** uses one cgroup v2 sub-tree per headless
+  turn, created under the tinyctb service's delegated cgroup before the
+  process exists: membership is `cgroup.procs`, killing is one atomic write
+  to `cgroup.kill`, and "everything is gone" is the kernel's `populated 0`.
+  The unit sets `Delegate=yes` (sub-tree ownership) and `KillMode=process`
+  (a daemon restart kills only the daemon; turn sub-trees survive it).
+  Reinstall the unit (`tinyctb daemon install`) after upgrading. If no
+  cgroup sub-tree is available, spawning FAILS rather than starting an
+  unsupervisable process; set `TINYCTB_LEGACY_PROCESS_SUPERVISION=1` to
+  accept the legacy killpg-based regime instead. On macOS the legacy
+  regime applies: turns owned by the current daemon are killed and reaped
+  normally, while after a daemon restart a timed-out turn is reported and
+  marked expired but deliberately NOT signalled — killing on weak identity
+  risks hitting an innocent reused PID.
 - The Telegram bot token is stored in the local config only and redacted from
   command output. Use a bot dedicated to this bridge.
 - `tinyctb doctor` is the fastest way to check that the claude binary, hooks,

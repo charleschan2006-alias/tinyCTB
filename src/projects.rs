@@ -183,12 +183,12 @@ pub(crate) fn resolve_new_thread_request<'a>(
                     }
                 }
             }
-            match current_project.or_else(|| (projects.len() == 1).then_some(&projects[0])) {
+            match current_project.or_else(|| (projects.len() == 1).then(|| &projects[0])) {
                 Some(project) => (project, Some(prompt)),
                 None => bail!("No current project selected. Use /project <id> first."),
             }
         }
-        None => match current_project.or_else(|| (projects.len() == 1).then_some(&projects[0])) {
+        None => match current_project.or_else(|| (projects.len() == 1).then(|| &projects[0])) {
             Some(project) => (project, None),
             None => bail!("No current project selected. Use /project <id> first."),
         },
@@ -199,6 +199,21 @@ pub(crate) fn resolve_new_thread_request<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With NO projects registered, resolution must FAIL, not panic.
+    /// `then_some(&projects[0])` evaluated the index EAGERLY — the length
+    /// check beside it never mattered — and one ordinary Telegram message
+    /// became a poison pill that crash-looped the daemon (68 restarts,
+    /// each rereading the same update) until the lazy form fixed it.
+    #[test]
+    fn resolving_with_no_projects_fails_instead_of_panicking() {
+        let err = resolve_new_thread_request(&[], None, Some("hi"))
+            .expect_err("no projects must be an error, never a panic");
+        assert!(format!("{err}").contains("No current project"), "{err}");
+        let err = resolve_new_thread_request(&[], None, None)
+            .expect_err("no projects must be an error, never a panic");
+        assert!(format!("{err}").contains("No current project"), "{err}");
+    }
 
     #[test]
     fn project_query_matches_id_alias_and_label() {

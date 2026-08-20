@@ -1439,15 +1439,218 @@ pub(crate) mod test_spawn {
     }
 }
 
+/// Per-turn cgroup (v2) OWNERSHIP. The turn's process group is not guessed
+/// from pids — it is a kernel object we created: membership is
+/// `cgroup.procs`, killing is one write to `cgroup.kill` (atomic, the whole
+/// subtree, immune to pid reuse), emptiness is `populated 0` in
+/// `cgroup.events`, and the directory outlives daemon restarts, so
+/// ownership survives them structurally. Everything the pid machinery had
+/// to PROVE — anchors, incarnations, birth debts — is simply true here by
+/// construction. On a host that cannot give us a subtree (no v2, no write
+/// access), `create` returns None and the spawn stays on the killpg regime.
+// The create/kill halves run only from cfg(not(test)) spawn/kill paths;
+// tests exercise them directly against real cgroups.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) mod turn_cgroup {
+    use std::fs;
+    use std::io::ErrorKind;
+    use std::path::{Path, PathBuf};
+
+    /// Where THIS process lives in the unified hierarchy.
+    fn own_cgroup_dir() -> Option<PathBuf> {
+        let raw = fs::read_to_string("/proc/self/cgroup").ok()?;
+        let rel = raw
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))?
+            .trim();
+        if rel.is_empty() || rel == "/" {
+            return None;
+        }
+        Some(PathBuf::from(format!("/sys/fs/cgroup{rel}")))
+    }
+
+    /// The STABLE owner subtree for turn objects: the tinyctb SERVICE's
+    /// cgroup, never the caller's. Parented under a terminal's scope (the
+    /// CLI case) a turn would die with the terminal; under the service —
+    /// whose unit sets KillMode=process precisely so restarts spare the
+    /// subtrees — it survives daemon restarts. Cross-scope migration works
+    /// because everything under user@.service is delegated to the user
+    /// (verified on this host). Tests override the root explicitly.
+    pub(crate) fn owner_root() -> Option<PathBuf> {
+        if let Ok(root) = std::env::var("TINYCTB_CGROUP_ROOT") {
+            let root = PathBuf::from(root);
+            return root.is_dir().then_some(root);
+        }
+        // SAFETY: reads our own uid; touches nothing.
+        let uid = unsafe { libc::getuid() };
+        let service = PathBuf::from(format!(
+            "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/tinyctb.service"
+        ));
+        if service.is_dir() {
+            return Some(service);
+        }
+        // No installed service (bare CLI use): our own subtree still gives
+        // correct ownership for as long as the caller's scope lives.
+        own_cgroup_dir().filter(|dir| dir.is_dir())
+    }
+
+    /// Create the turn's cgroup BEFORE anything is spawned. None means this
+    /// host cannot provide one; the caller decides whether that is fatal.
+    pub(crate) fn create(turn_id: &str) -> Option<PathBuf> {
+        let dir = owner_root()?.join(format!("turn-{turn_id}"));
+        match fs::create_dir(&dir) {
+            Ok(()) => Some(dir),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => Some(dir),
+            Err(_) => None,
+        }
+    }
+
+    /// Validate a path RECORDED IN THE DATABASE before acting on it: it
+    /// must live under the unified hierarchy and be named for exactly this
+    /// turn. `cgroup.kill` on an arbitrary path would kill whatever lives
+    /// there — a corrupted row must never be able to aim it.
+    pub(crate) fn validated(path: &str, turn_id: &str) -> Option<PathBuf> {
+        let dir = PathBuf::from(path);
+        let expected = format!("turn-{turn_id}");
+        if path.contains("..") {
+            return None;
+        }
+        // Confined to the TRUSTED owner subtree, not merely the unified
+        // hierarchy: a corrupted row must not aim `cgroup.kill` at some
+        // other service's tree just because it lives under /sys/fs/cgroup.
+        let root = owner_root()?;
+        if !dir.starts_with(&root) {
+            return None;
+        }
+        if dir.file_name()?.to_str()? != expected {
+            return None;
+        }
+        Some(dir)
+    }
+
+    /// SIGKILL the whole subtree, atomically. Nothing to confirm here —
+    /// `populated` is the confirmation.
+    pub(crate) fn kill(dir: &Path) -> bool {
+        fs::write(dir.join("cgroup.kill"), "1").is_ok()
+    }
+
+    /// Is anything still alive in the turn's cgroup? `Some(false)` is the
+    /// PROOF the whole stopping machinery exists to obtain. A directory
+    /// that no longer exists was settled and removed earlier — equally
+    /// empty. An unreadable one proves nothing.
+    pub(crate) fn populated(dir: &Path) -> Option<bool> {
+        match fs::read_to_string(dir.join("cgroup.events")) {
+            Ok(events) => Some(events.lines().any(|line| line.trim() == "populated 1")),
+            Err(err) if err.kind() == ErrorKind::NotFound => Some(false),
+            Err(_) => None,
+        }
+    }
+
+    /// Bounded wait for a proof of emptiness.
+    pub(crate) fn confirmed_empty(dir: &Path, within: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            match populated(dir) {
+                Some(false) => return true,
+                Some(true) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50))
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// TEARDOWN: kill and remove EVERY turn object under the owner root.
+    /// `reset` and `daemon uninstall` call this BEFORE deleting the ledger
+    /// or the unit — with `KillMode=process` sparing the sub-trees, a
+    /// teardown that skipped this would strand every running turn with no
+    /// ledger and no supervisor. Returns the objects that could NOT be
+    /// proven empty: the caller must ABORT on any, never delete the ledger
+    /// out from under live work.
+    pub(crate) fn sweep_all(within: std::time::Duration) -> anyhow::Result<SweepReport> {
+        use anyhow::Context as _;
+        let mut report = SweepReport::default();
+        let Some(root) = owner_root() else {
+            // A CONFIGURED root that is unusable is an error, not "no
+            // objects": swallowing it would let a teardown proceed blind.
+            if std::env::var_os("TINYCTB_CGROUP_ROOT").is_some() {
+                anyhow::bail!("the configured cgroup root is not a usable directory");
+            }
+            return Ok(report);
+        };
+        let entries = fs::read_dir(&root).with_context(|| {
+            format!("failed to enumerate turn objects under {}", root.display())
+        })?;
+        for entry in entries {
+            let entry = entry
+                .with_context(|| format!("failed to read an entry under {}", root.display()))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with("turn-") {
+                continue;
+            }
+            let dir = entry.path();
+            let _ = kill(&dir);
+            // Proven empty AND actually removed, or it goes on the report:
+            // "could not prove" and "could not remove" both block a
+            // teardown — the contract is proof, not optimism.
+            if confirmed_empty(&dir, within) && remove(&dir) {
+                report.removed += 1;
+            } else {
+                report.stubborn.push(dir);
+            }
+        }
+        Ok(report)
+    }
+
+    /// What a full sweep managed to prove.
+    #[derive(Debug, Default)]
+    pub(crate) struct SweepReport {
+        pub(crate) removed: usize,
+        pub(crate) stubborn: Vec<PathBuf>,
+    }
+
+    /// Remove an EMPTY turn cgroup; a populated one refuses (rmdir EBUSY),
+    /// which is exactly the safety we want.
+    pub(crate) fn remove(dir: &Path) -> bool {
+        match fs::remove_dir(dir) {
+            Ok(()) => true,
+            Err(err) if err.kind() == ErrorKind::NotFound => true,
+            Err(_) => false,
+        }
+    }
+}
+
 /// Live handles of spawned headless turns. The daemon reaps these every cycle
 /// so finished children never linger as zombies — a zombie still answers
 /// `kill -0`, which would make crash detection report "running" forever.
-#[cfg(not(test))]
+#[cfg_attr(test, allow(dead_code))]
 mod turn_children {
     use std::process::Child;
     use std::sync::Mutex;
 
-    pub(super) static RUNNING: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+    /// A live handle BOUND to the turn that spawned it. The binding is the
+    /// point: a stale `stopping` row can carry a pid the kernel has since
+    /// recycled onto a NEWER turn, so matching registry entries by pid would
+    /// hand that newer turn's process to the old turn's kill.
+    pub(super) struct RunningTurn {
+        pub(super) turn_id: String,
+        pub(super) child: Child,
+    }
+
+    pub(super) static RUNNING: Mutex<Vec<RunningTurn>> = Mutex::new(Vec::new());
+
+    /// Remove and return the handle for exactly this turn. Pid is not an
+    /// accepted key: pids get recycled, turn ids do not.
+    pub(super) fn take(turn_id: &str) -> Option<RunningTurn> {
+        let mut running = RUNNING.lock().expect("turn children lock");
+        let index = running.iter().position(|entry| entry.turn_id == turn_id)?;
+        Some(running.remove(index))
+    }
+
+    pub(super) fn put_back(entry: RunningTurn) {
+        RUNNING.lock().expect("turn children lock").push(entry);
+    }
 }
 
 #[cfg(test)]
@@ -1470,12 +1673,50 @@ pub(crate) mod test_settle_fail {
 
 #[cfg(test)]
 pub(crate) mod test_kill {
-    use std::sync::Mutex;
+    use std::cell::{Cell, RefCell};
 
-    pub(crate) static KILLED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    // Thread-local ON PURPOSE. Every test drives the kill path on its own
+    // thread, and these were once process-wide: parallel tests stole each
+    // other's recorded pids via `take()` and raced over the forced outcome,
+    // a flake that no "remember to hold the lock" convention survived.
+    thread_local! {
+        static KILLED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+
+        /// What `kill_turn_process` should report next. Real termination
+        /// cannot be exercised in-process, but the CALLER's behaviour on
+        /// each outcome is exactly what must not regress: settling a turn
+        /// whose process was never confirmed dead drops a live process out
+        /// of every later scan.
+        static OUTCOME: Cell<Option<super::KillOutcome>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn record(pid: u32) {
+        KILLED.with(|killed| killed.borrow_mut().push(pid));
+    }
+
+    pub(crate) fn forced_outcome() -> Option<super::KillOutcome> {
+        OUTCOME.with(Cell::get)
+    }
 
     pub(crate) fn take() -> Vec<u32> {
-        std::mem::take(&mut KILLED.lock().expect("test kill lock"))
+        KILLED.with(RefCell::take)
+    }
+
+    /// RAII: restores the outcome even if the test panics, so a forced
+    /// verdict cannot leak into this thread's next assertion.
+    pub(crate) struct OutcomeGuard;
+
+    impl OutcomeGuard {
+        pub(crate) fn set(outcome: super::KillOutcome) -> Self {
+            OUTCOME.with(|cell| cell.set(Some(outcome)));
+            OutcomeGuard
+        }
+    }
+
+    impl Drop for OutcomeGuard {
+        fn drop(&mut self) {
+            OUTCOME.with(|cell| cell.set(None));
+        }
     }
 }
 
@@ -1510,6 +1751,57 @@ fn process_start_ticks(pid: u32) -> Option<String> {
     rest.split_whitespace().nth(19).map(str::to_string)
 }
 
+/// What we can say about a process we signalled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    /// Provably over: the entry is gone, it is a zombie, or the pid now
+    /// belongs to a different incarnation.
+    Ended,
+    /// Still there, same incarnation.
+    Alive,
+    /// Could not tell. NOT the same as ended — treating an unreadable
+    /// `/proc` as death is how a live process gets recorded as stopped and
+    /// then disappears from every later scan.
+    Unknown,
+}
+
+/// Is the incarnation identified by `pid` + `expected_ticks` over?
+///
+/// `expected_ticks` is the value PERSISTED when the turn was spawned, never
+/// a fresh sample: sampling after signalling can read `None` while the
+/// process is merely momentarily unreadable, and a later `Some` would then
+/// look like a generation change and be misread as death.
+fn incarnation_liveness(pid: u32, expected_ticks: &str) -> Liveness {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => liveness_from_stat(&stat, expected_ticks),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Liveness::Ended,
+        // Any OTHER read failure is ignorance, not death. Reporting it as
+        // ended is how a live process gets recorded as stopped.
+        Err(_) => Liveness::Unknown,
+    }
+}
+
+/// The parsing half, split out so every branch is reachable from a test
+/// (a real `/proc` entry cannot be made malformed on demand).
+fn liveness_from_stat(stat: &str, expected_ticks: &str) -> Liveness {
+    let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+        return Liveness::Unknown;
+    };
+    let mut fields = rest.split_whitespace();
+    let Some(state) = fields.next() else {
+        return Liveness::Unknown;
+    };
+    if state == "Z" {
+        return Liveness::Ended; // dead, just not reaped yet
+    }
+    match fields.nth(18) {
+        Some(ticks) if ticks == expected_ticks => Liveness::Alive,
+        // A different incarnation owns this pid now: ours is over.
+        Some(_) => Liveness::Ended,
+        None => Liveness::Unknown,
+    }
+}
+
 /// This boot's unique id. starttime ticks restart from zero on reboot, so
 /// ticks are only meaningful within one boot — the boot id scopes them.
 fn current_boot_id() -> Option<String> {
@@ -1529,19 +1821,49 @@ pub(crate) struct ProcessIdentity {
 }
 
 /// Identity of a just-spawned turn, persisted so a restarted daemon can later
-/// verify the PID still belongs to the turn before signalling it. Best
-/// effort: missing components make verification refuse to kill.
+/// verify the PID still belongs to the turn before signalling it.
+///
+/// `pgid` is DETERMINISTIC, not observed: the spawn puts the child in its
+/// own process group (`process_group(0)`), so the kernel guarantees
+/// pgid == pid. Observing it through `ps` could fail, and a persisted NULL
+/// pgid is the one hole the whole stopping machinery cannot recover from —
+/// the daemon's group probe answers `Unknown` forever and a stopped turn
+/// never settles.
 pub(crate) fn capture_process_identity(pid: Option<u32>) -> ProcessIdentity {
     let Some(pid) = pid.filter(|pid| *pid > 0) else {
         return ProcessIdentity::default();
     };
     ProcessIdentity {
         lstart: ps_value(pid, "lstart="),
+        #[cfg(unix)]
+        pgid: Some(pid),
+        #[cfg(not(unix))]
         pgid: ps_value(pid, "pgid=").and_then(|value| value.trim().parse::<u32>().ok()),
         exe: process_exe_path(pid),
         start_ticks: process_start_ticks(pid),
         boot_id: current_boot_id(),
     }
+}
+
+/// What a spawn MUST know about its child before the turn may live —
+/// otherwise the turn can never be settled once the user stops it: the
+/// daemon's recovery keys on `pgid`, and the Linux kill paths on
+/// ticks + boot id. Returns why the identity is unusable, or None when it
+/// is complete enough for this platform.
+fn incomplete_spawn_identity(identity: &ProcessIdentity) -> Option<&'static str> {
+    if identity.pgid.is_none() {
+        return Some("no process group id");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if identity.start_ticks.is_none() {
+            return Some("no starttime ticks from /proc");
+        }
+        if identity.boot_id.is_none() {
+            return Some("no boot id");
+        }
+    }
+    None
 }
 
 /// Identity check for the restart case (no Child handle). Requires the full
@@ -1577,46 +1899,87 @@ pub(crate) fn verified_restart_identity(turn: &crate::state::BridgeTurn, pid: u3
     process_start_ticks(pid).as_deref() == Some(stored_ticks)
 }
 
+/// Has this child exited, WITHOUT reaping it? On Linux the answer comes
+/// from `/proc` (an exited-but-unreaped leader reads state `Z`), which
+/// leaves the leader unreaped — its pid, and with it the group id, stays
+/// reserved until WE choose to reap. `try_wait` would answer the same
+/// question by reaping, releasing the number for reuse while the group
+/// KILL is still pending. Elsewhere `/proc` does not exist and `try_wait`
+/// is the only probe there is.
+fn leader_exited(child: &mut std::process::Child) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let pid = child.id();
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .is_some_and(|state| matches!(state, "Z" | "X" | "x")),
+            // A child we hold unreaped always has an entry; an unreadable
+            // one merely runs the grace out, and the unconditional KILL
+            // that follows is the backstop either way.
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // No /proc means no way to observe the exit WITHOUT reaping, and
+        // reaping here frees the pid while the group KILL is still pending.
+        // So the grace simply runs its full course: a flat 2s latency on a
+        // stop, in exchange for a KILL that provably targets the original
+        // group on every platform.
+        let _ = child;
+        false
+    }
+}
+
 /// TERM the whole process group, give the main child a short grace to exit
 /// cleanly, then KILL the group UNCONDITIONALLY — a grandchild that ignores
 /// TERM must not survive just because the main process exited politely.
 /// Returns whether the supplied main child was reaped (true when no handle
 /// was supplied); an unreaped child must go back to the registry so a later
 /// cycle can collect it.
+/// Send a signal to a whole process group IN PROCESS. The external `kill`
+/// binary this replaced was an unbounded wait (its exit had to be
+/// collected), depended on PATH, and widened the TERM→KILL window with a
+/// fork+exec. Returns whether the kernel accepted delivery; ESRCH ("no
+/// such group") is false — establishing "already gone" is the group
+/// probe's job, not this one's.
+fn signal_process_group(pgid: u32, signal: libc::c_int) -> bool {
+    if pgid == 0 {
+        return false;
+    }
+    // SAFETY: delivers a signal; no memory is touched.
+    (unsafe { libc::killpg(pgid as libc::pid_t, signal) }) == 0
+}
+
 pub(crate) fn terminate_process_group(pid: u32, child: Option<&mut std::process::Child>) -> bool {
     if pid == 0 {
         return true;
     }
-    let group = format!("-{pid}");
-    // Returns whether the signal was actually delivered; PATH, permission or
-    // resource problems must degrade gracefully, never wedge the daemon.
-    let signal_group = |signal: &str| -> bool {
-        Command::new("kill")
-            .args([signal, "--", &group])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    };
-    let termed = signal_group("-TERM");
+    let termed = signal_process_group(pid, libc::SIGTERM);
     match child {
         Some(child) => {
             if termed {
+                // Grace WITHOUT reaping: the unreaped leader keeps its pid —
+                // and with it the group id — reserved, so the KILL below
+                // provably targets the original group. Reaping first would
+                // free the number for reuse, and a recycled group id would
+                // receive the KILL instead.
                 let started = std::time::Instant::now();
                 while started.elapsed() < Duration::from_secs(2) {
-                    if matches!(child.try_wait(), Ok(Some(_))) {
+                    if leader_exited(child) {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
-            if !signal_group("-KILL") {
-                // External kill unavailable: at least SIGKILL the main child
-                // directly through the handle (no PATH involved).
+            if !signal_process_group(pid, libc::SIGKILL) {
+                // Group signalling unavailable (or the group already gone):
+                // at least SIGKILL the main child through the handle.
                 let _ = child.kill();
             }
-            // Bounded reap — never block the daemon indefinitely on a child
+            // Only now reap — bounded, never blocking the daemon on a child
             // that could not be signalled.
             let started = std::time::Instant::now();
             loop {
@@ -1628,54 +1991,297 @@ pub(crate) fn terminate_process_group(pid: u32, child: Option<&mut std::process:
             }
         }
         None => {
-            std::thread::sleep(Duration::from_millis(500));
-            signal_group("-KILL");
-            true
+            // Without a handle there is nobody to reap through, so the only
+            // honest answer comes from OBSERVING the process — never from a
+            // signal's exit code. `kill` returns ESRCH once the target is
+            // already gone, which is success, not failure; and it returns
+            // success for a process that merely has not exited yet.
+            //
+            // The caller supplies the ticks recorded at spawn time. This
+            // path therefore reports `false` (Undetermined to the caller)
+            // whenever it cannot prove the incarnation ended AND its group
+            // emptied — a leader that dies while a grandchild keeps working
+            // is not a stopped turn.
+            unreachable!("the no-handle path goes through terminate_verified_group")
         }
     }
 }
 
-/// Terminate a timed-out headless turn. With a live handle the child is
-/// killed and reaped directly; after a daemon restart the stored identity
-/// must fully match, otherwise we refuse to signal (PID reuse).
-pub(crate) fn kill_turn_process(turn: &crate::state::BridgeTurn) {
+/// Is anything still in this process group?
+///
+/// `killpg(pgid, 0)` sends no signal; it only asks the kernel. That makes it
+/// authoritative, and the only answer that survives what enumerating
+/// `/proc` cannot: `hidepid=2` hides other users' processes, so a scan sees
+/// an empty group that is not empty, and a descendant that dropped
+/// privileges is invisible to a scan yet still reported by the kernel — as
+/// `EPERM`, which means the group EXISTS.
+///
+/// `ESRCH` is the only answer that means empty. Everything else is "alive"
+/// or "cannot tell", and both must stop us short of recording a turn as
+/// stopped.
+pub(crate) fn group_liveness(pgid: u32) -> Liveness {
+    #[cfg(test)]
+    if let Some(forced) = test_group_probe::injected() {
+        return forced;
+    }
+    if pgid == 0 {
+        return Liveness::Unknown; // 0 means "my own group" to killpg
+    }
+    // SAFETY: signal 0 performs the permission and existence checks and
+    // delivers nothing.
+    let result = unsafe { libc::killpg(pgid as libc::pid_t, 0) };
+    let errno = (result != 0)
+        .then(|| std::io::Error::last_os_error().raw_os_error())
+        .flatten();
+    liveness_from_killpg(result, errno)
+}
+
+/// The errno mapping, split out because the interesting case cannot be
+/// produced on demand: whether `EPERM` reads as "alive" decides if a
+/// descendant that dropped privileges can be mistaken for a dead group, and
+/// no test can conjure a foreign group that this host refuses to signal.
+fn liveness_from_killpg(result: i32, errno: Option<i32>) -> Liveness {
+    if result == 0 {
+        return Liveness::Alive; // exists and we may signal it
+    }
+    match errno {
+        Some(libc::ESRCH) => Liveness::Ended,
+        // The group EXISTS; we simply may not signal it — the exact shape of
+        // a descendant that dropped privileges.
+        Some(libc::EPERM) => Liveness::Alive,
+        _ => Liveness::Unknown,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_group_probe {
+    use super::Liveness;
+    use std::cell::Cell;
+
+    // Thread-local ON PURPOSE: a process-wide forced verdict leaked into
+    // every other test that happened to probe a group at the same moment,
+    // including the ones judging REAL processes.
+    thread_local! {
+        static FORCED: Cell<Option<Liveness>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn injected() -> Option<Liveness> {
+        FORCED.with(Cell::get)
+    }
+
+    /// RAII so a forced verdict cannot outlive its test on this thread.
+    pub(crate) struct ProbeGuard;
+
+    impl ProbeGuard {
+        pub(crate) fn set(liveness: Liveness) -> Self {
+            FORCED.with(|cell| cell.set(Some(liveness)));
+            ProbeGuard
+        }
+    }
+
+    impl Drop for ProbeGuard {
+        fn drop(&mut self) {
+            FORCED.with(|cell| cell.set(None));
+        }
+    }
+}
+
+/// Confirm a REAPED leader's whole group is gone. With the full identity
+/// the group is watched against the incarnation for a bounded window. With
+/// no ticks (macOS: no /proc) the group can still be PROBED: the pid came
+/// from our own just-reaped handle, and the probe signals nothing, so
+/// `ESRCH` is a safe and sufficient proof — without this arm a reaped
+/// macOS turn read `Undetermined` forever and never settled. No pgid at
+/// all proves nothing.
+fn confirm_reaped_leader(pid: u32, ticks: Option<&str>, pgid: Option<u32>) -> KillOutcome {
+    match (ticks, pgid) {
+        (Some(ticks), Some(pgid)) => confirm_group_gone(pid, pgid, ticks, Duration::from_secs(2)),
+        (None, Some(pgid)) => match group_liveness(pgid) {
+            Liveness::Ended => KillOutcome::Terminated,
+            _ => KillOutcome::Undetermined,
+        },
+        (_, None) => KillOutcome::Undetermined,
+    }
+}
+
+/// Both kill paths end here: a turn is only `Terminated` when the leader's
+/// incarnation is over AND its process group is empty.
+///
+/// Reaping the leader is not enough. A descendant that ignores TERM, or one
+/// running under a different uid that we cannot even signal, keeps doing
+/// whatever the turn was doing — and recording the turn as `stopped` would
+/// drop it out of every later scan.
+fn confirm_group_gone(
+    pid: u32,
+    pgid: u32,
+    expected_ticks: &str,
+    deadline: Duration,
+) -> KillOutcome {
+    let until = std::time::Instant::now() + deadline;
+    loop {
+        let leader = incarnation_liveness(pid, expected_ticks);
+        let group = group_liveness(pgid);
+        match (leader, group) {
+            (Liveness::Ended, Liveness::Ended) => return KillOutcome::Terminated,
+            // Ignorance is never death.
+            (Liveness::Unknown, _) | (_, Liveness::Unknown) => return KillOutcome::Undetermined,
+            _ if std::time::Instant::now() >= until => return KillOutcome::Undetermined,
+            _ => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+/// Terminate a turn we have no `Child` handle for (the daemon restarted
+/// since it was spawned), reporting what we could actually establish.
+fn terminate_verified_group(pid: u32, pgid: u32, expected_ticks: &str) -> KillOutcome {
+    // The anchor is verified FIRST: the ticks must still match, or the pid
+    // — and the group id derived from it — may already belong to unrelated
+    // work. (The check-to-signal gap is microseconds — in-process killpg,
+    // no fork/exec in between; closing it entirely
+    // needs an ownership primitive like a per-turn cgroup, noted as the
+    // long-term fix.)
+    if !leader_anchors_group(pid, expected_ticks) {
+        return KillOutcome::Undetermined;
+    }
+    // TERM and KILL back to back, with NO grace between them. This path
+    // holds no handle, so nothing can keep the leader unreaped: init (or a
+    // subreaper) collects it the moment it dies, the anchor evaporates, and
+    // a KILL delayed by a grace window would then have to be refused —
+    // leaving a TERM-ignoring grandchild alive and the turn `stopping`
+    // forever. Graceful shutdown is the LIVE path's luxury: there the
+    // unreaped handle pins the anchor for as long as the grace needs.
+    let _ = signal_process_group(pgid, libc::SIGTERM);
+    let _ = signal_process_group(pgid, libc::SIGKILL);
+    confirm_group_gone(pid, pgid, expected_ticks, Duration::from_secs(2))
+}
+
+/// Does this pid still hold OUR incarnation's place — alive, or exited but
+/// unreaped? An unreaped leader keeps the pid (and therefore the group id)
+/// reserved by the kernel. Distinct from `incarnation_liveness`, which
+/// calls a zombie `Ended`: true for "is the turn over", but exactly the
+/// wrong question for "may the group id still be trusted".
+fn leader_anchors_group(pid: u32, expected_ticks: &str) -> bool {
+    process_start_ticks(pid).as_deref() == Some(expected_ticks)
+}
+
+/// What actually happened when we tried to end a turn.
+///
+/// The distinction matters because a caller may want to record the turn as
+/// finished, and doing that for a process still running would leave a live
+/// process that nothing tracks any more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KillOutcome {
+    /// Signalled and reaped: the process is gone.
+    Terminated,
+    /// Signalled, but not reaped inside the bound. Probably dying, NOT
+    /// proven dead.
+    Undetermined,
+    /// Nothing was signalled — no pid, or the recorded identity (boot id +
+    /// pgid + start ticks) no longer matches, so signalling could hit an
+    /// unrelated process that inherited the pid.
+    Unverified,
+}
+
+/// Terminate a headless turn. With a live handle the child is killed and
+/// reaped directly; after a daemon restart the stored identity must fully
+/// match, otherwise we refuse to signal at all (PID reuse).
+pub(crate) fn kill_turn_process(turn: &crate::state::BridgeTurn) -> KillOutcome {
     #[cfg(test)]
     {
-        test_kill::KILLED
-            .lock()
-            .expect("test kill lock")
-            .push(turn.pid.unwrap_or(0));
+        test_kill::record(turn.pid.unwrap_or(0));
+        test_kill::forced_outcome().unwrap_or(KillOutcome::Terminated)
     }
     #[cfg(not(test))]
     {
-        let Some(pid) = turn.pid.filter(|pid| *pid > 0) else {
-            return;
-        };
-        let mut running = turn_children::RUNNING.lock().expect("turn children lock");
-        if let Some(index) = running.iter().position(|child| child.id() == pid) {
-            let mut child = running.remove(index);
-            drop(running);
-            if !terminate_process_group(pid, Some(&mut child)) {
-                // Not reaped within the bound: hand the child back so the
+        // cgroup regime FIRST: kill the OBJECT, reap our handle if we hold
+        // one (a zombie leader keeps the cgroup populated until reaped),
+        // and let `populated` be the confirmation. No anchors and no
+        // incarnations — the object cannot be recycled out from under us.
+        if let Some(dir) = turn
+            .cgroup_path
+            .as_deref()
+            .and_then(|path| turn_cgroup::validated(path, &turn.turn_id))
+        {
+            let entry = turn_children::take(&turn.turn_id);
+            let killed = turn_cgroup::kill(&dir);
+            if let Some(mut entry) = entry {
+                let started = std::time::Instant::now();
+                let reaped = loop {
+                    match entry.child.try_wait() {
+                        Ok(Some(_)) | Err(_) => break true,
+                        Ok(None) if started.elapsed() >= Duration::from_secs(2) => break false,
+                        Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                    }
+                };
+                if !reaped {
+                    turn_children::put_back(entry);
+                }
+            }
+            if !killed {
+                return KillOutcome::Undetermined;
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match turn_cgroup::populated(&dir) {
+                    Some(false) => return KillOutcome::Terminated,
+                    Some(true) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(100))
+                    }
+                    _ => return KillOutcome::Undetermined,
+                }
+            }
+        }
+        // Legacy killpg regime below (no ownership object recorded).
+        // The live registry answers by TURN ID, never by pid: `turn.pid` may
+        // have been recycled onto a different, newer turn whose handle sits
+        // in the registry, and matching by pid would hand THAT turn's
+        // process to this turn's kill.
+        if let Some(mut entry) = turn_children::take(&turn.turn_id) {
+            let pid = entry.child.id();
+            let reaped = terminate_process_group(pid, Some(&mut entry.child));
+            // Reaping the leader proves only the leader is gone. The turn is
+            // not stopped until its whole group is.
+            let confirmed = if reaped {
+                confirm_reaped_leader(pid, turn.proc_start_ticks.as_deref(), turn.pgid)
+            } else {
+                KillOutcome::Undetermined
+            };
+            if confirmed == KillOutcome::Terminated {
+                KillOutcome::Terminated
+            } else if reaped {
+                KillOutcome::Undetermined
+            } else {
+                // Not reaped within the bound: hand the entry back so the
                 // per-cycle reaper can collect it later instead of leaking a
                 // forever-unreapable zombie.
-                turn_children::RUNNING
-                    .lock()
-                    .expect("turn children lock")
-                    .push(child);
+                turn_children::put_back(entry);
+                KillOutcome::Undetermined
             }
         } else {
-            drop(running);
-            if verified_restart_identity(turn, pid) {
-                terminate_process_group(pid, None);
+            let Some(pid) = turn.pid.filter(|pid| *pid > 0) else {
+                return KillOutcome::Unverified;
+            };
+            match (turn.proc_start_ticks.as_deref(), turn.pgid) {
+                // The PERSISTED pgid, never `pid` as a stand-in: they happen
+                // to match for a fresh setsid child, but signalling a guessed
+                // group id is not something to do on a coincidence.
+                (Some(ticks), Some(pgid)) if verified_restart_identity(turn, pid) => {
+                    terminate_verified_group(pid, pgid, ticks)
+                }
+                // No persisted identity, or it no longer matches: the pid may
+                // belong to something else entirely now.
+                _ => KillOutcome::Unverified,
             }
         }
     }
 }
 
-/// Reap finished headless children. Returns (pid, exit_code) per finished
-/// child; exit_code is None if the status is unavailable.
-pub(crate) fn reap_finished_turn_processes() -> Vec<(u32, Option<i32>)> {
+/// Reap finished headless children. Returns (turn_id, exit_code) per
+/// finished child; exit_code is None if the status is unavailable. The turn
+/// id — not the pid — is the identity handed to the database: a pid can be
+/// shared with an older stale row through recycling, and stamping exits by
+/// pid marked both turns at once.
+pub(crate) fn reap_finished_turn_processes() -> Vec<(String, Option<i32>)> {
     #[cfg(test)]
     {
         Vec::new()
@@ -1684,14 +2290,14 @@ pub(crate) fn reap_finished_turn_processes() -> Vec<(u32, Option<i32>)> {
     {
         let mut running = turn_children::RUNNING.lock().expect("turn children lock");
         let mut finished = Vec::new();
-        running.retain_mut(|child| match child.try_wait() {
+        running.retain_mut(|entry| match entry.child.try_wait() {
             Ok(Some(status)) => {
-                finished.push((child.id(), status.code()));
+                finished.push((entry.turn_id.clone(), status.code()));
                 false
             }
             Ok(None) => true,
             Err(_) => {
-                finished.push((child.id(), None));
+                finished.push((entry.turn_id.clone(), None));
                 false
             }
         });
@@ -1723,22 +2329,71 @@ fn spawn_registered_headless(
     log_path: &Path,
     now: u64,
 ) -> Result<Option<u32>> {
-    crate::state::register_bridge_turn(
-        conn,
-        turn_id,
-        thread_id,
-        &log_path.display().to_string(),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        now,
-    )?;
-    let pid = match spawn_detached_headless(binary, args, cwd, turn_id) {
+    // cgroup regime: the OWNERSHIP object exists before the row, and the
+    // row records it before the process exists — supervision is structural
+    // from the first instant. Hosts that cannot provide a subtree record
+    // nothing and stay on the killpg regime.
+    // The SHARED spawn lock, held across create→register→spawn: a teardown
+    // holding it exclusively is provably alone.
+    #[cfg(not(test))]
+    let _spawn_permit = crate::daemon::hold_spawn_lock_shared()?;
+    #[cfg(test)]
+    let cgroup: Option<std::path::PathBuf> = None;
+    #[cfg(not(test))]
+    let cgroup = turn_cgroup::create(turn_id);
+    // Linux runs FAIL CLOSED: no ownership object, no spawn. The
+    // structural guarantee ("inside its cgroup or never exists") would
+    // otherwise silently evaporate exactly when delegation or permissions
+    // break. The legacy killpg regime must be opted into explicitly.
+    #[cfg(all(target_os = "linux", not(test)))]
+    if cgroup.is_none()
+        && std::env::var("TINYCTB_LEGACY_PROCESS_SUPERVISION")
+            .ok()
+            .as_deref()
+            != Some("1")
+    {
+        anyhow::bail!(
+            "no cgroup v2 subtree is available for turn supervision; refusing to spawn an              unsupervisable process. Reinstall the daemon unit (Delegate=yes) or set              TINYCTB_LEGACY_PROCESS_SUPERVISION=1 to accept the legacy killpg regime."
+        );
+    }
+    let registered = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        crate::state::register_bridge_turn(
+            &tx,
+            turn_id,
+            thread_id,
+            &log_path.display().to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )?;
+        if let Some(dir) = &cgroup {
+            crate::state::record_turn_cgroup(&tx, turn_id, &dir.display().to_string())?;
+        }
+        tx.commit()?;
+        Ok(())
+    })();
+    if let Err(err) = registered {
+        if let Some(dir) = &cgroup {
+            let _ = turn_cgroup::remove(dir);
+        }
+        return Err(err);
+    }
+    let pid = match spawn_detached_headless(binary, args, cwd, turn_id, cgroup.as_deref()) {
         Ok(pid) => pid,
-        Err(err) => return Err(settle_failed_turn(conn, turn_id, now, err)),
+        Err(err) => {
+            // The empty ownership object goes with the failed spawn; a
+            // populated one (partial start) refuses removal and stays for
+            // the daemon to sweep.
+            if let Some(dir) = &cgroup {
+                let _ = turn_cgroup::remove(dir);
+            }
+            return Err(settle_failed_turn(conn, turn_id, now, err));
+        }
     };
     // Identity arrives in a second write because it cannot exist before the
     // spawn — and losing that write is NOT survivable. With `pid` still NULL
@@ -1748,22 +2403,110 @@ fn spawn_registered_headless(
     // write is retried and verified, and a turn that cannot be recorded is
     // killed rather than left running unsupervised.
     let identity = capture_process_identity(pid);
+    // An incomplete identity is treated exactly like a failed identity
+    // write: kill now, fail the spawn. A supervised process that /stop can
+    // accept but never prove dead — pgid NULL probes `Unknown` forever —
+    // is worse than no process. (The test build's stubbed spawn never
+    // reaches real identity capture, hence the cfg.)
+    #[cfg(not(test))]
+    if let Some(missing) = incomplete_spawn_identity(&identity) {
+        let cleanup = kill_spawned_child(
+            turn_id,
+            pid,
+            identity.start_ticks.as_deref(),
+            cgroup.as_deref(),
+        );
+        let err = anyhow::anyhow!(
+            "the spawned turn's identity is incomplete ({missing}); the process was \
+             terminated rather than left running beyond the reach of /stop"
+        );
+        return Err(settle_unwound_spawn(
+            conn, turn_id, &identity, pid, cleanup, now, err,
+        ));
+    }
     if let Err(err) = persist_spawn_identity(conn, turn_id, pid, &identity) {
-        kill_spawned_child(pid);
+        let cleanup = kill_spawned_child(
+            turn_id,
+            pid,
+            identity.start_ticks.as_deref(),
+            cgroup.as_deref(),
+        );
         let err = err.context(
             "could not record the spawned turn's identity; the process was terminated \
              rather than left running outside the approval boundary",
         );
-        return Err(settle_failed_turn(conn, turn_id, now, err));
+        return Err(settle_unwound_spawn(
+            conn, turn_id, &identity, pid, cleanup, now, err,
+        ));
     }
     Ok(pid)
 }
 
+/// Settle a spawn that had to be unwound — by what the cleanup PROVED.
+/// A group confirmed empty is `failed` history. An UNCONFIRMED one stays
+/// `running` under the failure-cleanup marker (value 2) — never
+/// `stopping`, which is the user's word — and the daemon's recovery loop
+/// keeps probing until the group is provably gone, then settles it as
+/// `failed` with a failure receipt.
+///
+/// The invariant with no exceptions: an unproven group NEVER reaches a
+/// terminal status from here. A state that overstates liveness stays
+/// visible and correctable; a terminal one that lies does not.
+fn settle_unwound_spawn(
+    conn: &rusqlite::Connection,
+    turn_id: &str,
+    identity: &ProcessIdentity,
+    pid: Option<u32>,
+    cleanup: KillOutcome,
+    now: u64,
+    cause: anyhow::Error,
+) -> anyhow::Error {
+    // FIRST, whatever the outcome and whatever the status column says:
+    // patch the FULL identity in (COALESCE — never overwriting) and sweep
+    // the dialogs. A `/stop` that won the race left a `stopping` row with
+    // no pid/pgid the daemon could ever probe, and a recovery that saved
+    // only pid/pgid could no longer re-signal after a daemon restart
+    // (`verified_restart_identity` needs ticks + boot id).
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if crate::state::mark_cleanup_pending(
+            conn,
+            turn_id,
+            pid,
+            identity.start_ticks.as_deref(),
+            identity.boot_id.as_deref(),
+            now,
+        )
+        .is_ok()
+        {
+            break;
+        }
+    }
+    if cleanup == KillOutcome::Terminated {
+        return settle_failed_turn(conn, turn_id, now, cause);
+    }
+    // The row stays EXACTLY where the marker put it: `running` under the
+    // failure-cleanup marker — or `stopping` only if a user's /stop won a
+    // race, because that word is the USER's. Writing `stopping` from here
+    // made the recovery loop report a spawn failure as "已停止"; instead
+    // the daemon proves the group gone and settles it as `failed` with a
+    // failure receipt.
+    cause.context(format!(
+        "the cleanup could not confirm turn {turn_id}'s process group empty; the turn \
+         stays under the failure-cleanup marker until the daemon proves it gone and \
+         settles it as failed"
+    ))
+}
+
 /// Settle a turn whose spawn went wrong, and fold how THAT went into the
 /// reported error — a dropped settle error would leave the row `running`
-/// with nobody told. If settling itself keeps failing, the row does stay
-/// `running` with a NULL pid; the daemon's 10s crash grace then flags the
-/// turn failed on its own, loudly — delayed and noisier, but never silent.
+/// with nobody told. If settling itself keeps failing, the row stays
+/// `running` under the failure-cleanup marker the exhaustion tail writes:
+/// the recovery loop proves the (removed) object empty and settles it as
+/// `failed` within a cycle — the 10-second no-pid claim deliberately
+/// excludes supervised and cgroup-bound rows.
 fn settle_failed_turn(
     conn: &rusqlite::Connection,
     turn_id: &str,
@@ -1780,16 +2523,32 @@ fn settle_failed_turn(
             last_error = Some(anyhow::anyhow!("injected settle failure"));
             continue;
         }
-        match crate::state::mark_bridge_turn_finished(conn, turn_id, "failed", now) {
+        // Settling sweeps the turn's dialogs in the SAME transaction: a
+        // `failed` turn is outside every later daemon scan, so a button an
+        // early tool hook managed to publish would otherwise stay
+        // answerable for up to a day.
+        match crate::state::settle_unwound_turn_failed(conn, turn_id, now) {
             Ok(()) => return cause,
             Err(err) => last_error = Some(err),
         }
     }
     let settle_error = last_error.unwrap_or_else(|| anyhow::anyhow!("settle never ran"));
+    // Best-effort supervision marker: a cgroup-owned row is EXCLUDED from
+    // the 10-second no-pid claim on purpose, so without this it would sit
+    // `running` until the six-hour fiat. Marked, the recovery loop probes
+    // its (already removed) object next tick — `populated` reads empty —
+    // and settles it in seconds. If even this write fails, nothing durable
+    // is writable at all, and the same brokenness stops every claim too.
+    let marked = crate::state::set_failure_cleanup_marker(conn, turn_id).is_ok();
     cause.context(format!(
         "additionally, settling turn {turn_id} as failed also failed ({settle_error:#}); \
-         the row is still 'running' with no pid, so the daemon's grace-period check \
-         will flag it within seconds"
+         the row is still 'running'{}",
+        if marked {
+            " under the cleanup marker — the recovery loop settles it within a cycle"
+        } else {
+            " and even the cleanup marker could not be written; the row stays visible \
+             until writes recover"
+        }
     ))
 }
 
@@ -1840,36 +2599,65 @@ fn persist_spawn_identity(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("identity update never ran")))
 }
 
-/// Kill a child this process just spawned (it is still in RUNNING). The
+/// Kill a child this process just spawned (it is still in RUNNING), and
+/// report what was PROVEN — at the group level, not the leader's. The
 /// narrow cousin of `kill_turn_process`: no restart-identity check needed,
-/// because the pid came straight from our own `spawn`.
-fn kill_spawned_child(pid: Option<u32>) {
+/// because the handle is looked up by the turn that spawned it. A reaped
+/// leader alone is `Undetermined`: a TERM-proof or foreign-uid descendant
+/// can outlive it, and the caller settles by this verdict.
+fn kill_spawned_child(
+    turn_id: &str,
+    pid: Option<u32>,
+    ticks: Option<&str>,
+    cgroup: Option<&Path>,
+) -> KillOutcome {
     #[cfg(test)]
     {
-        test_kill::KILLED
-            .lock()
-            .expect("test kill lock")
-            .push(pid.unwrap_or(0));
+        let _ = (turn_id, ticks, cgroup);
+        test_kill::record(pid.unwrap_or(0));
+        test_kill::forced_outcome().unwrap_or(KillOutcome::Terminated)
     }
     #[cfg(not(test))]
     {
-        let Some(pid) = pid.filter(|pid| *pid > 0) else {
-            return;
-        };
-        let mut running = turn_children::RUNNING.lock().expect("turn children lock");
-        if let Some(index) = running.iter().position(|child| child.id() == pid) {
-            let mut child = running.remove(index);
-            drop(running);
-            if !terminate_process_group(pid, Some(&mut child)) {
-                // Not reaped within the bound: hand the child back so the
-                // per-cycle reaper collects it later instead of leaking a
-                // forever-unreapable zombie.
-                turn_children::RUNNING
-                    .lock()
-                    .expect("turn children lock")
-                    .push(child);
+        let _ = pid;
+        // cgroup regime: the object we just created is the authority — a
+        // detached-hook descendant that changed its PGID is invisible to
+        // killpg but not to `populated`.
+        if let Some(dir) = cgroup {
+            let entry = turn_children::take(turn_id);
+            let killed = turn_cgroup::kill(dir);
+            if let Some(mut entry) = entry {
+                let started = std::time::Instant::now();
+                let reaped = loop {
+                    match entry.child.try_wait() {
+                        Ok(Some(_)) | Err(_) => break true,
+                        Ok(None) if started.elapsed() >= Duration::from_secs(2) => break false,
+                        Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                    }
+                };
+                if !reaped {
+                    turn_children::put_back(entry);
+                }
             }
+            if killed && turn_cgroup::confirmed_empty(dir, Duration::from_secs(2)) {
+                return KillOutcome::Terminated;
+            }
+            return KillOutcome::Undetermined;
         }
+        let Some(mut entry) = turn_children::take(turn_id) else {
+            return KillOutcome::Unverified;
+        };
+        let child_pid = entry.child.id();
+        if !terminate_process_group(child_pid, Some(&mut entry.child)) {
+            // Not reaped within the bound: hand the entry back so the
+            // per-cycle reaper collects it later instead of leaking a
+            // forever-unreapable zombie.
+            turn_children::put_back(entry);
+            return KillOutcome::Undetermined;
+        }
+        // The group id is the spawn contract's pgid == pid; ticks come from
+        // the identity capture when it produced them (macOS: the probe arm).
+        confirm_reaped_leader(child_pid, ticks, Some(child_pid))
     }
 }
 
@@ -1879,6 +2667,7 @@ fn spawn_detached_headless(
     args: &[String],
     cwd: Option<&str>,
     log_name: &str,
+    cgroup: Option<&Path>,
 ) -> Result<Option<u32>> {
     #[cfg(test)]
     {
@@ -1887,7 +2676,7 @@ fn spawn_detached_headless(
             args.to_vec(),
             cwd.map(str::to_string),
         ));
-        let _ = log_name;
+        let _ = (log_name, cgroup);
         return Ok(Some(0));
     }
     #[cfg(not(test))]
@@ -1919,14 +2708,50 @@ fn spawn_detached_headless(
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
+        // cgroup regime: the child moves ITSELF into the turn's cgroup
+        // between fork and exec. The fd is opened in the parent (pre_exec
+        // must stay async-signal-safe: one raw write, no allocation), and
+        // a failure to enter fails the spawn — the contract is "inside its
+        // cgroup, or never exists at all".
+        #[cfg(unix)]
+        let _procs_keepalive = match cgroup {
+            Some(dir) => {
+                let procs = fs::OpenOptions::new()
+                    .write(true)
+                    .open(dir.join("cgroup.procs"))
+                    .with_context(|| {
+                        format!("failed to open cgroup.procs under {}", dir.display())
+                    })?;
+                {
+                    use std::os::unix::io::AsRawFd;
+                    use std::os::unix::process::CommandExt;
+                    let fd = procs.as_raw_fd();
+                    // SAFETY: the closure runs post-fork pre-exec and only
+                    // performs a raw write on an inherited fd.
+                    unsafe {
+                        command.pre_exec(move || {
+                            let buf = b"0\n";
+                            if libc::write(fd, buf.as_ptr().cast(), buf.len()) < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            Ok(())
+                        });
+                    }
+                }
+                Some(procs)
+            }
+            None => None,
+        };
+        #[cfg(not(unix))]
+        let _ = cgroup;
         let child = command
             .spawn()
             .with_context(|| format!("failed to spawn {} for headless turn", binary.display()))?;
         let pid = child.id();
-        turn_children::RUNNING
-            .lock()
-            .expect("turn children lock")
-            .push(child);
+        turn_children::put_back(turn_children::RunningTurn {
+            turn_id: log_name.to_string(),
+            child,
+        });
         Ok(Some(pid))
     }
 }
@@ -2504,6 +3329,36 @@ mod tests {
     use crate::state::create_state_db_in_memory;
     use std::io::Write;
 
+    /// The live registry hands a child back by TURN ID, never by pid. A
+    /// stale `stopping` row can carry a pid the kernel recycled onto a newer
+    /// turn; a pid-keyed lookup handed that newer turn's process to the old
+    /// turn's kill.
+    #[cfg(unix)]
+    #[test]
+    fn the_registry_matches_turns_not_pids() {
+        let child = std::process::Command::new("sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn victim");
+        let pid = child.id();
+        turn_children::put_back(turn_children::RunningTurn {
+            turn_id: "turn-registry-owner".to_string(),
+            child,
+        });
+        assert!(
+            turn_children::take("turn-registry-intruder").is_none(),
+            "a different turn must never receive this handle, whatever its pid claims"
+        );
+        let mut entry =
+            turn_children::take("turn-registry-owner").expect("the owner gets its handle");
+        assert_eq!(entry.child.id(), pid, "and it is the same process");
+        let _ = entry.child.kill();
+        let _ = entry.child.wait();
+    }
+
     struct TempDirGuard {
         path: PathBuf,
     }
@@ -2767,7 +3622,7 @@ mod tests {
 
     #[test]
     fn permission_notification_includes_pending_tool_detail() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let temp = TempDirGuard::new("spool-permission-detail");
         std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
         let projects = temp.path.join("projects").join("-home-user-project");
@@ -2992,7 +3847,7 @@ mod tests {
     /// of a long agentic turn.
     #[test]
     fn sync_clears_prompts_the_user_already_answered() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let projects =
             std::env::temp_dir().join(format!("tinyctb-answered-prompt-{}", std::process::id()));
         let _ = fs::remove_dir_all(&projects);
@@ -3093,7 +3948,7 @@ mod tests {
     /// recorded at hook time riding along.
     #[test]
     fn completion_notifications_do_not_become_waits() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let temp = TempDirGuard::new("spool-types");
         std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
         let projects = temp.path.join("projects").join("-home-user-x");
@@ -3179,7 +4034,7 @@ mod tests {
     /// the way, silently eat a real question.
     #[test]
     fn notification_type_survives_the_whole_hook_to_daemon_path() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let temp = TempDirGuard::new("notification-type-e2e");
         std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
         let projects = temp.path.join("projects").join("-home-user-project");
@@ -3281,7 +4136,7 @@ mod tests {
 
     #[test]
     fn spool_ingestion_builds_stop_and_notification_snapshots() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let temp = TempDirGuard::new("spool-ingest");
         std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
         let projects = temp.path.join("projects").join("-home-user-project");
@@ -3347,7 +4202,7 @@ mod tests {
 
     #[test]
     fn sync_preserves_completed_status_across_metadata_scans() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let temp = TempDirGuard::new("sync-preserve");
         std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
         let projects_root = temp.path.join("projects");
@@ -3412,7 +4267,7 @@ mod tests {
 
     #[test]
     fn cli_sync_preserves_away_notifications_from_consumed_spool() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let temp = TempDirGuard::new("cli-sync-enqueue");
         std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
         let projects_root = temp.path.join("projects");
@@ -3470,7 +4325,7 @@ mod tests {
     /// the outbox with their own previews (no by-session collapse).
     #[test]
     fn two_stops_in_one_cycle_push_two_answers() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let temp = TempDirGuard::new("two-stops-one-cycle");
         std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
         let projects_root = temp.path.join("projects");
@@ -3538,7 +4393,7 @@ mod tests {
     /// the spool uid, not the timestamp, or one answer is deduped away.
     #[test]
     fn two_same_millisecond_stops_push_two_answers() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let temp = TempDirGuard::new("same-ms-stops");
         std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
         let projects_root = temp.path.join("projects");
@@ -3626,7 +4481,7 @@ mod tests {
     /// would keep making tool calls outside the approval boundary.
     #[test]
     fn spawn_that_cannot_be_recorded_is_terminated() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let config = DaemonConfig {
             version: 1,
             bridge_command: "tinyctb".to_string(),
@@ -3663,12 +4518,529 @@ mod tests {
         );
     }
 
+    /// The last link of the failure-cleanup chain: when the unwinding kill
+    /// cannot PROVE the group empty (a TERM-proof or foreign-uid descendant
+    /// may have outlived the reaped leader), the turn must go `stopping`
+    /// with its contract pgid written in — NOT `failed`, which moves the
+    /// survivors out of every scan the daemon will ever make.
+    #[test]
+    fn an_unconfirmed_spawn_cleanup_stays_scannable() {
+        let _guard = crate::state::test_env_lock();
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        let _ = test_spawn::take();
+        let _ = test_kill::take();
+        if resolve_claude_binary().is_err() {
+            return;
+        }
+        let conn = test_state_conn("cleanup-unconfirmed");
+        let _outcome = test_kill::OutcomeGuard::set(KillOutcome::Undetermined);
+        test_identity_persist::FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = send_user_message(&conn, &config, "sess-cleanup", "go", None, 4000);
+        test_identity_persist::FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(result.is_err(), "the spawn must still be reported failed");
+        assert_eq!(
+            test_kill::take(),
+            vec![0],
+            "the child must still be signalled (test spawn pid = 0)"
+        );
+        let (status, pgid): (String, Option<i64>) = conn
+            .query_row("SELECT status, pgid FROM bridge_turns", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("turn row");
+        assert_eq!(
+            status, "running",
+            "an unproven cleanup stays RUNNING under the failure marker — `stopping` \
+             is the user's word, and `failed` buries survivors forever"
+        );
+        assert_eq!(
+            pgid,
+            Some(0),
+            "and the contract pgid must be written so the recovery loop can probe"
+        );
+    }
+
+    /// A spawn whose EVERY settlement write failed leaves `running` plus a
+    /// bound (already removed) object — deliberately outside the no-pid
+    /// claim. The exhaustion tail marks supervision, and the recovery loop
+    /// settles it ONE TICK later off the object's proven emptiness; the
+    /// six-hour fiat is not the convergence path.
+    #[test]
+    fn an_unsettleable_spawn_converges_through_the_marker() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-ladder-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let _root_guard = crate::state::EnvVarGuard::set("TINYCTB_CGROUP_ROOT", &root);
+        let conn = create_state_db_in_memory().expect("db");
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-1",
+            "sess-ladder",
+            "/tmp/t.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        // The object was created and then removed by the failed spawn's
+        // cleanup: the recorded path points at nothing — which IS proof.
+        let gone = root.join("turn-turn-1");
+        crate::state::record_turn_cgroup(&conn, "turn-1", gone.to_str().expect("utf8"))
+            .expect("bind");
+
+        test_settle_fail::FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _err = settle_failed_turn(&conn, "turn-1", 5000, anyhow::anyhow!("spawn failed"));
+        test_settle_fail::FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let (status, marker): (String, i64) = conn
+            .query_row(
+                "SELECT status, cleanup_pending FROM bridge_turns",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(status, "running", "nothing settled — every write failed");
+        assert_eq!(
+            marker, 2,
+            "but the FAILURE-flavoured marker made it through"
+        );
+
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        crate::daemon::process_bridge_turns(&conn, &config, 7_000).expect("cycle");
+
+        let (status, marker): (String, i64) = conn
+            .query_row(
+                "SELECT status, cleanup_pending FROM bridge_turns",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(
+            status, "failed",
+            "a spawn failure's cleanup settles as FAILED — `stopped` is the user's word"
+        );
+        assert_eq!(marker, 0, "and supervision is released");
+        let receipt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events
+                 WHERE json_extract(payload_json, '$.eventKey') = 'cleanup-settled:turn-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(receipt, 1, "and the receipt says failure, not stop");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Teardown must report what it cannot PROVE empty — the caller
+    /// aborts on any — while clean objects are removed. The stuck object
+    /// is a fake with a hand-written `populated 1`, which is exactly what
+    /// the prober reads.
+    #[test]
+    fn teardown_sweep_reports_what_it_cannot_prove_empty() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-sweeproot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let _root_guard = crate::state::EnvVarGuard::set("TINYCTB_CGROUP_ROOT", &root);
+
+        let clean = root.join("turn-clean");
+        fs::create_dir(&clean).expect("clean");
+        let stuck = root.join("turn-stuck");
+        fs::create_dir(&stuck).expect("stuck");
+        fs::write(stuck.join("cgroup.events"), "populated 1\nfrozen 0\n").expect("events");
+
+        let report = turn_cgroup::sweep_all(Duration::from_millis(50)).expect("sweep runs");
+
+        assert!(
+            report.stubborn.contains(&stuck),
+            "the unprovable object must be REPORTED, not skipped: {report:?}"
+        );
+        // (On this FAKE root the kill probe creates a regular file, which
+        // blocks remove_dir — so under the STRICT contract even the clean
+        // object lands on the report rather than being silently dropped.
+        // Real removal is covered by the real-kernel-object tests.)
+        assert!(
+            report.stubborn.contains(&clean),
+            "an object that could not be removed is reported too: {report:?}"
+        );
+        assert!(
+            stuck.exists(),
+            "the unprovable one is left for the caller to refuse on"
+        );
+        let _ = fs::remove_dir_all(&root);
+
+        // A configured-but-unusable root is an ERROR, never "no objects".
+        let _bad = crate::state::EnvVarGuard::set(
+            "TINYCTB_CGROUP_ROOT",
+            "/nonexistent/definitely-not-a-dir",
+        );
+        assert!(
+            turn_cgroup::sweep_all(Duration::from_millis(10)).is_err(),
+            "a broken root must block the teardown"
+        );
+    }
+
+    /// A database path may only aim `cgroup.kill` after validation: the
+    /// unified-hierarchy prefix, the exact `turn-<id>` name, and no `..` —
+    /// a corrupted row must never kill whatever lives elsewhere.
+    #[test]
+    fn cgroup_paths_from_the_database_are_validated_before_use() {
+        let _guard = crate::state::test_env_lock();
+        let _root =
+            crate::state::EnvVarGuard::set("TINYCTB_CGROUP_ROOT", "/sys/fs/cgroup/user.slice");
+        assert!(turn_cgroup::validated("/sys/fs/cgroup/user.slice/turn-abc", "abc").is_some());
+        assert!(
+            turn_cgroup::validated("/sys/fs/cgroup/user.slice/turn-abc", "other").is_none(),
+            "the name must match exactly this turn"
+        );
+        assert!(
+            turn_cgroup::validated("/sys/fs/cgroup/system.slice/turn-abc", "abc").is_none(),
+            "outside the trusted owner subtree is refused even under the hierarchy"
+        );
+        assert!(
+            turn_cgroup::validated("/tmp/turn-abc", "abc").is_none(),
+            "outside the hierarchy is refused"
+        );
+        assert!(
+            turn_cgroup::validated("/sys/fs/cgroup/user.slice/../etc/turn-abc", "abc").is_none(),
+            "traversal is refused"
+        );
+        assert!(
+            turn_cgroup::validated("/sys/fs/cgroup/user.slice", "abc").is_none(),
+            "a non-turn directory is refused"
+        );
+    }
+
+    /// The primitive itself, on a real kernel object: create, membership
+    /// via the same fork-time entry the spawn uses, atomic subtree kill of
+    /// a TERM-proof member, emptiness proof, removal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_turn_cgroup_kills_and_proves_the_whole_tree() {
+        // Serialised: `owner_root` reads the overridable env var.
+        let _guard = crate::state::test_env_lock();
+        let turn_id = format!("cgprim-{}", std::process::id());
+        let Some(dir) = turn_cgroup::create(&turn_id) else {
+            eprintln!("host cannot provide a cgroup subtree; skipping");
+            return;
+        };
+        assert_eq!(
+            turn_cgroup::populated(&dir),
+            Some(false),
+            "a fresh object is empty"
+        );
+
+        // A TERM-ignoring member: only the subtree KILL can end it.
+        let procs = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("cgroup.procs"))
+            .expect("open cgroup.procs");
+        let mut member = {
+            use std::os::unix::io::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            let fd = procs.as_raw_fd();
+            let mut command = std::process::Command::new("sh");
+            command
+                .args(["-c", "trap '' TERM; sleep 300"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            // SAFETY: raw write on an inherited fd.
+            unsafe {
+                command.pre_exec(move || {
+                    let buf = b"0\n";
+                    if libc::write(fd, buf.as_ptr().cast(), buf.len()) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command.spawn().expect("spawn member")
+        };
+        drop(procs);
+        assert_eq!(
+            turn_cgroup::populated(&dir),
+            Some(true),
+            "the member must be inside the object"
+        );
+
+        assert!(turn_cgroup::kill(&dir), "the subtree kill must be accepted");
+        let _ = member.wait();
+        let deadline = std::time::Instant::now();
+        while turn_cgroup::populated(&dir) != Some(false) {
+            assert!(
+                deadline.elapsed() < Duration::from_secs(5),
+                "a killed subtree must read empty"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(turn_cgroup::remove(&dir), "an empty object removes");
+        assert_eq!(
+            turn_cgroup::populated(&dir),
+            Some(false),
+            "and a removed object reads empty forever"
+        );
+    }
+
+    /// The invariant with no exceptions: an unproven group never reaches a
+    /// terminal status. With the stopping write itself sabotaged, the row
+    /// must be left `running` — visible and correctable — not settled as
+    /// `failed`, which would bury the possible survivors all over again.
+    #[test]
+    fn a_cleanup_that_cannot_even_mark_stopping_never_buries_the_turn() {
+        let _guard = crate::state::test_env_lock();
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        let _ = test_spawn::take();
+        let _ = test_kill::take();
+        if resolve_claude_binary().is_err() {
+            return;
+        }
+        let conn = test_state_conn("cleanup-noterminal");
+        conn.execute_batch(
+            "CREATE TRIGGER stopping_broken BEFORE UPDATE OF status ON bridge_turns
+             WHEN NEW.status = 'stopping'
+             BEGIN SELECT RAISE(ABORT, 'stopping broken'); END;",
+        )
+        .expect("trigger");
+        let _outcome = test_kill::OutcomeGuard::set(KillOutcome::Undetermined);
+        test_identity_persist::FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = send_user_message(&conn, &config, "sess-noterm", "go", None, 4000);
+        test_identity_persist::FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(result.is_err(), "the spawn must still be reported failed");
+        let row = |conn: &rusqlite::Connection| -> (String, i64) {
+            conn.query_row(
+                "SELECT status, cleanup_pending FROM bridge_turns",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("turn row")
+        };
+        let (status, marker) = row(&conn);
+        assert_eq!(
+            status, "running",
+            "no proof of an empty group and no stopping write → NO terminal status"
+        );
+        assert_eq!(marker, 2, "the durable failure-cleanup marker must be set");
+
+        // The review's counterexample continued: 10 seconds later the
+        // daemon's no-pid crash claim used to bury exactly this row. The
+        // marker must hold it open — same status, still supervised.
+        crate::daemon::process_bridge_turns(&conn, &config, 4000 + 10_001).expect("daemon cycle");
+        let (status, marker) = row(&conn);
+        assert_eq!(
+            status, "running",
+            "the 10-second no-evidence claim must NOT bury a supervised group"
+        );
+        assert_eq!(marker, 2, "and supervision must continue");
+    }
+
+    /// The review's worst case: BOTH recovery writes fail, the database
+    /// then recovers, and 10 seconds pass. The debt recorded at
+    /// REGISTRATION — before anything could fail — must still hold the
+    /// no-pid claim off.
+    #[test]
+    fn a_recovered_database_still_cannot_bury_the_debtor() {
+        let _guard = crate::state::test_env_lock();
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        let _ = test_spawn::take();
+        let _ = test_kill::take();
+        if resolve_claude_binary().is_err() {
+            return;
+        }
+        let conn = test_state_conn("db-recovers");
+        conn.execute_batch(
+            "CREATE TRIGGER stopping_broken BEFORE UPDATE OF status ON bridge_turns
+             WHEN NEW.status = 'stopping'
+             BEGIN SELECT RAISE(ABORT, 'stopping broken'); END;
+             CREATE TRIGGER marker_broken BEFORE UPDATE OF cleanup_pending ON bridge_turns
+             BEGIN SELECT RAISE(ABORT, 'marker broken'); END;",
+        )
+        .expect("triggers");
+        let _outcome = test_kill::OutcomeGuard::set(KillOutcome::Undetermined);
+        test_identity_persist::FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = send_user_message(&conn, &config, "sess-recover", "go", None, 4000);
+        test_identity_persist::FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(result.is_err(), "the spawn must be reported failed");
+
+        // The database "recovers"...
+        conn.execute_batch("DROP TRIGGER stopping_broken; DROP TRIGGER marker_broken;")
+            .expect("drop triggers");
+        // ...and 10 seconds later the no-pid claim comes around.
+        crate::daemon::process_bridge_turns(&conn, &config, 4000 + 10_001).expect("cycle");
+
+        let (status, marker): (String, i64) = conn
+            .query_row(
+                "SELECT status, cleanup_pending FROM bridge_turns",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(
+            status, "running",
+            "the birth debt must hold the no-evidence claim off even after recovery"
+        );
+        assert_eq!(
+            marker, 1,
+            "the debt was recorded at registration, not best-effort"
+        );
+    }
+
+    /// A `/stop` that wins the race before the identity lands leaves a
+    /// `stopping` row with nothing to probe. The unwinding must patch the
+    /// FULL identity in whatever the status says — under both cleanup
+    /// verdicts — and a REOPENED database must still hold everything a
+    /// restart-path re-kill needs (ticks + boot id, not just pid/pgid).
+    #[test]
+    fn unwinding_patches_identity_into_a_stopping_row_under_both_verdicts() {
+        let _guard = crate::state::test_env_lock();
+        let path =
+            std::env::temp_dir().join(format!("tinyctb-unwind-identity-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let identity = ProcessIdentity {
+            lstart: None,
+            pgid: Some(4_400),
+            exe: None,
+            start_ticks: Some("777".to_string()),
+            boot_id: Some("boot-x".to_string()),
+        };
+        // Undetermined: the stop intent survives (the group is unproven,
+        // the daemon keeps sweeping). Terminated: the settlement CARRIES
+        // PROOF and overrides the stop — satisfied vacuously, no phantom
+        // `stopping + NULL identity` left behind.
+        for (verdict, expect_status, expect_marker) in [
+            (KillOutcome::Undetermined, "stopping", 2_i64),
+            (KillOutcome::Terminated, "failed", 0_i64),
+        ] {
+            let conn = crate::state::create_state_db(&path).expect("db");
+            conn.execute("DELETE FROM bridge_turns", []).expect("reset");
+            crate::state::register_bridge_turn(
+                &conn,
+                "turn-1",
+                "sess-1",
+                "/tmp/t.log",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                1000,
+            )
+            .expect("register");
+            // The /stop wins the race before the identity write.
+            crate::state::mark_bridge_turn_stopping(&conn, "turn-1", 1500).expect("stop wins");
+
+            let _ = settle_unwound_spawn(
+                &conn,
+                "turn-1",
+                &identity,
+                Some(4_400),
+                verdict,
+                2000,
+                anyhow::anyhow!("identity write failed"),
+            );
+
+            // Reopen: what a restarted daemon would find, with no live handle.
+            drop(conn);
+            let conn = crate::state::create_state_db(&path).expect("reopen");
+            type Row = (
+                String,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+                Option<String>,
+                i64,
+            );
+            let (status, pid, pgid, ticks, boot, marker): Row = conn
+                .query_row(
+                    "SELECT status, pid, pgid, proc_start_ticks, boot_id, cleanup_pending
+                     FROM bridge_turns",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .expect("row");
+            assert_eq!(
+                status, expect_status,
+                "{verdict:?}: unproven keeps the intent; proof settles it vacuously"
+            );
+            assert_eq!(pid, Some(4_400), "{verdict:?}: pid patched");
+            assert_eq!(pgid, Some(4_400), "{verdict:?}: pgid patched");
+            assert_eq!(
+                ticks.as_deref(),
+                Some("777"),
+                "{verdict:?}: ticks patched — a restart-path re-kill is impossible without them"
+            );
+            assert_eq!(
+                boot.as_deref(),
+                Some("boot-x"),
+                "{verdict:?}: boot id patched"
+            );
+            assert_eq!(marker, expect_marker, "{verdict:?}: marker state");
+            let supervised = crate::state::list_supervised_bridge_turns(&conn)
+                .expect("supervised")
+                .iter()
+                .any(|turn| turn.turn_id == "turn-1");
+            assert_eq!(
+                supervised,
+                expect_marker != 0,
+                "{verdict:?}: an unproven group stays visible to the reopened daemon; \
+                 a proven-settled one is history"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The /threads liveness facts: a session with a running turn counts as
     /// headless-active, a settled one does not; a session with no recorded
     /// socket never counts as a live terminal.
     #[test]
     fn liveness_primitives_read_the_actual_state() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let conn = test_state_conn("liveness");
         crate::state::register_bridge_turn(
             &conn,
@@ -3707,7 +5079,7 @@ mod tests {
     /// notified the user about) as successfully started.
     #[test]
     fn identity_persist_refuses_a_turn_the_daemon_already_settled() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let conn = test_state_conn("preempt");
         crate::state::register_bridge_turn(
             &conn,
@@ -3750,7 +5122,7 @@ mod tests {
     /// check flags on its own.
     #[test]
     fn settle_failure_is_reported_not_swallowed() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let config = DaemonConfig {
             version: 1,
             bridge_command: "tinyctb".to_string(),
@@ -3804,7 +5176,7 @@ mod tests {
 
     #[test]
     fn headless_reply_spawns_resume_with_permission_mode() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let config = DaemonConfig {
             version: 1,
             bridge_command: "tinyctb".to_string(),
@@ -3853,7 +5225,7 @@ mod tests {
     /// log files must still be unique or the answers get interleaved.
     #[test]
     fn concurrent_replies_same_timestamp_get_unique_turn_ids_and_logs() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let config = DaemonConfig {
             version: 1,
             bridge_command: "tinyctb".to_string(),
@@ -3983,6 +5355,7 @@ mod tests {
             pgid: identity.pgid,
             proc_start_ticks: identity.start_ticks,
             boot_id: identity.boot_id,
+            cgroup_path: None,
         };
         let recognized = verified_restart_identity(&turn, pid);
         // A record without a boot id must fail closed even for the right pid.
@@ -4008,6 +5381,530 @@ mod tests {
     /// Real process-group termination: the main process exits politely on
     /// TERM, a grandchild ignores TERM — the unconditional group KILL must
     /// still sweep it so the whole PGID disappears.
+    /// The restart path judges by OBSERVATION, not by a signal's exit code:
+    /// `kill` returns ESRCH for a target that is already gone (success, not
+    /// failure) and returns success for one that has not exited yet. A pid
+    /// with no `/proc` entry and an empty group is provably over.
+    ///
+    /// Linux-only: every judgement here comes from `/proc`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restart_termination_of_a_vanished_group_is_provably_over() {
+        // A pid that cannot exist, with ticks that therefore never match.
+        // Nothing can be proven about a group that was never there, and the
+        // honest answer is Undetermined rather than "terminated".
+        let outcome = terminate_verified_group(4_294_000_000, 4_294_000_000, "999999");
+        assert_eq!(
+            outcome,
+            KillOutcome::Undetermined,
+            "an out-of-range group id cannot be proven empty — Undetermined, not stopped"
+        );
+    }
+
+    /// A leader that exited politely while a grandchild ignores TERM: the
+    /// UNREAPED leader still anchors the group id, so the group KILL is
+    /// provably aimed at the original group — and it is the only thing that
+    /// ever sweeps that grandchild through the restart path. Refusing to
+    /// signal over a zombie leader left exactly this shape running
+    /// forever. The test HOLDS the leader unreaped, so the anchor is
+    /// guaranteed for the whole call; no reaper race decides the verdict.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_anchored_zombie_leader_still_gets_its_group_swept() {
+        use std::os::unix::process::CommandExt as _;
+        let dir = std::env::temp_dir().join(format!("tinyctb-anchor-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let pid_file = dir.join("grandchild.pid");
+        // The leader spawns a TERM-ignoring grandchild and exits at once.
+        // Null stdio, or the surviving grandchild holds the test harness's
+        // captured output pipe open for its whole sleep — a red run then
+        // reads as a hang instead of a failure.
+        let mut leader = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "sh -c 'trap \"\" TERM; echo $$ > {}; sleep 300' & exit 0",
+                    pid_file.display()
+                ),
+            ])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn leader");
+        let leader_pid = leader.id();
+        // Readable for zombies too — the entry stays until WE reap.
+        let ticks = process_start_ticks(leader_pid).expect("leader ticks");
+        let deadline = std::time::Instant::now();
+        let grandchild: u32 = loop {
+            if let Some(pid) = fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|raw| raw.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(
+                deadline.elapsed() < Duration::from_secs(5),
+                "the grandchild must announce itself"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // Dead-or-gone probe that also accepts an unreaped zombie: if the
+        // orphan lands under a subreaper that never waits, the entry stays —
+        // as a zombie, which is just as dead.
+        let swept = |pid: u32| match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .is_some_and(|state| matches!(state, "Z" | "X" | "x")),
+        };
+        assert!(
+            !swept(grandchild),
+            "the grandchild must be running before the kill"
+        );
+
+        let outcome = terminate_verified_group(leader_pid, leader_pid, &ticks);
+
+        // It ignored TERM, so only the group KILL can have removed it.
+        let deadline = std::time::Instant::now();
+        while !swept(grandchild) {
+            assert!(
+                deadline.elapsed() < Duration::from_secs(5),
+                "the TERM-ignoring grandchild must be swept by the group KILL"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // With the leader held unreaped the group can never read empty, and
+        // claiming "terminated" without that proof is the exact bug class
+        // this module exists to prevent.
+        assert_eq!(
+            outcome,
+            KillOutcome::Undetermined,
+            "an unreaped leader keeps the group unproven"
+        );
+        let _ = leader.wait();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The production shape that used to jam forever: through the restart
+    /// path nothing pins the anchor — init reaps the leader the moment it
+    /// dies — while a grandchild in the same group ignores TERM. A KILL
+    /// delayed behind a grace window found the anchor gone, refused, and
+    /// left the turn `stopping` with the grandchild running. Sweeping the
+    /// whole group while the anchor is verified must complete the stop.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restart_termination_completes_despite_a_reaped_leader() {
+        use std::os::unix::process::CommandExt as _;
+        let dir = std::env::temp_dir().join(format!("tinyctb-reaped-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let pid_file = dir.join("grandchild.pid");
+        // The leader stays alive (plain sleep tail — no TERM trap) while its
+        // grandchild ignores TERM; a standby reaper plays init's part and
+        // collects the leader the instant it dies.
+        let child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "sh -c 'trap \"\" TERM; echo $$ > {}; sleep 300' & exec sleep 300",
+                    pid_file.display()
+                ),
+            ])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn leader");
+        let pid = child.id();
+        let ticks = process_start_ticks(pid).expect("leader ticks");
+        let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+            let _ = reaped_tx.send(());
+        });
+        let deadline = std::time::Instant::now();
+        while !pid_file.exists() {
+            assert!(
+                deadline.elapsed() < Duration::from_secs(5),
+                "the grandchild must announce itself"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let outcome = terminate_verified_group(pid, pid, &ticks);
+
+        assert!(
+            reaped_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the standby reaper must have collected the leader"
+        );
+        assert_eq!(
+            outcome,
+            KillOutcome::Terminated,
+            "a reaped leader plus a TERM-ignoring grandchild must still be a COMPLETED stop"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The real shape: a live process in its own group, killed through the
+    /// restart path, confirmed by observation rather than by exit codes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restart_termination_confirms_a_real_process_died() {
+        use std::os::unix::process::CommandExt as _;
+        // Its OWN process group, like a real headless turn.
+        let child = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn victim");
+        let pid = child.id();
+        let ticks = process_start_ticks(pid).expect("victim must be observable");
+
+        // Something must REAP it, or the zombie keeps the group non-empty
+        // and killpg keeps answering "exists". In production that is the
+        // daemon's own reaper, or init after a restart; here it is a thread.
+        // Detached, with a channel timeout: a join would hang the whole
+        // suite if the kill ever failed to land, where a bounded wait fails
+        // THIS test instead.
+        let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+            let _ = reaped_tx.send(());
+        });
+
+        let outcome = terminate_verified_group(pid, pid, &ticks);
+        assert!(
+            reaped_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the reaper must have collected the victim"
+        );
+        assert_eq!(
+            outcome,
+            KillOutcome::Terminated,
+            "a process that really dies and is reaped must be reported as terminated"
+        );
+    }
+
+    /// Every branch of the parse, including the ones a real `/proc` entry
+    /// cannot be coaxed into producing. A malformed or truncated entry is
+    /// UNKNOWN, never "ended" — the difference is whether a still-running
+    /// turn gets recorded as stopped and then vanishes from every scan.
+    #[test]
+    fn liveness_parsing_separates_unknown_from_ended() {
+        // Field 3 is state, field 22 overall is starttime — i.e. index 18
+        // after the state token.
+        let stat = |state: &str, ticks: &str| {
+            let filler = std::iter::repeat("0")
+                .take(18)
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("1234 (claude) {state} {filler} {ticks} rest")
+        };
+        assert_eq!(
+            liveness_from_stat(&stat("S", "555"), "555"),
+            Liveness::Alive
+        );
+        assert_eq!(
+            liveness_from_stat(&stat("S", "777"), "555"),
+            Liveness::Ended,
+            "different ticks mean the pid was recycled"
+        );
+        assert_eq!(
+            liveness_from_stat(&stat("Z", "555"), "555"),
+            Liveness::Ended,
+            "a zombie is dead, just not reaped"
+        );
+        assert_eq!(
+            liveness_from_stat("garbage with no paren", "555"),
+            Liveness::Unknown,
+            "an unparseable entry proves nothing"
+        );
+        assert_eq!(
+            liveness_from_stat("1234 (claude) S 1 2 3", "555"),
+            Liveness::Unknown,
+            "a truncated entry proves nothing either"
+        );
+    }
+
+    /// The group probe's contract. `ESRCH` is the ONLY answer that means
+    /// empty: `EPERM` says the group exists but belongs to someone else —
+    /// exactly a descendant that dropped privileges — and reading that as
+    /// "gone" is how a live turn gets recorded as stopped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn group_probe_only_calls_esrch_empty() {
+        use std::os::unix::process::CommandExt as _;
+        let mut member = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn member");
+        let pgid = member.id();
+        assert_eq!(group_liveness(pgid), Liveness::Alive);
+        let _ = member.kill();
+        let _ = member.wait();
+        assert_eq!(
+            group_liveness(pgid),
+            Liveness::Ended,
+            "once reaped, killpg reports ESRCH and the group is genuinely empty"
+        );
+        // pgid 0 means "my own group" to killpg — never a question we can
+        // answer about someone else's turn.
+        assert_eq!(group_liveness(0), Liveness::Unknown);
+    }
+
+    /// The errno mapping, which is where the dangerous case lives. `ESRCH`
+    /// is the ONLY answer meaning empty; `EPERM` says the group exists and
+    /// merely belongs to someone else — the shape of a descendant that
+    /// dropped privileges, and reading it as gone is how a turn that is
+    /// still working gets recorded as stopped. (This host answers 0 even for
+    /// init's group, so the branch cannot be produced with a real process.)
+    #[test]
+    fn killpg_errno_mapping_only_calls_esrch_empty() {
+        assert_eq!(liveness_from_killpg(0, None), Liveness::Alive);
+        assert_eq!(
+            liveness_from_killpg(-1, Some(libc::ESRCH)),
+            Liveness::Ended,
+            "no such group is the one and only proof of emptiness"
+        );
+        assert_eq!(
+            liveness_from_killpg(-1, Some(libc::EPERM)),
+            Liveness::Alive,
+            "a group we may not signal EXISTS — never read that as empty"
+        );
+        assert_eq!(
+            liveness_from_killpg(-1, Some(libc::EINVAL)),
+            Liveness::Unknown
+        );
+        assert_eq!(liveness_from_killpg(-1, None), Liveness::Unknown);
+    }
+
+    /// The forced-verdict seam drives the production entry point, so each
+    /// verdict's handling is exercised rather than assumed.
+    #[test]
+    fn injected_group_verdicts_reach_the_production_probe() {
+        for verdict in [Liveness::Alive, Liveness::Ended, Liveness::Unknown] {
+            let _guard = test_group_probe::ProbeGuard::set(verdict);
+            assert_eq!(group_liveness(4_242), verdict);
+        }
+    }
+
+    /// Without incarnation ticks (macOS has no /proc) a reaped leader's
+    /// group can still be PROBED, and ESRCH is sufficient proof — the pid
+    /// came from our own just-reaped handle and the probe signals nothing.
+    /// Without this arm the turn read Undetermined forever and never
+    /// settled. A live group stays unproven; no pgid proves nothing.
+    #[test]
+    fn a_reaped_leader_without_ticks_confirms_by_group_probe() {
+        let ended = test_group_probe::ProbeGuard::set(Liveness::Ended);
+        assert_eq!(
+            confirm_reaped_leader(4_242, None, Some(4_242)),
+            KillOutcome::Terminated,
+            "an empty group after a reaped leader is a completed stop"
+        );
+        drop(ended);
+        let alive = test_group_probe::ProbeGuard::set(Liveness::Alive);
+        assert_eq!(
+            confirm_reaped_leader(4_242, None, Some(4_242)),
+            KillOutcome::Undetermined,
+            "a populated group stays unproven"
+        );
+        drop(alive);
+        assert_eq!(
+            confirm_reaped_leader(4_242, None, None),
+            KillOutcome::Undetermined,
+            "no pgid proves nothing"
+        );
+    }
+
+    /// The pgid is ASSIGNED, not observed: the spawn puts the child in its
+    /// own group, so pgid == pid by kernel guarantee. An observation (ps)
+    /// can fail — here, for a pid that does not exist — and a NULL pgid is
+    /// the one hole the stopping machinery cannot recover from.
+    #[cfg(unix)]
+    #[test]
+    fn captured_identity_pins_the_pgid_deterministically() {
+        let identity = capture_process_identity(Some(4_150_000));
+        assert_eq!(
+            identity.pgid,
+            Some(4_150_000),
+            "pgid must come from the spawn contract, not from a fallible probe"
+        );
+    }
+
+    /// A spawn without the identity the stopping machinery keys on must be
+    /// refused: a persisted NULL pgid probes Unknown forever (the turn can
+    /// never settle once stopped), and on Linux missing ticks or boot id
+    /// strands every restart-path kill.
+    #[test]
+    fn spawn_identity_must_be_complete_for_this_platform() {
+        let complete = ProcessIdentity {
+            lstart: None,
+            pgid: Some(1_234),
+            exe: None,
+            start_ticks: Some("555".to_string()),
+            boot_id: Some("boot".to_string()),
+        };
+        assert_eq!(incomplete_spawn_identity(&complete), None);
+        let mut no_pgid = complete.clone();
+        no_pgid.pgid = None;
+        assert!(
+            incomplete_spawn_identity(&no_pgid).is_some(),
+            "pgid is mandatory on every platform"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let mut no_ticks = complete.clone();
+            no_ticks.start_ticks = None;
+            assert!(
+                incomplete_spawn_identity(&no_ticks).is_some(),
+                "Linux requires starttime ticks"
+            );
+            let mut no_boot = complete;
+            no_boot.boot_id = None;
+            assert!(
+                incomplete_spawn_identity(&no_boot).is_some(),
+                "Linux requires the boot id"
+            );
+        }
+    }
+
+    /// A live leader with an empty group, or a dead leader with a live one,
+    /// are BOTH "not proven stopped". Requiring only the leader let a turn
+    /// be settled while a descendant kept doing its work.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confirmation_requires_both_the_leader_and_the_group() {
+        use std::os::unix::process::CommandExt as _;
+        let mut member = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn member");
+        let pgid = member.id();
+
+        // Leader gone (a pid that cannot exist), group still populated.
+        let outcome = confirm_group_gone(
+            4_294_000_000,
+            pgid,
+            "irrelevant",
+            Duration::from_millis(200),
+        );
+        let _ = member.kill();
+        let _ = member.wait();
+        assert_eq!(
+            outcome,
+            KillOutcome::Undetermined,
+            "a live group member means the turn is not stopped, whatever the leader did"
+        );
+    }
+
+    /// A live process must never read as ended, and a pid whose ticks no
+    /// longer match must never read as alive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn liveness_distinguishes_alive_ended_and_recycled() {
+        let mine = std::process::id();
+        let ticks = process_start_ticks(mine).expect("own ticks");
+        assert_eq!(incarnation_liveness(mine, &ticks), Liveness::Alive);
+        assert_eq!(
+            incarnation_liveness(mine, "0"),
+            Liveness::Ended,
+            "different ticks mean the pid was recycled — our incarnation is over"
+        );
+        assert_eq!(
+            incarnation_liveness(4_294_000_000, &ticks),
+            Liveness::Ended,
+            "a pid with no entry is gone"
+        );
+        // Our REAL process group (not our pid — a test binary is rarely a
+        // group leader) must read as populated.
+        let own_pgid = fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')
+                    // ppid, pgrp, session… — pgrp is the second after state,
+                    // i.e. index 2 counting the state token itself.
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(2))
+                    .and_then(|value| value.parse::<u32>().ok())
+            })
+            .expect("own pgid");
+        assert_eq!(
+            group_liveness(own_pgid),
+            Liveness::Alive,
+            "our own group is certainly not empty"
+        );
+        // NOTE: a pgid outside the kernel's pid range answers EINVAL, not
+        // ESRCH — "that is not a valid group" is ignorance, not emptiness.
+        // Emptiness is proven with a real group in `group_probe_only_calls_esrch_empty`.
+        assert_eq!(
+            group_liveness(4_294_000_000),
+            Liveness::Unknown,
+            "an out-of-range group id proves nothing either way"
+        );
+    }
+
+    /// The grace probe must observe the leader's exit WITHOUT reaping it:
+    /// unreaped, the leader keeps its pid — and the group id — reserved, so
+    /// the unconditional group KILL that follows provably hits the original
+    /// group. A probe that reaps (`try_wait`) frees the number first and
+    /// hands the KILL to whoever inherits it.
+    ///
+    /// The discriminating evidence is the `/proc` entry, NOT the `Child`
+    /// handle: `try_wait` caches a consumed exit status, so a probe that
+    /// wrongly reaped would still answer politely through the handle — but
+    /// it cannot put the zombie's `/proc` entry back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_grace_probe_detects_exit_without_reaping() {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn victim");
+        assert!(
+            !leader_exited(&mut child),
+            "a live leader has not exited yet"
+        );
+        child.kill().expect("kill victim");
+        let started = std::time::Instant::now();
+        while !leader_exited(&mut child) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the exit must become observable"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let stat = fs::read_to_string(format!("/proc/{}/stat", child.id()))
+            .expect("an unreaped leader must keep its /proc entry — the probe must not reap");
+        assert!(
+            stat.rsplit_once(')')
+                .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+                .unwrap_or(false),
+            "the observed exit must still be an unreaped zombie: {stat}"
+        );
+        let _ = child.wait();
+    }
+
     #[test]
     #[cfg(unix)]
     fn terminate_process_group_sweeps_term_ignoring_grandchildren() {
@@ -4056,7 +5953,7 @@ mod tests {
     /// which is how the bridge learns where a live session listens.
     #[test]
     fn hook_event_records_the_sessions_messaging_socket() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let temp = TempDirGuard::new("hook-socket-capture");
         std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
         std::env::set_var(
@@ -4197,7 +6094,7 @@ mod tests {
     /// Telegram even with away off — the user asked from their phone.
     #[test]
     fn injected_reply_answer_is_pushed_even_when_not_away() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let temp = TempDirGuard::new("injected-answer-push");
         std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
         let projects_root = temp.path.join("projects");
@@ -4277,7 +6174,7 @@ mod tests {
     /// that postdates the injection can settle it.
     #[test]
     fn older_completion_cannot_claim_a_later_injection() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let temp = TempDirGuard::new("injection-ordering");
         std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
         let projects_root = temp.path.join("projects");
@@ -4354,7 +6251,7 @@ mod tests {
     /// otherwise it forks the session instead of being injected.
     #[test]
     fn socket_mapping_is_available_before_the_spool_is_consumed() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let temp = TempDirGuard::new("socket-peek-order");
         std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
         std::env::set_var(
@@ -4384,7 +6281,7 @@ mod tests {
 
     #[test]
     fn headless_new_session_generates_session_id() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let config = DaemonConfig {
             version: 1,
             bridge_command: "tinyctb".to_string(),

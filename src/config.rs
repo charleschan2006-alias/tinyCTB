@@ -283,9 +283,8 @@ pub(crate) fn resolve_telegram_bot_token(explicit: Option<&str>) -> Result<Strin
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
 
-    fn config_test_lock() -> &'static Mutex<()> {
+    fn config_test_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::state::test_env_lock()
     }
 
@@ -362,7 +361,7 @@ mod tests {
 
     #[test]
     fn load_daemon_config_defaults_claude_config() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = config_test_lock();
         let _state = TempConfigDir::new("defaults");
         write_daemon_config(&DaemonConfig {
             version: 1,
@@ -384,7 +383,7 @@ mod tests {
 
     #[test]
     fn load_daemon_config_rejects_invalid_permission_mode() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = config_test_lock();
         let _state = TempConfigDir::new("bad-permission-mode");
         write_daemon_config(&DaemonConfig {
             version: 1,

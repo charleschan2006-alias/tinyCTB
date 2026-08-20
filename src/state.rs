@@ -495,11 +495,19 @@ pub(crate) fn prune_state_logs(conn: &Connection, now: u64) -> Result<usize> {
         "DELETE FROM dialog_messages WHERE created_at < ?1",
         params![sql_cutoff],
     )?;
+    // A stop operation only matters while its Telegram update could still be
+    // redelivered — measured in minutes; a month is generous.
+    let stop_ops = conn.execute(
+        "DELETE FROM stop_operations WHERE created_at < ?1",
+        params![sql_cutoff],
+    )?;
     // Settled turns are history; running rows are load-bearing (liveness,
     // crash detection) and are never pruned regardless of age.
     let turns = conn.execute(
         "DELETE FROM bridge_turns
-         WHERE status != 'running' AND COALESCE(completed_at, started_at) < ?1",
+         WHERE status NOT IN ('running', 'stopping')
+           AND cleanup_pending = 0
+           AND COALESCE(completed_at, started_at) < ?1",
         params![sql_cutoff],
     )?;
     // Settled or long-expired prompts are history too — /threads scans these
@@ -559,6 +567,7 @@ pub(crate) fn prune_state_logs(conn: &Connection, now: u64) -> Result<usize> {
         + actions
         + injections
         + dialogs
+        + stop_ops
         + turns
         + approvals
         + questions
@@ -764,8 +773,29 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
           proc_start_ticks TEXT,
           boot_id TEXT
         );
+        -- One row per /stop COMMAND (keyed by its Telegram message), holding
+        -- its FIRST interpretation — the resolved turns, or the terminal
+        -- reply of an early exit (empty, ambiguous, too short). A
+        -- redelivered update replays against this record instead of
+        -- reinterpreting the command over whatever happens to be running by
+        -- then: nothing-to-stop must never become stop-everything just
+        -- because new turns started before the redelivery.
+        CREATE TABLE IF NOT EXISTS stop_operations (
+          operation_id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL DEFAULT 'turns',
+          turns_json TEXT NOT NULL,
+          reply TEXT,
+          created_at INTEGER NOT NULL
+        );
         ",
     )?;
+    ensure_column(
+        conn,
+        "stop_operations",
+        "kind",
+        "TEXT NOT NULL DEFAULT 'turns'",
+    )?;
+    ensure_column(conn, "stop_operations", "reply", "TEXT")?;
     ensure_column(
         conn,
         "threads_cache",
@@ -791,6 +821,7 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(conn, "pending_approvals", "headless", "INTEGER")?;
+    ensure_column(conn, "pending_approvals", "turn_id", "TEXT")?;
     ensure_column(conn, "telegram_callback_routes", "question_id", "TEXT")?;
     ensure_column(conn, "telegram_callback_routes", "answer", "TEXT")?;
     ensure_column(
@@ -809,11 +840,39 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "bridge_turns", "exited", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "bridge_turns", "exit_code", "INTEGER")?;
     migrate_live_injections(conn)?;
+    backfill_stop_receipt_fields(conn)?;
     ensure_column(conn, "bridge_turns", "proc_start", "TEXT")?;
     ensure_column(conn, "bridge_turns", "proc_exe", "TEXT")?;
     ensure_column(conn, "bridge_turns", "pgid", "INTEGER")?;
     ensure_column(conn, "bridge_turns", "proc_start_ticks", "TEXT")?;
     ensure_column(conn, "bridge_turns", "boot_id", "TEXT")?;
+    // Re-kill backoff for `stopping` recovery: each attempt can hold the
+    // daemon loop for ~2s of confirmation, so attempts are spaced out.
+    ensure_column(
+        conn,
+        "bridge_turns",
+        "stop_attempts",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "bridge_turns",
+        "last_stop_attempt_at",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // Supervision marker: this turn's process group is UNPROVEN-empty and
+    // must keep being probed WHATEVER the status column says. Deliberately
+    // its own column: it is written exactly when the status transition
+    // itself is what keeps failing.
+    ensure_column(
+        conn,
+        "bridge_turns",
+        "cleanup_pending",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // cgroup regime (v0.2.5): the turn's kernel-object ownership. NULL =
+    // legacy killpg regime.
+    ensure_column(conn, "bridge_turns", "cgroup_path", "TEXT")?;
     ensure_column(conn, "telegram_inbound_log", "thread_id", "TEXT")?;
     ensure_column(conn, "telegram_inbound_log", "route_message_id", "INTEGER")?;
     ensure_column(conn, "telegram_inbound_log", "result_action", "TEXT")?;
@@ -843,6 +902,44 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
 /// an older completion cannot claim a newer one. `CREATE TABLE IF NOT
 /// EXISTS` leaves an already-deployed table untouched, so rebuild it here —
 /// otherwise every query fails with "no such column" on an upgraded install.
+/// Interim (unreleased) builds enqueued stop receipts before the structured
+/// `stopTurn`/`stopPhase` fields existed, and the terminal withdrawal
+/// matches on those fields EXACTLY — an unlabelled row would dodge it
+/// forever. Backfilled here once, parsed from the RIGHT of the key (the
+/// invocation id contains ':' itself, the trailing turn and phase do not).
+/// Released versions never wrote such rows; the LIKE pattern is a literal
+/// prefix, no interpolation.
+fn backfill_stop_receipt_fields(conn: &Connection) -> Result<()> {
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT event_id, json_extract(payload_json, '$.eventKey')
+             FROM outbound_events
+             WHERE json_valid(payload_json)
+               AND json_extract(payload_json, '$.eventKey') LIKE 'stop-summary:%'
+               AND json_extract(payload_json, '$.stopTurn') IS NULL",
+        )?;
+        let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (event_id, key) in rows {
+        let mut parts = key.rsplitn(3, ':');
+        let (Some(phase), Some(turn)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if !matches!(phase, "requested" | "outcome" | "final") {
+            // An even older, phase-less key shape: nothing safe to infer.
+            continue;
+        }
+        conn.execute(
+            "UPDATE outbound_events
+             SET payload_json = json_set(payload_json, '$.stopTurn', ?2, '$.stopPhase', ?3)
+             WHERE event_id = ?1",
+            params![event_id, turn, phase],
+        )?;
+    }
+    Ok(())
+}
+
 fn migrate_live_injections(conn: &Connection) -> Result<()> {
     let columns = table_columns(conn, "live_injections")?;
     if columns.is_empty() || columns.iter().any(|column| column == "claimed_at") {
@@ -935,10 +1032,51 @@ pub(crate) fn live_backend_status_path() -> Result<PathBuf> {
     Ok(state_dir_path()?.join("live-backend.json"))
 }
 
+/// Serialises tests that touch process-wide state (env vars, config paths).
+/// Poison is deliberately recovered: the lock protects no invariant of its
+/// own, so a test that panics while holding it must produce ONE red test —
+/// not a cascade of `PoisonError` failures in every later test that locks.
 #[cfg(test)]
-pub(crate) fn test_env_lock() -> &'static Mutex<()> {
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Set (or clear) one environment variable, restoring whatever was there
+/// before on drop. Panic-safe where a manual save/restore is not: an assert
+/// firing between the mutation and the restore must not leak the rewritten
+/// variable into every later test that shares it.
+#[cfg(test)]
+pub(crate) struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl EnvVarGuard {
+    pub(crate) fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        EnvVarGuard { key, previous }
+    }
+
+    pub(crate) fn clear(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        EnvVarGuard { key, previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(previous) => std::env::set_var(self.key, previous),
+            None => std::env::remove_var(self.key),
+        }
+    }
 }
 
 pub(crate) fn get_setting_number(conn: &Connection, key: &str) -> Result<Option<u64>> {
@@ -1856,6 +1994,10 @@ pub(crate) struct BridgeTurn {
     pub(crate) pgid: Option<u32>,
     pub(crate) proc_start_ticks: Option<String>,
     pub(crate) boot_id: Option<String>,
+    /// cgroup regime: the turn's own cgroup directory, created BEFORE the
+    /// spawn. Killing and emptiness-proof go through it; NULL rows use the
+    /// legacy killpg machinery.
+    pub(crate) cgroup_path: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1872,9 +2014,14 @@ pub(crate) fn register_bridge_turn(
     boot_id: Option<&str>,
     now: u64,
 ) -> Result<()> {
+    // `cleanup_pending`: a row registered WITHOUT a pid carries the cleanup
+    // debt from birth — the successful identity write is what pays it off.
+    // Pre-positioned here because a debt recorded only after a write
+    // failure is a debt a failing database can refuse to record.
     conn.execute(
-        "INSERT OR REPLACE INTO bridge_turns(turn_id, thread_id, log_path, pid, started_at, status, completed_at, exited, exit_code, proc_start, proc_exe, pgid, proc_start_ticks, boot_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'running', NULL, 0, NULL, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT OR REPLACE INTO bridge_turns(turn_id, thread_id, log_path, pid, started_at, status, completed_at, exited, exit_code, proc_start, proc_exe, pgid, proc_start_ticks, boot_id, cleanup_pending)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'running', NULL, 0, NULL, ?6, ?7, ?8, ?9, ?10,
+                 CASE WHEN ?4 IS NULL THEN 1 ELSE 0 END)",
         params![
             turn_id,
             thread_id,
@@ -1924,12 +2071,36 @@ pub(crate) fn threads_with_pending_terminal_prompts(
     Ok(result)
 }
 
+/// Turns the daemon still owns: `running`, plus `stopping` — a turn whose
+/// kill was requested but never confirmed is still out there, and dropping
+/// it from this list is exactly how a live process stops being tracked.
 pub(crate) fn list_running_bridge_turns(conn: &Connection) -> Result<Vec<BridgeTurn>> {
-    let mut stmt = conn.prepare(
+    list_bridge_turns_where(conn, "status IN ('running', 'stopping')")
+}
+
+/// Every turn the daemon must LOOK AT this cycle: the running set plus any
+/// row still carrying the cleanup marker — including rows whose status a
+/// racing writer already made terminal. A supervised group is supervised
+/// whatever the status column says; a `running`-only scan was how a
+/// marked-but-buried row escaped every future probe.
+pub(crate) fn list_supervised_bridge_turns(conn: &Connection) -> Result<Vec<BridgeTurn>> {
+    list_bridge_turns_where(
+        conn,
+        // ANY non-zero marker: the failure flavour (2) supervises exactly
+        // like the stop flavour (1) — a `= 1` filter let a terminal row
+        // with a failure marker slip out of every scan while its object
+        // stayed populated and unprunable.
+        "status IN ('running', 'stopping') OR cleanup_pending != 0",
+    )
+}
+
+fn list_bridge_turns_where(conn: &Connection, filter: &str) -> Result<Vec<BridgeTurn>> {
+    let mut stmt = conn.prepare(&format!(
         "SELECT turn_id, thread_id, log_path, pid, started_at, exited, exit_code,
-                pgid, proc_start_ticks, boot_id
-         FROM bridge_turns WHERE status = 'running' ORDER BY started_at ASC",
-    )?;
+                pgid, proc_start_ticks, boot_id, cgroup_path
+         FROM bridge_turns WHERE {filter}
+         ORDER BY started_at ASC",
+    ))?;
     type BridgeTurnRow = (
         String,
         String,
@@ -1939,6 +2110,7 @@ pub(crate) fn list_running_bridge_turns(conn: &Connection) -> Result<Vec<BridgeT
         i64,
         Option<i64>,
         Option<i64>,
+        Option<String>,
         Option<String>,
         Option<String>,
     );
@@ -1954,6 +2126,7 @@ pub(crate) fn list_running_bridge_turns(conn: &Connection) -> Result<Vec<BridgeT
             row.get(7)?,
             row.get(8)?,
             row.get(9)?,
+            row.get(10)?,
         ))
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -1970,6 +2143,7 @@ pub(crate) fn list_running_bridge_turns(conn: &Connection) -> Result<Vec<BridgeT
                 pgid,
                 proc_start_ticks,
                 boot_id,
+                cgroup_path,
             )| {
                 Ok(BridgeTurn {
                     turn_id,
@@ -1982,22 +2156,25 @@ pub(crate) fn list_running_bridge_turns(conn: &Connection) -> Result<Vec<BridgeT
                     pgid: pgid.and_then(|value| u32::try_from(value).ok()),
                     proc_start_ticks,
                     boot_id,
+                    cgroup_path,
                 })
             },
         )
         .collect()
 }
 
-/// Record that a spawned turn process was reaped by the daemon.
+/// Record that a spawned turn process was reaped by the daemon. Keyed by
+/// TURN ID: a pid key stamped `exited` onto every active row sharing a
+/// recycled pid, and the innocent row was then settled as a crash.
 pub(crate) fn record_bridge_turn_exit(
     conn: &Connection,
-    pid: u32,
+    turn_id: &str,
     exit_code: Option<i32>,
 ) -> Result<()> {
     conn.execute(
         "UPDATE bridge_turns SET exited = 1, exit_code = ?2
-         WHERE pid = ?1 AND status = 'running'",
-        params![i64::from(pid), exit_code],
+         WHERE turn_id = ?1 AND status IN ('running', 'stopping')",
+        params![turn_id, exit_code],
     )?;
     Ok(())
 }
@@ -2013,6 +2190,381 @@ pub(crate) fn record_bridge_turn_exit(
 /// evidence no longer holds (or the turn is no longer running) — the caller
 /// must drop the verdict, not announce it. A re-read instead of a CAS would
 /// leave the same TOCTOU window this exists to close.
+/// A `/stop` command's FIRST interpretation — either the turns it resolved
+/// to, or the terminal reply of an early exit.
+pub(crate) struct StopOperation {
+    pub(crate) kind: String,
+    pub(crate) turn_ids: Vec<String>,
+    pub(crate) reply: Option<String>,
+}
+
+/// Record a `/stop` command's interpretation the FIRST time it is made.
+/// Idempotent by key so a racing re-insert cannot clobber the original.
+pub(crate) fn record_stop_operation(
+    conn: &Connection,
+    operation_id: &str,
+    kind: &str,
+    turn_ids: &[String],
+    reply: Option<&str>,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO stop_operations(operation_id, kind, turns_json, reply, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            operation_id,
+            kind,
+            serde_json::to_string(turn_ids)?,
+            reply,
+            to_sql_i64(now)?
+        ],
+    )?;
+    Ok(())
+}
+
+/// A previously seen `/stop` command's interpretation, or None if this
+/// command id has never been recorded.
+pub(crate) fn stop_operation(
+    conn: &Connection,
+    operation_id: &str,
+) -> Result<Option<StopOperation>> {
+    let row: Option<(String, String, Option<String>)> = conn
+        .query_row(
+            "SELECT kind, turns_json, reply FROM stop_operations WHERE operation_id = ?1",
+            params![operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    match row {
+        Some((kind, turns_json, reply)) => Ok(Some(StopOperation {
+            kind,
+            turn_ids: serde_json::from_str(&turns_json)?,
+            reply,
+        })),
+        None => Ok(None),
+    }
+}
+
+/// Withdraw every UNDELIVERED pre-final stop receipt for this turn
+/// (`requested`/`outcome` phases, any invocation). Ordering rows by
+/// timestamp cannot survive a retry: a `requested` that failed its first
+/// send would retry AFTER the final receipt it causally precedes, telling
+/// the user "正在终止" about a turn already reported stopped. Delivered
+/// rows are history and stay; every invocation's story concludes with the
+/// turn's terminal receipt.
+pub(crate) fn withdraw_undelivered_stop_chatter(
+    conn: &Connection,
+    turn_id: &str,
+    now: u64,
+) -> Result<()> {
+    let stale_cutoff = to_sql_i64(now.saturating_sub(CLAIM_LEASE_MS))?;
+    // Matched on the STRUCTURED payload fields, exactly — parsing the event
+    // key with LIKE made `_`/`%` inside a turn id act as wildcards and
+    // could withdraw another turn's receipts. The same two-step shape as
+    // `cancel_pending_push_inner`: delete what nobody holds, mark what a
+    // live lease still might send.
+    conn.execute(
+        "DELETE FROM outbound_events
+         WHERE delivered_at IS NULL
+           AND status IN ('pending', 'failed')
+           AND (claimed_at IS NULL OR claimed_at <= ?2)
+           AND json_valid(payload_json)
+           AND json_extract(payload_json, '$.stopTurn') = ?1
+           AND json_extract(payload_json, '$.stopPhase') IN ('requested', 'outcome')
+           AND NOT EXISTS (
+             SELECT 1 FROM transport_delivery_log
+             WHERE transport_delivery_log.event_id = outbound_events.event_id
+           )",
+        params![turn_id, stale_cutoff],
+    )?;
+    conn.execute(
+        "UPDATE outbound_events SET cancel_requested = 1
+         WHERE delivered_at IS NULL
+           AND status IN ('pending', 'failed')
+           AND json_valid(payload_json)
+           AND json_extract(payload_json, '$.stopTurn') = ?1
+           AND json_extract(payload_json, '$.stopPhase') IN ('requested', 'outcome')",
+        params![turn_id],
+    )?;
+    Ok(())
+}
+
+/// One turn by id, whatever its status — replay needs to see settled rows.
+pub(crate) fn bridge_turn_by_id(conn: &Connection, turn_id: &str) -> Result<Option<BridgeTurn>> {
+    type Row = (
+        String,
+        String,
+        String,
+        Option<i64>,
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: Option<Row> = conn
+        .query_row(
+            "SELECT turn_id, thread_id, log_path, pid, started_at, exited, exit_code,
+                    pgid, proc_start_ticks, boot_id, cgroup_path
+             FROM bridge_turns WHERE turn_id = ?1",
+            params![turn_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        turn_id,
+        thread_id,
+        log_path,
+        pid,
+        started_at,
+        exited,
+        exit_code,
+        pgid,
+        proc_start_ticks,
+        boot_id,
+        cgroup_path,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    Ok(Some(BridgeTurn {
+        turn_id,
+        thread_id,
+        log_path,
+        pid: pid.and_then(|value| u32::try_from(value).ok()),
+        started_at: from_sql_i64(started_at)?,
+        exited: exited != 0,
+        exit_code: exit_code.and_then(|value| i32::try_from(value).ok()),
+        pgid: pgid.and_then(|value| u32::try_from(value).ok()),
+        proc_start_ticks,
+        boot_id,
+        cgroup_path,
+    }))
+}
+
+/// Re-kill pacing for a `stopping` turn: (attempts so far, when the last
+/// one was made).
+pub(crate) fn stop_attempt_state(conn: &Connection, turn_id: &str) -> Result<(u32, u64)> {
+    let row: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT stop_attempts, last_stop_attempt_at FROM bridge_turns WHERE turn_id = ?1",
+            params![turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (attempts, last) = row.unwrap_or((0, 0));
+    Ok((attempts.max(0) as u32, last.max(0) as u64))
+}
+
+pub(crate) fn record_stop_attempt(conn: &Connection, turn_id: &str, now: u64) -> Result<()> {
+    conn.execute(
+        "UPDATE bridge_turns SET stop_attempts = stop_attempts + 1, last_stop_attempt_at = ?2
+         WHERE turn_id = ?1",
+        params![turn_id, now as i64],
+    )?;
+    Ok(())
+}
+
+/// Durable supervision marker for a group that could not be proven empty
+/// AND whose `stopping` transition would not commit. No status change — a
+/// trigger or constraint on the status column cannot block this — but the
+/// contract identity is written so the probe has something to ask about,
+/// and the owned dialogs close in the same transaction.
+pub(crate) fn mark_cleanup_pending(
+    conn: &Connection,
+    turn_id: &str,
+    pid: Option<u32>,
+    ticks: Option<&str>,
+    boot_id: Option<&str>,
+    now: u64,
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        // `cleanup_pending = 2`: this path is only ever a SPAWN FAILURE's
+        // unwinding — the recovery loop must settle it as `failed`, not
+        // report a stop the user never asked for.
+        "UPDATE bridge_turns
+         SET cleanup_pending = 2, pid = COALESCE(pid, ?2), pgid = COALESCE(pgid, ?2),
+             proc_start_ticks = COALESCE(proc_start_ticks, ?3),
+             boot_id = COALESCE(boot_id, ?4)
+         WHERE turn_id = ?1",
+        params![turn_id, pid.map(i64::from), ticks, boot_id],
+    )?;
+    settle_prompts_for_turn(&tx, turn_id, now)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Active turns with NO ownership object — the explicitly opted-in legacy
+/// regime. Teardown must refuse while any exist: the sweep cannot see
+/// them, and deleting the ledger under them strands the processes.
+pub(crate) fn count_active_legacy_turns(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        // Terminal rows still carrying a supervision marker count too:
+        // their group was never proven empty, and without a cgroup path
+        // the sweep cannot see them either.
+        "SELECT COUNT(*) FROM bridge_turns
+         WHERE (status IN ('running', 'stopping') OR cleanup_pending != 0)
+           AND cgroup_path IS NULL",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+/// Put a turn under the supervised loop's eye: its object (or group) is
+/// not yet proven empty.
+pub(crate) fn set_cleanup_marker(conn: &Connection, turn_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE bridge_turns SET cleanup_pending = 1 WHERE turn_id = ?1",
+        params![turn_id],
+    )?;
+    Ok(())
+}
+
+/// The FAILURE flavour of supervision: the value records WHY the row is
+/// being cleaned, so the recovery loop settles a spawn failure as `failed`
+/// with a failure receipt — never as `stopped`, which is the user's word.
+pub(crate) fn set_failure_cleanup_marker(conn: &Connection, turn_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE bridge_turns SET cleanup_pending = 2 WHERE turn_id = ?1",
+        params![turn_id],
+    )?;
+    Ok(())
+}
+
+/// Settle a supervised (running/stopping) row into the given terminal —
+/// which one is the CALLER's decision, made from the persisted intent.
+pub(crate) fn settle_supervised_turn(
+    conn: &Connection,
+    turn_id: &str,
+    terminal: &str,
+    now: u64,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE bridge_turns SET status = ?2, completed_at = ?3
+         WHERE turn_id = ?1 AND status IN ('running', 'stopping')",
+        params![turn_id, terminal, to_sql_i64(now)?],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Supervision is over: the group was proven empty.
+pub(crate) fn clear_cleanup_pending(conn: &Connection, turn_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE bridge_turns SET cleanup_pending = 0 WHERE turn_id = ?1",
+        params![turn_id],
+    )?;
+    Ok(())
+}
+
+/// Does this turn need the stopping-recovery treatment this cycle — either
+/// an explicit `stopping` status, or the cleanup marker of a group nobody
+/// has proven empty yet?
+pub(crate) fn needs_stop_supervision(conn: &Connection, turn_id: &str) -> Result<bool> {
+    let row: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT status, cleanup_pending FROM bridge_turns WHERE turn_id = ?1",
+            params![turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(matches!(row, Some((status, marker)) if status == "stopping" || marker != 0))
+}
+
+/// Settle a spawn-failure turn AND close everything it owns, atomically.
+/// A `failed` turn leaves the daemon never sweeping it again — published
+/// piecemeal, an approval the turn's first tool call managed to open would
+/// sit answerable on the phone for up to a day.
+pub(crate) fn settle_unwound_turn_failed(conn: &Connection, turn_id: &str, now: u64) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    // This settlement is only reached with PROOF in hand — the group
+    // confirmed empty, or no process ever spawned — which is the one
+    // circumstance allowed to override a `stopping` intent: the stop is
+    // satisfied vacuously. Left unoverridden, a /stop racing a failed
+    // spawn stranded a `stopping` row with NULL identity that probed
+    // `Unknown` forever.
+    let row: Option<(String, String)> = {
+        use rusqlite::OptionalExtension as _;
+        tx.query_row(
+            "SELECT status, thread_id FROM bridge_turns WHERE turn_id = ?1",
+            params![turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+    };
+    tx.execute(
+        "UPDATE bridge_turns
+         SET status = 'failed', completed_at = ?2, cleanup_pending = 0
+         WHERE turn_id = ?1 AND status IN ('running', 'stopping')",
+        params![turn_id, to_sql_i64(now)?],
+    )?;
+    settle_prompts_for_turn(&tx, turn_id, now)?;
+    // A raced /stop may have queued "正在终止" receipts; delivered after
+    // this terminal they would promise progress on a settled turn. The
+    // REPLACEMENT terminal receipt commits in this same transaction — a
+    // withdrawal with no substitute left the user of an interrupted /stop
+    // with no durable answer at all when the daemon crashed before any
+    // later `final` could be written.
+    withdraw_undelivered_stop_chatter(&tx, turn_id, now)?;
+    if let Some((status, thread_id)) = row {
+        if status == "stopping" {
+            let label = crate::telegram::short_thread_id(&thread_id);
+            let event = serde_json::json!({
+                "type": "bridge_notice",
+                "threadId": thread_id,
+                "observedAt": now,
+                "eventKey": format!("stop-settled:{turn_id}"),
+                "message": format!("🧵 {label} — 已停止（清理确认：进程已结束）"),
+            });
+            enqueue_outbound_event(&tx, &event, now, "bridge")?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Record that a turn is being stopped, BEFORE any signal is sent.
+///
+/// The intent has to outlive a crash: without it, a daemon dying between the
+/// kill and the settle leaves a `running` row that the next cycle reads as
+/// an ordinary failure and reports as "exited without producing an answer" —
+/// an error message for something the user chose to do.
+pub(crate) fn mark_bridge_turn_stopping(conn: &Connection, turn_id: &str, now: u64) -> Result<()> {
+    conn.execute(
+        "UPDATE bridge_turns SET status = 'stopping', completed_at = ?2
+         WHERE turn_id = ?1 AND status = 'running'",
+        params![turn_id, to_sql_i64(now)?],
+    )?;
+    Ok(())
+}
+
+/// Promote a turn we proved dead from `stopping` to `stopped`. Returns
+/// whether this call was the one that did it.
+pub(crate) fn settle_stopping_turn(conn: &Connection, turn_id: &str, now: u64) -> Result<bool> {
+    let rows = conn.execute(
+        "UPDATE bridge_turns SET status = 'stopped', completed_at = ?2
+         WHERE turn_id = ?1 AND status IN ('running', 'stopping')",
+        params![turn_id, to_sql_i64(now)?],
+    )?;
+    Ok(rows > 0)
+}
+
 pub(crate) fn claim_bridge_turn_failure(
     conn: &Connection,
     turn_id: &str,
@@ -2021,8 +2573,15 @@ pub(crate) fn claim_bridge_turn_failure(
     pid_still_missing: bool,
 ) -> Result<bool> {
     let sql = if pid_still_missing {
+        // `cleanup_pending = 0`: a row under cleanup supervision is NOT an
+        // unexplained no-pid crash — it is a group nobody has proven empty,
+        // and this no-evidence claim would bury its survivors 10 seconds
+        // after the cleanup path itself refused to. `cgroup_path IS NULL`:
+        // a cgroup-owned turn is never unexplained either — its object can
+        // be PROBED, and burying it would strand live members.
         "UPDATE bridge_turns SET status = ?2, completed_at = ?3
-         WHERE turn_id = ?1 AND status = 'running' AND pid IS NULL"
+         WHERE turn_id = ?1 AND status = 'running' AND pid IS NULL
+           AND cleanup_pending = 0 AND cgroup_path IS NULL"
     } else {
         "UPDATE bridge_turns SET status = ?2, completed_at = ?3
          WHERE turn_id = ?1 AND status = 'running'"
@@ -2038,7 +2597,12 @@ pub(crate) fn mark_bridge_turn_finished(
     now: u64,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE bridge_turns SET status = ?2, completed_at = ?3 WHERE turn_id = ?1",
+        // Never overwrite `stopping`. A turn whose log happened to produce an
+        // answer just before the user stopped it is still a STOPPED turn:
+        // letting `done`/`error` win here would erase the intent and, with
+        // it, the daemon's obligation to keep confirming the process died.
+        "UPDATE bridge_turns SET status = ?2, completed_at = ?3
+         WHERE turn_id = ?1 AND status != 'stopping'",
         params![turn_id, status, to_sql_i64(now)?],
     )?;
     Ok(())
@@ -2070,8 +2634,13 @@ pub(crate) fn create_pending_approval(
     now: u64,
     expires_at: u64,
 ) -> Result<()> {
+    // Plain INSERT on purpose: a duplicate approval id must ERROR, never
+    // silently re-open a decided row with a NULL decision. Publication
+    // handles the legitimate duplicate (an interrupted gate re-run) by
+    // checking first; anything else reaching a collision is a bug worth
+    // hearing about.
     conn.execute(
-        "INSERT OR REPLACE INTO pending_approvals(
+        "INSERT INTO pending_approvals(
             approval_id, thread_id, tool_name, summary, headless, created_at, decision,
             decided_at, expires_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7)",
@@ -2314,6 +2883,75 @@ pub(crate) enum OpenPrompt {
     },
 }
 
+/// cgroup regime: bind the turn to the ownership object created for it —
+/// in the SAME transaction as its registration, so the row never exists
+/// without naming the kernel object that supervises it.
+pub(crate) fn record_turn_cgroup(conn: &Connection, turn_id: &str, path: &str) -> Result<()> {
+    conn.execute(
+        // The birth debt is VOID for a cgroup-owned turn: the ownership
+        // object supervises it from before the process exists, so there is
+        // nothing an identity write still has to secure.
+        "UPDATE bridge_turns SET cgroup_path = ?2, cleanup_pending = 0 WHERE turn_id = ?1",
+        params![turn_id, path],
+    )?;
+    Ok(())
+}
+
+/// Record which bridge turn an approval belongs to.
+///
+/// Kept separate from `create_pending_approval` on purpose: only the
+/// headless gate knows the turn, and threading an extra parameter through a
+/// constructor with eighteen call sites buys nothing but churn.
+pub(crate) fn record_approval_turn_owner(
+    conn: &Connection,
+    approval_id: &str,
+    turn_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_approvals SET turn_id = ?2 WHERE approval_id = ?1",
+        params![approval_id, turn_id],
+    )?;
+    Ok(())
+}
+
+/// Close the approvals a stopped bridge turn owned, withdrawing their queued
+/// buttons in the same breath. Returns how many were closed.
+///
+/// Ownership is by TURN, not by thread. Two things share a thread's
+/// namespace and must not be swept up: an approval belonging to a CONCURRENT
+/// turn of the same session, and questions — `AskUserQuestion` does not
+/// exist in headless mode at all, so a question on this thread came from the
+/// user's own terminal and is none of our business.
+///
+/// A row with no recorded owner FAILS OPEN (left untouched): closing
+/// something we cannot prove belonged to this turn is the worse mistake.
+pub(crate) fn settle_prompts_for_turn(conn: &Connection, turn_id: &str, now: u64) -> Result<usize> {
+    // EVERY approval the turn owns, not just the unsettled ones. An approval
+    // that already timed out on its own may still have an undelivered push
+    // sitting on the retry schedule, and delivering that button after the
+    // turn is gone is exactly the late-dead-button this exists to prevent.
+    // Withdrawing the push and updating the decision are therefore separate
+    // questions, asked separately.
+    let rows: Vec<(String, Option<String>)> = {
+        let mut stmt =
+            conn.prepare("SELECT approval_id, decision FROM pending_approvals WHERE turn_id = ?1")?;
+        let rows = stmt.query_map(params![turn_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut settled = 0usize;
+    for (approval_id, decision) in &rows {
+        if decision.is_none() {
+            // Still open: settle it AND withdraw its push, atomically.
+            settle_expired_and_cancel_push_inner(conn, SettleTarget::Approval(approval_id), now)?;
+            settled += 1;
+        } else {
+            // Already decided; only the queued button is still a hazard.
+            cancel_pending_push_inner(conn, &format!("approval:{approval_id}"), now)?;
+        }
+    }
+    Ok(settled)
+}
+
 /// Every thread's open prompt in two queries (not 2×N). An approval wins
 /// over a question for the same thread — it blocks a tool call mid-flight.
 /// Only unexpired, unanswered rows count: a settled prompt's buttons would
@@ -2529,9 +3167,11 @@ pub(crate) fn record_bridge_turn_spawn(
     boot_id: Option<&str>,
 ) -> Result<usize> {
     let rows = conn.execute(
+        // A successful FULL identity write pays off the birth debt: from
+        // here the ordinary lifecycle owns the turn.
         "UPDATE bridge_turns
          SET pid = ?2, proc_start = ?3, proc_exe = ?4, pgid = ?5,
-             proc_start_ticks = ?6, boot_id = ?7
+             proc_start_ticks = ?6, boot_id = ?7, cleanup_pending = 0
          WHERE turn_id = ?1 AND status = 'running'",
         params![
             turn_id,
@@ -2978,27 +3618,19 @@ pub(crate) enum SettleTarget<'a> {
 /// Cancelling only touches rows that are unclaimed AND carry no transport
 /// record: once delivery has claimed a row it may already be on the wire, so
 /// the honest move is to leave it and let the callback answer "已超时".
-pub(crate) fn settle_expired_and_cancel_push(
+/// Withdraw a queued push identified by its `eventKey`, honouring the claim
+/// and transport-log rules: a row inside a live delivery lease cannot be
+/// deleted (its owner may already be mid-send), and one that already reached
+/// Telegram is left alone. Both cases fall back to recording the intent.
+///
+/// Separate from settling a decision on purpose: an approval that already
+/// timed out still needs its button withdrawn, and asking both questions
+/// together made the second one unreachable.
+pub(crate) fn cancel_pending_push_inner(
     conn: &Connection,
-    target: SettleTarget<'_>,
+    event_key: &str,
     now: u64,
-) -> Result<SettleOutcome> {
-    let tx = conn.unchecked_transaction()?;
-    let (answer, event_key) = match target {
-        SettleTarget::Approval(id) => (
-            expire_or_take_decision(conn, id, now)?,
-            format!("approval:{id}"),
-        ),
-        SettleTarget::Question(id) => (
-            expire_or_take_answer(conn, id, now)?,
-            format!("question:{id}"),
-        ),
-    };
-    if let Some(answer) = answer {
-        // A tap won the race. Keep its push exactly as it is.
-        tx.commit()?;
-        return Ok(SettleOutcome::Answered(answer));
-    }
+) -> Result<()> {
     let stale_cutoff = to_sql_i64(now.saturating_sub(CLAIM_LEASE_MS))?;
     // Withdraw outright what nobody is holding.
     conn.execute(
@@ -3006,6 +3638,7 @@ pub(crate) fn settle_expired_and_cancel_push(
          WHERE delivered_at IS NULL
            AND status IN ('pending', 'failed')
            AND (claimed_at IS NULL OR claimed_at <= ?2)
+           AND json_valid(payload_json)
            AND json_extract(payload_json, '$.eventKey') = ?1
            AND NOT EXISTS (
              SELECT 1 FROM transport_delivery_log
@@ -3022,10 +3655,47 @@ pub(crate) fn settle_expired_and_cancel_push(
         "UPDATE outbound_events SET cancel_requested = 1
          WHERE delivered_at IS NULL
            AND status IN ('pending', 'failed')
+           AND json_valid(payload_json)
            AND json_extract(payload_json, '$.eventKey') = ?1",
         params![event_key],
     )?;
+    Ok(())
+}
+
+pub(crate) fn settle_expired_and_cancel_push(
+    conn: &Connection,
+    target: SettleTarget<'_>,
+    now: u64,
+) -> Result<SettleOutcome> {
+    let tx = conn.unchecked_transaction()?;
+    let outcome = settle_expired_and_cancel_push_inner(conn, target, now)?;
     tx.commit()?;
+    Ok(outcome)
+}
+
+/// The body of `settle_expired_and_cancel_push` WITHOUT its own transaction,
+/// for callers already holding one — SQLite has no nested transactions, so
+/// settling several rows atomically has to drive this directly.
+pub(crate) fn settle_expired_and_cancel_push_inner(
+    conn: &Connection,
+    target: SettleTarget<'_>,
+    now: u64,
+) -> Result<SettleOutcome> {
+    let (answer, event_key) = match target {
+        SettleTarget::Approval(id) => (
+            expire_or_take_decision(conn, id, now)?,
+            format!("approval:{id}"),
+        ),
+        SettleTarget::Question(id) => (
+            expire_or_take_answer(conn, id, now)?,
+            format!("question:{id}"),
+        ),
+    };
+    if let Some(answer) = answer {
+        // A tap won the race. Keep its push exactly as it is.
+        return Ok(SettleOutcome::Answered(answer));
+    }
+    cancel_pending_push_inner(conn, &event_key, now)?;
     Ok(SettleOutcome::Expired)
 }
 
@@ -3320,7 +3990,7 @@ mod tests {
         // away marker: these write it through the shared state dir, and an
         // unlocked writer flipping it mid-run is what made the question-gate
         // tests fail intermittently.
-        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env_guard = crate::state::test_env_lock();
         let conn = create_state_db_in_memory().expect("db");
         let tables = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -3934,33 +4604,38 @@ mod tests {
         assert_eq!(imported[1].id, "app-2");
     }
 
+    /// One failing test must stay ONE failing test: the env lock recovers
+    /// from poison, so a panic while holding it cannot cascade into every
+    /// later test that locks. (The panic printed below is this test's own
+    /// probe thread, not a failure.)
+    #[test]
+    fn a_panicking_lock_holder_does_not_poison_the_suite() {
+        let poisoner = std::thread::spawn(|| {
+            let _guard = test_env_lock();
+            std::panic::panic_any("deliberate poison probe");
+        });
+        assert!(poisoner.join().is_err(), "the probe thread must panic");
+        // Reverting the recovery to `.expect()` turns this acquisition into
+        // the very cascade the recovery exists to prevent.
+        let _guard = test_env_lock();
+    }
+
     #[test]
     fn live_backend_status_path_uses_bridge_state_directory() {
-        let _guard = test_env_lock().lock().expect("test env lock");
+        let _guard = test_env_lock();
         let home =
             std::env::temp_dir().join(format!("tinyctb-live-state-path-{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).expect("create temp home");
-        let previous_home = std::env::var("HOME").ok();
-        let previous_state_dir = std::env::var("TINYCTB_STATE_DIR").ok();
-        std::env::remove_var("TINYCTB_STATE_DIR");
-        std::env::set_var("HOME", &home);
+        // RAII, not manual save/restore: the expect() below must not be able
+        // to leak a rewritten HOME into every later test.
+        let _state_dir = EnvVarGuard::clear("TINYCTB_STATE_DIR");
+        let _home = EnvVarGuard::set("HOME", &home);
 
         let path = live_backend_status_path().expect("live backend status path");
 
-        if let Some(previous_home) = previous_home {
-            std::env::set_var("HOME", previous_home);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        if let Some(previous_state_dir) = previous_state_dir {
-            std::env::set_var("TINYCTB_STATE_DIR", previous_state_dir);
-        } else {
-            std::env::remove_var("TINYCTB_STATE_DIR");
-        }
-        let _ = fs::remove_dir_all(&home);
-
         assert!(path.ends_with(".tinyctb/live-backend.json"));
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -4259,6 +4934,923 @@ mod tests {
     }
 
     /// The contract the gate depends on when it settles itself.
+    /// An approval that already timed out on its own can still have an
+    /// undelivered push on the retry schedule. `/stop` must withdraw that
+    /// too — skipping settled rows meant the button shipped minutes after
+    /// the turn it belonged to was gone.
+    #[test]
+    fn stopping_a_turn_withdraws_buttons_of_already_expired_approvals() {
+        let conn = create_state_db_in_memory().expect("db");
+        for (id, decision) in [("ap-open", None), ("ap-expired", Some("expired"))] {
+            create_pending_approval(&conn, id, "sess", "Bash", "x", true, 1000, 9_000_000_000)
+                .expect("approval");
+            record_approval_turn_owner(&conn, id, "turn-1").expect("owner");
+            if let Some(decision) = decision {
+                conn.execute(
+                    "UPDATE pending_approvals SET decision = ?2 WHERE approval_id = ?1",
+                    params![id, decision],
+                )
+                .expect("settle");
+            }
+            // A push that failed once and is waiting to retry.
+            conn.execute(
+                "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at)
+                 VALUES (?1, 'approval_request', 'sess', ?2, 'failed', 0, 1000)",
+                params![id, json!({"eventKey": format!("approval:{id}")}).to_string()],
+            )
+            .expect("queue");
+        }
+
+        let settled = settle_prompts_for_turn(&conn, "turn-1", 5000).expect("settle turn");
+        assert_eq!(settled, 1, "only the open approval needed a decision");
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM outbound_events", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(
+            left, 0,
+            "both buttons must be withdrawn — an expired approval's queued push \
+             is just as capable of arriving late"
+        );
+    }
+
+    /// One malformed payload must not take the whole cancellation down with
+    /// it. Without the `json_valid` guard, `json_extract` errors and the
+    /// transaction rolls back — after the process was already killed.
+    #[test]
+    fn a_corrupt_payload_does_not_abort_the_cancellation() {
+        let conn = create_state_db_in_memory().expect("db");
+        create_pending_approval(
+            &conn,
+            "ap-1",
+            "sess",
+            "Bash",
+            "x",
+            true,
+            1000,
+            9_000_000_000,
+        )
+        .expect("approval");
+        record_approval_turn_owner(&conn, "ap-1", "turn-1").expect("owner");
+        conn.execute(
+            "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at)
+             VALUES ('evt-mine', 'approval_request', 'sess', ?1, 'pending', 0, 1000)",
+            params![json!({"eventKey": "approval:ap-1"}).to_string()],
+        )
+        .expect("queue mine");
+        conn.execute(
+            "INSERT INTO outbound_events(event_id, event_type, thread_id, payload_json, status, next_attempt_at, created_at)
+             VALUES ('evt-corrupt', 'thread_waiting', 'other', '{not json', 'pending', 0, 1000)",
+            [],
+        )
+        .expect("queue corrupt");
+
+        settle_prompts_for_turn(&conn, "turn-1", 5000).expect("must not fail on a corrupt row");
+
+        let mine: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events WHERE event_id = 'evt-mine'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(mine, 0, "the targeted button must still be withdrawn");
+        let corrupt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events WHERE event_id = 'evt-corrupt'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(corrupt, 1, "and the unrelated row must be left alone");
+    }
+
+    /// Whoever commits first wins, in BOTH orders, and either way no live
+    /// button survives for a turn the user ended — measured through the
+    /// PRODUCTION publication (approval + owner + callback routes + outbox
+    /// button in one transaction), not just the approval row: a stop that
+    /// committed first must find literally nothing to withdraw, and a
+    /// publication that committed first must be swept in full.
+    #[test]
+    fn an_owned_approval_cannot_follow_or_outlive_a_stop() {
+        let register = |conn: &Connection| {
+            register_bridge_turn(
+                conn,
+                "turn-1",
+                "sess",
+                "/tmp/t.log",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                1000,
+            )
+            .expect("register owner");
+        };
+
+        // Order 1: the stop committed first — creation must refuse.
+        let conn = create_state_db_in_memory().expect("db");
+        register(&conn);
+        mark_bridge_turn_stopping(&conn, "turn-1", 1500).expect("intent");
+        let published = crate::approvals::publish_approval_request(
+            &conn,
+            "123",
+            "ap-late",
+            "sess",
+            "Bash",
+            "x",
+            true,
+            Some("turn-1"),
+            None,
+            2000,
+            9_000_000_000,
+        )
+        .expect("publish");
+        assert_eq!(
+            published,
+            crate::approvals::Publication::OwnerNotRunning,
+            "a stopped owner must refuse new dialogs"
+        );
+        for table in [
+            "pending_approvals",
+            "telegram_callback_routes",
+            "outbound_events",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("count");
+            assert_eq!(
+                count, 0,
+                "a refused publication must write NOTHING to {table}"
+            );
+        }
+
+        // Order 2: creation committed first — the stop's sweep (the same
+        // transaction shape `stop_bridge_turn` commits) expires it.
+        let conn = create_state_db_in_memory().expect("db");
+        register(&conn);
+        let published = crate::approvals::publish_approval_request(
+            &conn,
+            "123",
+            "ap-early",
+            "sess",
+            "Bash",
+            "x",
+            true,
+            Some("turn-1"),
+            None,
+            1200,
+            9_000_000_000,
+        )
+        .expect("publish");
+        assert_eq!(published, crate::approvals::Publication::Published);
+        let buttons: i64 = conn
+            .query_row("SELECT COUNT(*) FROM outbound_events", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(buttons, 1, "a publication must include its outbox button");
+        let tx = conn.unchecked_transaction().expect("tx");
+        mark_bridge_turn_stopping(&tx, "turn-1", 1500).expect("intent");
+        settle_prompts_for_turn(&tx, "turn-1", 1500).expect("sweep");
+        tx.commit().expect("commit");
+        let decision: Option<String> = conn
+            .query_row(
+                "SELECT decision FROM pending_approvals WHERE approval_id = 'ap-early'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(
+            decision.as_deref(),
+            Some("expired"),
+            "the stop must sweep the dialog the moment its intent commits"
+        );
+        let buttons: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events
+                 WHERE json_extract(payload_json, '$.eventKey') = 'approval:ap-early'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            buttons, 0,
+            "and the published button must be withdrawn with it"
+        );
+    }
+
+    /// Republication of the SAME approval id (an interrupted gate re-run,
+    /// a redelivered hook) must not reopen anything: an OPEN row keeps its
+    /// routes and button untouched, and a decided row hands the decision
+    /// back. REPLACE semantics here once reset a deny to NULL — no new
+    /// message was pushed (the outbox key already existed), yet the stale
+    /// sibling buttons came back to life and could flip the answer.
+    #[test]
+    fn republication_honours_what_already_happened() {
+        let conn = create_state_db_in_memory().expect("db");
+        register_bridge_turn(
+            &conn,
+            "turn-1",
+            "sess",
+            "/tmp/t.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register owner");
+        let publish = |now: u64| {
+            crate::approvals::publish_approval_request(
+                &conn,
+                "123",
+                "ap-1",
+                "sess",
+                "Bash",
+                "x",
+                true,
+                Some("turn-1"),
+                None,
+                now,
+                9_000_000_000,
+            )
+        };
+        let counts = || -> (i64, i64, i64) {
+            let count = |table: &str| -> i64 {
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("count")
+            };
+            (
+                count("pending_approvals"),
+                count("telegram_callback_routes"),
+                count("outbound_events"),
+            )
+        };
+
+        assert_eq!(
+            publish(1000).expect("publish"),
+            crate::approvals::Publication::Published
+        );
+        let before = counts();
+        assert_eq!(
+            publish(2000).expect("republish"),
+            crate::approvals::Publication::AlreadyPublished,
+            "an open row is simply waited on"
+        );
+        assert_eq!(counts(), before, "and republication must write NOTHING");
+
+        conn.execute(
+            "UPDATE pending_approvals SET decision = 'deny', decided_at = 3000
+             WHERE approval_id = 'ap-1'",
+            [],
+        )
+        .expect("decide");
+        assert_eq!(
+            publish(4000).expect("decided"),
+            crate::approvals::Publication::AlreadyDecided("deny".to_string()),
+            "a decided row hands the decision back to be honoured"
+        );
+        let decision: Option<String> = conn
+            .query_row(
+                "SELECT decision FROM pending_approvals WHERE approval_id = 'ap-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(
+            decision.as_deref(),
+            Some("deny"),
+            "republication must never reset a decision to NULL"
+        );
+        assert_eq!(counts(), before, "nor write anything while doing so");
+    }
+
+    /// Binding the ownership object voids the birth debt — structural
+    /// supervision needs no identity write — and a bound row is also
+    /// beyond the reach of the no-pid crash claim.
+    #[test]
+    fn binding_a_cgroup_voids_the_birth_debt_and_shields_the_row() {
+        let conn = create_state_db_in_memory().expect("db");
+        register_bridge_turn(
+            &conn,
+            "turn-1",
+            "sess",
+            "/tmp/t.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        record_turn_cgroup(&conn, "turn-1", "/sys/fs/cgroup/x/turn-turn-1").expect("bind");
+
+        let (marker, path): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT cleanup_pending, cgroup_path FROM bridge_turns",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(marker, 0, "ownership is structural; the debt is void");
+        assert!(path.is_some());
+        assert!(
+            !claim_bridge_turn_failure(&conn, "turn-1", "failed", 20_000, true).expect("claim"),
+            "a bound row is never an unexplained no-pid crash"
+        );
+    }
+
+    /// The no-evidence crash claim keeps its hands off supervised rows —
+    /// isolated from the OTHER layers that usually shield them (routing,
+    /// the coalesced pid): a hand-built row with pid still NULL and only
+    /// the marker set must survive the claim.
+    #[test]
+    fn the_no_pid_claim_excludes_supervised_cleanups() {
+        let conn = create_state_db_in_memory().expect("db");
+        register_bridge_turn(
+            &conn,
+            "turn-1",
+            "sess",
+            "/tmp/t.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        conn.execute(
+            "UPDATE bridge_turns SET cleanup_pending = 1 WHERE turn_id = 'turn-1'",
+            [],
+        )
+        .expect("marker");
+
+        assert!(
+            !claim_bridge_turn_failure(&conn, "turn-1", "failed", 20_000, true).expect("claim"),
+            "a supervised row must not be claimable as a no-pid crash"
+        );
+        clear_cleanup_pending(&conn, "turn-1").expect("clear");
+        assert!(
+            claim_bridge_turn_failure(&conn, "turn-1", "failed", 20_000, true).expect("claim"),
+            "and without supervision the ordinary claim applies again"
+        );
+    }
+
+    /// A proof-carrying settlement (group empty, or never spawned) is the
+    /// one thing allowed to override a `stopping` intent — the stop is
+    /// satisfied vacuously. Left unoverridden, a /stop racing a failed
+    /// spawn stranded a `stopping` row with NULL identity, probing
+    /// `Unknown` forever.
+    #[test]
+    fn a_proof_carrying_settlement_overrides_a_stop_intent() {
+        let conn = create_state_db_in_memory().expect("db");
+        register_bridge_turn(
+            &conn,
+            "turn-1",
+            "sess",
+            "/tmp/t.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        mark_bridge_turn_stopping(&conn, "turn-1", 1500).expect("stop wins");
+
+        // A queued "正在终止" from the raced /stop…
+        enqueue_outbound_event(
+            &conn,
+            &json!({
+                "type": "bridge_notice", "threadId": "sess",
+                "eventKey": "stop-summary:456:3:turn-1:requested",
+                "observedAt": 1600, "message": "m",
+                "stopTurn": "turn-1", "stopPhase": "requested"
+            }),
+            1600,
+            "bridge",
+        )
+        .expect("stale receipt");
+
+        settle_unwound_turn_failed(&conn, "turn-1", 2000).expect("settle");
+
+        let (status, marker): (String, i64) = conn
+            .query_row(
+                "SELECT status, cleanup_pending FROM bridge_turns",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(status, "failed", "the vacuously satisfied stop settles");
+        assert_eq!(marker, 0, "and no phantom supervision is left behind");
+        // …is withdrawn AND replaced by a durable terminal receipt in the
+        // SAME transaction: a withdrawal with no substitute left the user
+        // with no stop answer at all if the daemon crashed here.
+        let keys: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT json_extract(payload_json, '$.eventKey') FROM outbound_events")
+                .expect("stmt");
+            let rows = stmt
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .expect("rows");
+            rows
+        };
+        assert_eq!(
+            keys,
+            vec!["stop-settled:turn-1".to_string()],
+            "the stale receipt goes; the terminal answer arrives, atomically"
+        );
+    }
+
+    /// Both spawn-cleanup settlements close what the turn owns in the SAME
+    /// transaction. A `failed` turn is never swept by the daemon again, and
+    /// a `stopping` one not before the next tick — either way, a button an
+    /// early tool hook managed to publish would stay answerable and could
+    /// hand a decision to a turn being unwound.
+    #[test]
+    fn spawn_cleanup_settlements_close_owned_dialogs_atomically() {
+        for terminated in [true, false] {
+            let conn = create_state_db_in_memory().expect("db");
+            register_bridge_turn(
+                &conn,
+                "turn-1",
+                "sess",
+                "/tmp/t.log",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                1000,
+            )
+            .expect("register");
+            create_pending_approval(
+                &conn,
+                "ap-1",
+                "sess",
+                "Bash",
+                "x",
+                true,
+                1000,
+                9_000_000_000,
+            )
+            .expect("approval");
+            record_approval_turn_owner(&conn, "ap-1", "turn-1").expect("owner");
+            enqueue_outbound_event(
+                &conn,
+                &json!({
+                    "type": "approval_request", "threadId": "sess",
+                    "eventKey": "approval:ap-1", "observedAt": 1000
+                }),
+                1000,
+                "bridge",
+            )
+            .expect("button");
+
+            let expected_status = if terminated {
+                // A raced /stop's undelivered receipt must go with the
+                // settlement — delivered later it would promise progress
+                // on a settled turn.
+                enqueue_outbound_event(
+                    &conn,
+                    &json!({
+                        "type": "bridge_notice", "threadId": "sess",
+                        "eventKey": "stop-summary:456:9:turn-1:requested",
+                        "observedAt": 1500, "message": "m",
+                        "stopTurn": "turn-1", "stopPhase": "requested"
+                    }),
+                    1500,
+                    "bridge",
+                )
+                .expect("stale receipt");
+                settle_unwound_turn_failed(&conn, "turn-1", 5000).expect("settle");
+                let stale: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM outbound_events
+                         WHERE json_extract(payload_json, '$.eventKey')
+                               = 'stop-summary:456:9:turn-1:requested'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("count");
+                assert_eq!(stale, 0, "the stale stop receipt must be withdrawn");
+                "failed"
+            } else {
+                // The unconfirmed unwinding keeps the row RUNNING under
+                // the failure-cleanup marker — `stopping` is the user's
+                // word — and still closes the dialogs atomically.
+                mark_cleanup_pending(&conn, "turn-1", Some(4_210), None, None, 5000).expect("mark");
+                "running"
+            };
+
+            let status: String = conn
+                .query_row("SELECT status FROM bridge_turns", [], |row| row.get(0))
+                .expect("status");
+            assert_eq!(status, expected_status);
+            let decision: Option<String> = conn
+                .query_row(
+                    "SELECT decision FROM pending_approvals WHERE approval_id = 'ap-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("approval");
+            assert_eq!(
+                decision.as_deref(),
+                Some("expired"),
+                "{expected_status}: the owned dialog must close with the settlement"
+            );
+            let buttons: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM outbound_events
+                     WHERE json_extract(payload_json, '$.eventKey') = 'approval:ap-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count");
+            assert_eq!(
+                buttons, 0,
+                "{expected_status}: and its queued button must be withdrawn"
+            );
+        }
+    }
+
+    /// The backfill runs at DATABASE OPEN — proven through the real
+    /// migration entry, not by calling the helper: an interim receipt is
+    /// written, the file closed and reopened (the upgrade), and a second
+    /// reopen must be idempotent.
+    #[test]
+    fn reopening_a_database_backfills_interim_receipts() {
+        let path = std::env::temp_dir().join(format!("tinyctb-backfill-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = create_state_db(&path).expect("create");
+            enqueue_outbound_event(
+                &conn,
+                &json!({
+                    "type": "bridge_notice", "threadId": "sess-z",
+                    "eventKey": "stop-summary:456:8:turn-w:requested",
+                    "observedAt": 1000, "message": "m"
+                }),
+                1000,
+                "bridge",
+            )
+            .expect("enqueue");
+        }
+        let labelled = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT json_extract(payload_json, '$.stopTurn') FROM outbound_events",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row")
+        };
+        {
+            let conn = create_state_db(&path).expect("reopen");
+            assert_eq!(
+                labelled(&conn).as_deref(),
+                Some("turn-w"),
+                "reopening must label the interim receipt through the migration entry"
+            );
+        }
+        {
+            let conn = create_state_db(&path).expect("second reopen");
+            assert_eq!(labelled(&conn).as_deref(), Some("turn-w"));
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM outbound_events", [], |row| row.get(0))
+                .expect("count");
+            assert_eq!(rows, 1, "and a second reopen changes nothing");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Receipts written by interim builds lack the structured fields the
+    /// terminal withdrawal matches on; the backfill labels them from the
+    /// key so they cannot dodge withdrawal forever. A phase-less older key
+    /// is left alone — nothing safe to infer from it.
+    #[test]
+    fn backfill_labels_interim_stop_receipts() {
+        let conn = create_state_db_in_memory().expect("db");
+        for key in [
+            "stop-summary:456:7:turn-z:requested",
+            "stop-summary:456:7:turn-z",
+        ] {
+            enqueue_outbound_event(
+                &conn,
+                &json!({
+                    "type": "bridge_notice", "threadId": "sess-z",
+                    "eventKey": key, "observedAt": 1000, "message": "m"
+                }),
+                1000,
+                "bridge",
+            )
+            .expect("enqueue");
+        }
+
+        backfill_stop_receipt_fields(&conn).expect("backfill");
+
+        let labelled: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT json_extract(payload_json, '$.stopTurn'),
+                        json_extract(payload_json, '$.stopPhase')
+                 FROM outbound_events
+                 WHERE json_extract(payload_json, '$.eventKey')
+                       = 'stop-summary:456:7:turn-z:requested'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(
+            labelled,
+            (Some("turn-z".to_string()), Some("requested".to_string())),
+            "the interim receipt must be labelled from its key"
+        );
+        let untouched: Option<String> = conn
+            .query_row(
+                "SELECT json_extract(payload_json, '$.stopTurn') FROM outbound_events
+                 WHERE json_extract(payload_json, '$.eventKey') = 'stop-summary:456:7:turn-z'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(untouched, None, "a phase-less key must be left alone");
+
+        // And the withdrawal now reaches the labelled row.
+        withdraw_undelivered_stop_chatter(&conn, "turn-z", 5000).expect("withdraw");
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events
+                 WHERE json_extract(payload_json, '$.eventKey')
+                       = 'stop-summary:456:7:turn-z:requested'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(remaining, 0, "the backfilled receipt is withdrawable");
+    }
+
+    /// The terminal withdrawal pulls back only UNDELIVERED stale chatter:
+    /// a receipt the user already received is history and must survive.
+    #[test]
+    fn stop_chatter_withdrawal_spares_delivered_history() {
+        let conn = create_state_db_in_memory().expect("db");
+        for (key, delivered) in [
+            ("stop-summary:456:1:turn-x:requested", true),
+            ("stop-summary:456:2:turn-x:requested", false),
+        ] {
+            enqueue_outbound_event(
+                &conn,
+                &json!({
+                    "type": "bridge_notice", "threadId": "sess-x",
+                    "eventKey": key, "observedAt": 1000, "message": "m",
+                    "stopTurn": "turn-x", "stopPhase": "requested"
+                }),
+                1000,
+                "bridge",
+            )
+            .expect("enqueue");
+            if delivered {
+                let event_id: String = conn
+                    .query_row(
+                        "SELECT event_id FROM outbound_events
+                         WHERE json_extract(payload_json, '$.eventKey') = ?1",
+                        params![key],
+                        |row| row.get(0),
+                    )
+                    .expect("event id");
+                record_transport_delivery(&conn, &event_id, "telegram", &json!({"ok": true}), 1)
+                    .expect("delivery log");
+            }
+        }
+
+        withdraw_undelivered_stop_chatter(&conn, "turn-x", 5000).expect("withdraw");
+
+        let keys: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT json_extract(payload_json, '$.eventKey') FROM outbound_events")
+                .expect("stmt");
+            let rows = stmt
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .expect("rows");
+            rows
+        };
+        assert_eq!(
+            keys,
+            vec!["stop-summary:456:1:turn-x:requested".to_string()],
+            "delivered history stays; only the undelivered stale row is withdrawn"
+        );
+    }
+
+    /// `_` and `%` inside a turn id must never act as wildcards: the
+    /// withdrawal matches the STRUCTURED turn field exactly. Parsed out of
+    /// the event key with LIKE, `turn_a` also matched `turnxa` and pulled
+    /// back another turn's receipts.
+    #[test]
+    fn stop_chatter_withdrawal_is_not_a_wildcard_match() {
+        let conn = create_state_db_in_memory().expect("db");
+        for turn in ["turn_a", "turnxa"] {
+            enqueue_outbound_event(
+                &conn,
+                &json!({
+                    "type": "bridge_notice", "threadId": "sess-x",
+                    "eventKey": format!("stop-summary:456:9:{turn}:requested"),
+                    "observedAt": 1000, "message": "m",
+                    "stopTurn": turn, "stopPhase": "requested"
+                }),
+                1000,
+                "bridge",
+            )
+            .expect("enqueue");
+        }
+
+        withdraw_undelivered_stop_chatter(&conn, "turn_a", 5000).expect("withdraw");
+
+        let keys: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT json_extract(payload_json, '$.eventKey') FROM outbound_events")
+                .expect("stmt");
+            let rows = stmt
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .expect("rows");
+            rows
+        };
+        assert_eq!(
+            keys,
+            vec!["stop-summary:456:9:turnxa:requested".to_string()],
+            "only the EXACT turn's receipt may be withdrawn"
+        );
+    }
+
+    /// All-or-nothing, proven by sabotage: if the outbox insert fails, the
+    /// approval row and its callback routes must vanish with it. Committed
+    /// piecemeal, a broken outbox left an approval with no button —
+    /// invisible on the phone, blocking the gate until its timeout.
+    #[test]
+    fn a_publication_that_cannot_queue_its_button_leaves_nothing() {
+        let conn = create_state_db_in_memory().expect("db");
+        register_bridge_turn(
+            &conn,
+            "turn-1",
+            "sess",
+            "/tmp/t.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register owner");
+        conn.execute_batch(
+            "CREATE TRIGGER outbox_broken BEFORE INSERT ON outbound_events
+             BEGIN SELECT RAISE(ABORT, 'outbox broken'); END;",
+        )
+        .expect("trigger");
+
+        let result = crate::approvals::publish_approval_request(
+            &conn,
+            "123",
+            "ap-1",
+            "sess",
+            "Bash",
+            "x",
+            true,
+            Some("turn-1"),
+            None,
+            1000,
+            9_000_000_000,
+        );
+        assert!(result.is_err(), "a broken outbox must fail the publication");
+        for table in ["pending_approvals", "telegram_callback_routes"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("count");
+            assert_eq!(
+                count, 0,
+                "{table} must roll back with the failed button — no half-published dialog"
+            );
+        }
+    }
+
+    /// The approval row and its owner must land together or not at all.
+    /// Written as two commits, a `/stop` landing in between would see
+    /// `turn_id` still NULL, correctly fail open, and leave a dead prompt
+    /// that `/threads` would keep reoffering for up to a day.
+    ///
+    /// Two threads hammer the same window: one repeatedly creates
+    /// approval+owner in a transaction, the other repeatedly reads. The
+    /// reader must NEVER observe a row whose owner is missing.
+    #[test]
+    fn an_approval_is_never_visible_without_its_owner() {
+        let path =
+            std::env::temp_dir().join(format!("tinyctb-owner-race-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let writer_conn = create_state_db(&path).expect("db");
+        let reader_conn = create_state_db(&path).expect("db");
+        // The owner must be a RUNNING turn — creation now refuses owners in
+        // any other state.
+        register_bridge_turn(
+            &writer_conn,
+            "turn-1",
+            "sess",
+            "/tmp/t.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register owner");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let reader_stop = std::sync::Arc::clone(&stop);
+        let reader_barrier = std::sync::Arc::clone(&barrier);
+        let reader = std::thread::spawn(move || {
+            reader_barrier.wait();
+            let mut orphans = 0usize;
+            let mut seen = 0usize;
+            while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let rows: Vec<Option<String>> = {
+                    let mut stmt = reader_conn
+                        .prepare("SELECT turn_id FROM pending_approvals")
+                        .expect("stmt");
+                    let rows = stmt
+                        .query_map([], |row| row.get(0))
+                        .expect("query")
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .expect("rows");
+                    rows
+                };
+                for owner in rows {
+                    seen += 1;
+                    if owner.is_none() {
+                        orphans += 1;
+                    }
+                }
+            }
+            (seen, orphans)
+        });
+
+        barrier.wait();
+        for index in 0..200 {
+            let id = format!("ap-{index}");
+            // THE PRODUCTION WRAPPER, not a hand-rolled transaction: a test
+            // that builds its own atomicity proves nothing about the code
+            // the gate actually runs.
+            crate::approvals::publish_approval_request(
+                &writer_conn,
+                "123",
+                &id,
+                "sess",
+                "Bash",
+                "x",
+                true,
+                Some("turn-1"),
+                None,
+                1000,
+                9_000_000_000,
+            )
+            .expect("publish");
+            writer_conn
+                .execute("DELETE FROM pending_approvals", [])
+                .expect("clear");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (seen, orphans) = reader.join().expect("reader");
+
+        assert!(seen > 0, "the reader must actually have observed rows");
+        assert_eq!(
+            orphans, 0,
+            "an approval was visible without its owner — /stop would then fail \
+             open and leave a dead prompt behind"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn settling_honours_a_tap_and_only_withdraws_withdrawable_pushes() {
         let seed = |conn: &Connection, key: &str, claimed: Option<i64>, logged: bool| {

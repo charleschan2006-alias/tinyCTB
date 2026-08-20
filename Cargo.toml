@@ -1,6 +1,6 @@
 [package]
 name = "tinyctb"
-version = "0.2.3"
+version = "0.2.5"
 edition = "2021"
 description = "Telegram away-mode control for local Claude Code sessions"
 license = "MIT"
@@ -13,6 +13,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 fs2 = "0.4"
+libc = "0.2"
 notify = "8"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

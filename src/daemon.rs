@@ -21,9 +21,9 @@ use crate::claude::{
 };
 use crate::state::{
     create_state_db, delete_setting, deliver_due_outbound_events, enqueue_outbound_event,
-    get_setting_text, list_running_bridge_turns, mark_bridge_turn_finished, pending_outbound_count,
-    prune_state_logs, record_transport_delivery, set_setting_text, should_emit_for_away_window,
-    state_db_path, transport_delivered_at, BridgeTurn, OutboxDeliverySummary,
+    get_setting_text, mark_bridge_turn_finished, pending_outbound_count, prune_state_logs,
+    record_transport_delivery, set_setting_text, should_emit_for_away_window, state_db_path,
+    transport_delivered_at, BridgeTurn, OutboxDeliverySummary,
 };
 use crate::telegram::{
     deliver_telegram_event, extend_telegram_typing_indicator, process_telegram_updates,
@@ -64,6 +64,64 @@ impl Drop for DaemonLock {
 
 fn daemon_lock_path() -> Result<PathBuf> {
     Ok(state_db_path()?.with_file_name("daemon.lock"))
+}
+
+pub(crate) fn spawn_lock_path() -> Result<PathBuf> {
+    Ok(state_db_path()?.with_file_name("spawn.lock"))
+}
+
+/// SHARED lock every spawner holds across create→register→spawn, so a
+/// teardown holding it EXCLUSIVELY is provably alone: no daemon `/new` and
+/// no CLI `new/reply` can slip a fresh turn in between the sweep and the
+/// ledger deletion.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn hold_spawn_lock_shared() -> Result<fs::File> {
+    let path = spawn_lock_path()?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open spawn lock at {}", path.display()))?;
+    match FileExt::try_lock_shared(&file) {
+        Ok(()) => Ok(file),
+        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+            bail!("bridge maintenance (reset/uninstall) is in progress; try again shortly")
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to lock spawn lock at {}", path.display()))
+        }
+    }
+}
+
+/// The teardown side: EXCLUSIVE, bounded wait, held by the caller through
+/// the sweep and the deletion.
+pub(crate) fn hold_spawn_lock_exclusive(wait: Duration) -> Result<fs::File> {
+    let path = spawn_lock_path()?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open spawn lock at {}", path.display()))?;
+    let started = Instant::now();
+    loop {
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(file),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if started.elapsed() >= wait {
+                    bail!("a spawn is still in flight (spawn lock busy); try again");
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to lock spawn lock at {}", path.display()))
+            }
+        }
+    }
 }
 
 fn acquire_daemon_lock() -> Result<DaemonLock> {
@@ -305,6 +363,298 @@ fn bridge_turn_thread_json(conn: &Connection, turn: &BridgeTurn, preview: &str) 
 ///   `running`, and the next cycle retries the whole verdict.
 ///
 /// Returns whether the failure was claimed (false = verdict dropped).
+/// Drive a turn the user asked to stop towards a settled state.
+///
+/// `/stop` records the intent and signals, but it cannot be the place that
+/// PROVES the process died: it may crash before signalling, the leader may
+/// die while a grandchild keeps working, or it may be killed between the
+/// kill and the settle. Recovery therefore lives here, in the loop that runs
+/// every cycle, and it has exactly three answers:
+///  - group provably gone → settle as `stopped`, and close the prompts and
+///    queued buttons the turn owned, in ONE transaction;
+///  - group still alive → signal again (the kill is idempotent) and wait;
+///  - cannot tell → stay `stopping`. Never settle on ignorance; a settled
+///    turn is invisible to this loop forever after.
+fn advance_stopping_turn(
+    conn: &Connection,
+    turn: &crate::state::BridgeTurn,
+    now: u64,
+) -> Result<bool> {
+    use crate::claude::{KillOutcome, Liveness};
+    // Owned dialogs die at the INTENT, not at the settle — `/stop` closes
+    // them in its own transaction, and creation refuses owners that are not
+    // running. Rows written by an older binary (or an interrupted recovery)
+    // may still carry open prompts, so every pass re-closes idempotently:
+    // stopping turns are rare and the sweep is a no-op when clean.
+    {
+        let tx = conn.unchecked_transaction()?;
+        crate::state::settle_prompts_for_turn(&tx, &turn.turn_id, now)?;
+        tx.commit()?;
+    }
+    // The ownership object outranks every pid-derived probe: `populated`
+    // is a kernel fact about OUR object, immune to reuse and recycling.
+    let cgroup = turn
+        .cgroup_path
+        .as_deref()
+        .and_then(|path| crate::claude::turn_cgroup::validated(path, &turn.turn_id));
+    let group = match &cgroup {
+        Some(dir) => match crate::claude::turn_cgroup::populated(dir) {
+            Some(true) => Liveness::Alive,
+            Some(false) => Liveness::Ended,
+            None => Liveness::Unknown,
+        },
+        None => match turn.pgid {
+            Some(pgid) => crate::claude::group_liveness(pgid),
+            // No persisted group id: nothing here can be proven, and
+            // guessing `pid` as the group would risk signalling an
+            // unrelated one.
+            None => Liveness::Unknown,
+        },
+    };
+    match group {
+        Liveness::Alive => {
+            // Idempotent — but not free: an attempt can hold this loop for
+            // ~2s of confirmation, so re-kills back off exponentially
+            // (1s → 64s cap) instead of burning that cost every cycle
+            // against a group that shrugs KILL off (uninterruptible IO, a
+            // descendant under another uid).
+            let (attempts, last) = crate::state::stop_attempt_state(conn, &turn.turn_id)?;
+            let delay_ms = 1_000u64 << attempts.min(6);
+            // `last <= now` fails OPEN on wall-clock regression: a stamp
+            // from the future would otherwise freeze retries until the
+            // clock catches back up.
+            if last <= now && now < last.saturating_add(delay_ms) {
+                return Ok(false);
+            }
+            crate::state::record_stop_attempt(conn, &turn.turn_id, now)?;
+            let _ = crate::claude::kill_turn_process(turn);
+            Ok(false)
+        }
+        Liveness::Unknown => Ok(false),
+        Liveness::Ended => {
+            let tx = conn.unchecked_transaction()?;
+            // The terminal is chosen from PERSISTED intent, never guessed:
+            // `stopping` status is the user's stop; a failure-flavoured
+            // marker (2) is a spawn failure's cleanup — reporting that as
+            // "已停止" claimed a stop the user never made.
+            let (row_status, marker): (String, i64) = tx.query_row(
+                "SELECT status, cleanup_pending FROM bridge_turns WHERE turn_id = ?1",
+                rusqlite::params![turn.turn_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let failure_cleanup = row_status != "stopping" && marker == 2;
+            let terminal = if failure_cleanup { "failed" } else { "stopped" };
+            let settled = crate::state::settle_supervised_turn(&tx, &turn.turn_id, terminal, now)?;
+            if settled {
+                crate::state::settle_prompts_for_turn(&tx, &turn.turn_id, now)?;
+                // The final confirmation, in the SAME transaction as the
+                // settle: a stop that was only confirmed by this recovery
+                // loop would otherwise end silently — the `/stop` reply
+                // already said "unconfirmed" and nothing else would follow.
+                // Undelivered pre-final chatter is withdrawn first: retried
+                // out of order it would arrive AFTER this terminal answer.
+                crate::state::withdraw_undelivered_stop_chatter(&tx, &turn.turn_id, now)?;
+                let label = crate::telegram::short_thread_id(&turn.thread_id);
+                let event = if failure_cleanup {
+                    json!({
+                        "type": "thread_error",
+                        "threadId": turn.thread_id,
+                        "observedAt": now,
+                        "eventKey": format!("cleanup-settled:{}", turn.turn_id),
+                        "message": format!(
+                            "🧵 {label} — 启动失败的回合已清理完毕（进程组确认退出，按失败结算）"
+                        ),
+                    })
+                } else {
+                    json!({
+                        "type": "bridge_notice",
+                        "threadId": turn.thread_id,
+                        "observedAt": now,
+                        "eventKey": format!("stop-settled:{}", turn.turn_id),
+                        "message": format!("🧵 {label} — 已停止（daemon 确认整组退出）"),
+                    })
+                };
+                enqueue_outbound_event(&tx, &event, now, "bridge")?;
+            }
+            // Supervision ends HERE either way: the group is provably
+            // empty. (A row that was already terminal keeps its status;
+            // only the marker is lifted.)
+            crate::state::clear_cleanup_pending(&tx, &turn.turn_id)?;
+            tx.commit()?;
+            if let Some(dir) = &cgroup {
+                // Emptiness is proven and settled; the object has served.
+                // Removal refuses a non-empty directory by construction.
+                let _ = crate::claude::turn_cgroup::remove(dir);
+            }
+            if settled {
+                // Only once nothing is left running for this session.
+                let others = crate::state::list_running_bridge_turns(conn)?;
+                if !others.iter().any(|other| other.thread_id == turn.thread_id) {
+                    let _ = crate::telegram::clear_typing_for_thread(conn, &turn.thread_id);
+                }
+            }
+            let _ = KillOutcome::Terminated; // documents the state we reached
+            Ok(settled)
+        }
+    }
+}
+
+/// How long a registered turn may sit with NO identity before the bridge
+/// concludes the identity will never land. Normal spawns record it within
+/// milliseconds; the unwinding paths within seconds. Generous on purpose.
+const IDENTITY_GRACE_MS: u64 = 60_000;
+
+/// A supervised turn with NO identity: nothing can be killed or probed,
+/// and — decisively — nothing can be PROVEN. Sixty quiet seconds prove
+/// only that the identity write is late, not that no process exists (the
+/// CLI can die between a successful spawn and the write, leaving a live
+/// group). So this NEVER settles: within the grace the row is left
+/// entirely alone (a healthy newborn's first approval must survive the
+/// tick), and past it the user is alarmed ONCE — the row stays visible
+/// and supervised until something with evidence resolves it: the identity
+/// handshake a gated tool call performs, the turn's own completion, or
+/// the hard timeout.
+fn alarm_identityless_turn(
+    conn: &Connection,
+    turn: &crate::state::BridgeTurn,
+    now: u64,
+) -> Result<()> {
+    if now.saturating_sub(turn.started_at) <= IDENTITY_GRACE_MS {
+        return Ok(());
+    }
+    let event = json!({
+        "type": "thread_error",
+        "threadId": turn.thread_id,
+        "observedAt": now,
+        "eventKey": format!("identityless-turn:{}", turn.turn_id),
+        "message": format!(
+            "🧵 {} 的进程身份仍未落库：无法监管也无法安全终止。回合保持可见，直到它自证身份（下一次工具调用）、自行完成或到达硬超时。若怀疑有失控进程请人工检查。",
+            crate::telegram::short_thread_id(&turn.thread_id)
+        ),
+    });
+    // Keyed once per turn; the outbox deduplicates re-attempts away.
+    enqueue_outbound_event(conn, &event, now, "bridge")?;
+    Ok(())
+}
+
+/// Reclaim ownership objects NO ROW references — the crash window between
+/// `create` and the registration commit, or a red test run that panicked
+/// before its cleanup, leaves a directory nobody will ever settle. The
+/// name alone proves it is ours (it lives under our owner root and is
+/// shaped `turn-*`), so an empty one is removed and a populated one is
+/// killed first, loudly: work with no owning row is work nobody asked to
+/// keep.
+fn gc_orphan_turn_objects(conn: &Connection, grace: std::time::Duration) -> Result<()> {
+    let Some(root) = crate::claude::turn_cgroup::owner_root() else {
+        return Ok(());
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(_) = name.strip_prefix("turn-") else {
+            continue;
+        };
+        // The GRACE is load-bearing twice over: a CLI in its create→register
+        // window, and parallel tests owning rows in their own databases,
+        // both look "unreferenced" for a moment. Crash orphans have all the
+        // time in the world.
+        let fresh = match entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+        {
+            Some(age) => age < grace,
+            // Unreadable age: err on the side of keeping it.
+            None => true,
+        };
+        if fresh {
+            continue;
+        }
+        let path = entry.path();
+        let Some(path_str) = path.to_str() else {
+            continue;
+        };
+        let referenced: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM bridge_turns WHERE cgroup_path = ?1",
+            rusqlite::params![path_str],
+            |row| row.get(0),
+        )?;
+        if referenced > 0 {
+            continue;
+        }
+        if crate::claude::turn_cgroup::populated(&path) == Some(true) {
+            eprintln!(
+                "tinyctb: killing ORPHAN turn object {} — populated but referenced by no row",
+                path.display()
+            );
+            let _ = crate::claude::turn_cgroup::kill(&path);
+            if !crate::claude::turn_cgroup::confirmed_empty(
+                &path,
+                std::time::Duration::from_secs(2),
+            ) {
+                continue;
+            }
+        }
+        let _ = crate::claude::turn_cgroup::remove(&path);
+    }
+    Ok(())
+}
+
+/// Terminal settlement of a cgroup-owned turn: mark terminal AND set the
+/// cleanup marker in ONE transaction, then kill the object and attempt a
+/// quick confirmation. Confirmed → marker released, object removed. Not
+/// confirmed → the marker keeps the row in the supervised loop until
+/// `populated 0` is a fact. A turn's end means its whole tree's end —
+/// including any background processes it started.
+fn finish_turn_and_sweep(
+    conn: &Connection,
+    turn: &crate::state::BridgeTurn,
+    status: &str,
+    now: u64,
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    mark_bridge_turn_finished(&tx, &turn.turn_id, status, now)?;
+    // A finished turn's dialogs finish WITH it, atomically: the only other
+    // sweeper is the stopping-recovery path, which a turn that terminates
+    // cleanly (and proves empty in the quick window) never visits — its
+    // approval rows and queued buttons would otherwise stay answerable.
+    crate::state::settle_prompts_for_turn(&tx, &turn.turn_id, now)?;
+    if turn.cgroup_path.is_some() {
+        crate::state::set_cleanup_marker(&tx, &turn.turn_id)?;
+    }
+    tx.commit()?;
+    sweep_terminal_turn_object(conn, turn, now)?;
+    Ok(())
+}
+
+/// Kill the settled turn's object and, on a quick proof of emptiness,
+/// release the marker and remove it. A missed confirmation leaves the
+/// marker: the supervised loop owns the rest.
+fn sweep_terminal_turn_object(
+    conn: &Connection,
+    turn: &crate::state::BridgeTurn,
+    now: u64,
+) -> Result<()> {
+    let _ = now;
+    let Some(dir) = turn
+        .cgroup_path
+        .as_deref()
+        .and_then(|path| crate::claude::turn_cgroup::validated(path, &turn.turn_id))
+    else {
+        return Ok(());
+    };
+    let _ = crate::claude::turn_cgroup::kill(&dir);
+    if crate::claude::turn_cgroup::confirmed_empty(&dir, std::time::Duration::from_secs(2)) {
+        crate::state::clear_cleanup_pending(conn, &turn.turn_id)?;
+        let _ = crate::claude::turn_cgroup::remove(&dir);
+    }
+    Ok(())
+}
+
 fn settle_dead_turn(
     conn: &Connection,
     turn: &crate::state::BridgeTurn,
@@ -316,7 +666,10 @@ fn settle_dead_turn(
     // new: a process past the hard timeout is dead by fiat, and the old code
     // killed it unconditionally too.
     if timed_out && !turn.exited {
-        crate::claude::kill_turn_process(turn);
+        // Outcome deliberately ignored here: a turn past the hard timeout is
+        // dead by fiat and gets settled either way, which is the pre-existing
+        // contract. `/stop` is the caller that must respect the outcome.
+        let _ = crate::claude::kill_turn_process(turn);
     }
     let reason = if turn.exited {
         format!(
@@ -355,8 +708,22 @@ fn settle_dead_turn(
     )?;
     if claimed {
         enqueue_outbound_event(&tx, &event, now, "bridge")?;
+        // The failed turn's dialogs close with it, atomically — this row
+        // will not pass the stopping-recovery sweeper again.
+        crate::state::settle_prompts_for_turn(&tx, &turn.turn_id, now)?;
+        // A cgroup-owned turn's end is its whole TREE's end: the marker
+        // commits with the terminal status, and the sweep (or the
+        // supervised loop, if the quick confirmation misses) releases it
+        // only on proven emptiness. Without this, a terminal row left a
+        // populated object outside every future scan.
+        if turn.cgroup_path.is_some() {
+            crate::state::set_cleanup_marker(&tx, &turn.turn_id)?;
+        }
     }
     tx.commit()?;
+    if claimed {
+        sweep_terminal_turn_object(conn, turn, now)?;
+    }
     Ok(claimed)
 }
 
@@ -371,14 +738,49 @@ pub(crate) fn process_bridge_turns(
 ) -> Result<Value> {
     // Reap finished children first: this prevents zombies (which would fool
     // `kill -0`) and records authoritative exit facts for crash detection.
-    for (pid, exit_code) in crate::claude::reap_finished_turn_processes() {
-        crate::state::record_bridge_turn_exit(conn, pid, exit_code)?;
+    for (turn_id, exit_code) in crate::claude::reap_finished_turn_processes() {
+        crate::state::record_bridge_turn_exit(conn, &turn_id, exit_code)?;
     }
-    let turns = list_running_bridge_turns(conn)?;
+    // The SUPERVISED set, not just running/stopping: a cleanup-marked row
+    // whose status a racing writer already made terminal still needs its
+    // group probed until it is proven empty.
+    let turns = crate::state::list_supervised_bridge_turns(conn)?;
+    gc_orphan_turn_objects(conn, std::time::Duration::from_secs(600))?;
     let mut answered = 0usize;
     let mut failed = 0usize;
     let mut running = 0usize;
     for turn in turns {
+        // A turn the user asked to stop follows its own path: it must not be
+        // read for an answer (there will not be one worth pushing), and it
+        // must not be reported as a failure. Its only question is whether the
+        // process group is really gone yet.
+        if crate::state::needs_stop_supervision(conn, &turn.turn_id)? {
+            // Two very different supervised shapes, split on EVIDENCE. An
+            // identity (pgid) to act on means real cleanup: sweep, re-kill,
+            // probe — and nothing else this cycle.
+            if turn.pgid.is_some() || turn.cgroup_path.is_some() {
+                if advance_stopping_turn(conn, &turn, now)? {
+                    failed += 1; // counted as settled work, not as an answer
+                } else {
+                    running += 1;
+                }
+                continue;
+            }
+            // NO identity: alarm once past the grace, and for a row still
+            // RUNNING fall through — the ordinary flow below (answer
+            // delivery, exit accounting, the six-hour hard timeout) must
+            // stay reachable, or a turn that completed without ever making
+            // a gated call would show running forever, its answer never
+            // delivered. An unconditional `continue` here was exactly that
+            // bug. Non-running identityless rows (a raced stop, a fiat
+            // timeout) have nothing below for them: alarmed and kept.
+            alarm_identityless_turn(conn, &turn, now)?;
+            if crate::state::bridge_turn_status(conn, &turn.turn_id)?.as_deref() != Some("running")
+            {
+                running += 1;
+                continue;
+            }
+        }
         let log_path = std::path::PathBuf::from(&turn.log_path);
         match read_bridge_turn_result(&log_path) {
             Some(result) => {
@@ -435,9 +837,9 @@ pub(crate) fn process_bridge_turns(
                     });
                     enqueue_outbound_event(conn, &event, now, "bridge")?;
                 }
-                mark_bridge_turn_finished(
+                finish_turn_and_sweep(
                     conn,
-                    &turn.turn_id,
+                    &turn,
                     if result.is_error { "error" } else { "done" },
                     now,
                 )?;
@@ -1447,7 +1849,11 @@ pub(crate) fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<D
         })
         .collect::<String>();
         let contents = format!(
-            "[Unit]\nDescription=tinyCTB Claude Telegram bridge daemon\n\n[Service]\nType=simple\nEnvironment=\"PATH={}\"\n{}ExecStart={} daemon run\nRestart=always\nRestartSec=2\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
+            // Delegate=yes: systemd hands the service its cgroup SUBTREE,
+            // which is what lets the daemon create one cgroup per headless
+            // turn — the ownership object the whole /stop machinery kills
+            // and probes. Without it, sub-cgroup writes are unsupported.
+            "[Unit]\nDescription=tinyCTB Claude Telegram bridge daemon\n\n[Service]\nType=simple\nDelegate=yes\nKillMode=process\nEnvironment=\"PATH={}\"\n{}ExecStart={} daemon run\nRestart=always\nRestartSec=2\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
             systemd_escape_env(&runtime_path),
             extra_env,
             shell_quote(&service_bridge_command),
@@ -1651,6 +2057,62 @@ pub(crate) fn uninstall_daemon_service(label: &str, dry_run: bool) -> Result<Val
     } else {
         Some(run_shell_command(&spec.uninstall_command)?)
     };
+    // The uninstall command tolerates failures (`|| true`), so "stopped"
+    // must be PROVEN, not assumed: the daemon lock has to be free, the
+    // spawn lock held exclusively, and only then are the turn objects
+    // swept — with KillMode=process sparing sub-trees, walking away here
+    // would strand them. Anything that cannot be proven empty and removed
+    // aborts before the unit file is touched.
+    // Held past the unit-file removal below.
+    let mut _spawn_freeze: Option<fs::File> = None;
+    if !dry_run {
+        let started = Instant::now();
+        loop {
+            if daemon_lock_free()? {
+                break;
+            }
+            if started.elapsed() >= Duration::from_secs(5) {
+                bail!("the daemon is still running despite the stop; refusing to uninstall");
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        _spawn_freeze = Some(hold_spawn_lock_exclusive(Duration::from_secs(5))?);
+        let report = crate::claude::turn_cgroup::sweep_all(std::time::Duration::from_secs(5))?;
+        if !report.stubborn.is_empty() {
+            bail!(
+                "refusing to uninstall: {} turn cgroup(s) could not be proven empty and removed                  ({}); stop the work they contain first",
+                report.stubborn.len(),
+                report
+                    .stubborn
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let db_path = state_db_path()?;
+        if db_path.exists() {
+            match crate::state::create_state_db(&db_path) {
+                Ok(conn) => {
+                    let legacy_active = crate::state::count_active_legacy_turns(&conn)?;
+                    if legacy_active > 0 {
+                        bail!(
+                            "refusing to uninstall: {legacy_active} legacy-supervised turn(s) \
+                             (no cgroup) are still active; stop them or let them finish first"
+                        );
+                    }
+                }
+                Err(err) => {
+                    // FAIL CLOSED, same as reset: unreadable is not empty.
+                    bail!(
+                        "refusing to uninstall: state.db exists but is unreadable ({err:#}); \
+                         verify no legacy-supervised process survives, remove the file \
+                         manually, then uninstall again"
+                    );
+                }
+            }
+        }
+    }
     if !dry_run && spec.service_path.exists() {
         fs::remove_file(&spec.service_path)?;
     }
@@ -1979,6 +2441,940 @@ mod tests {
     ///
     /// The wait happens on ANOTHER thread with a channel timeout, so a
     /// regression to serial blocking fails this test instead of hanging it.
+    /// A turn whose log produced an answer just before the user stopped it
+    /// is still a STOPPED turn. Letting `done` win would erase the intent —
+    /// and with it the daemon's obligation to keep confirming the process
+    /// actually died.
+    #[test]
+    fn a_completion_cannot_overwrite_a_stop_in_progress() {
+        let conn = create_state_db_in_memory().expect("db");
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-1",
+            "sess-1",
+            "/tmp/t.log",
+            Some(4_000_090),
+            None,
+            None,
+            Some(4_000_090),
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        crate::state::mark_bridge_turn_stopping(&conn, "turn-1", 1500).expect("intent");
+
+        crate::state::mark_bridge_turn_finished(&conn, "turn-1", "done", 2000).expect("finish");
+
+        assert_eq!(
+            crate::state::bridge_turn_status(&conn, "turn-1").expect("status"),
+            Some("stopping".to_string()),
+            "a late completion must not erase the stop intent"
+        );
+        // And a turn that was never stopping still settles normally.
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-2",
+            "sess-1",
+            "/tmp/t.log",
+            Some(4_000_091),
+            None,
+            None,
+            Some(4_000_091),
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        crate::state::mark_bridge_turn_finished(&conn, "turn-2", "done", 2000).expect("finish");
+        assert_eq!(
+            crate::state::bridge_turn_status(&conn, "turn-2").expect("status"),
+            Some("done".to_string())
+        );
+    }
+
+    /// The recovery state machine has exactly three answers, and the wrong
+    /// one in either direction is a real failure: settling on ignorance
+    /// loses a live process forever, and refusing to settle a dead one
+    /// leaves the user's stop half-done.
+    #[test]
+    fn stopping_recovery_settles_only_on_a_provably_empty_group() {
+        use crate::claude::Liveness;
+        let _guard = crate::state::test_env_lock();
+
+        for (verdict, expect_settled, expect_status) in [
+            (Liveness::Unknown, false, "stopping"),
+            (Liveness::Alive, false, "stopping"),
+            (Liveness::Ended, true, "stopped"),
+        ] {
+            let conn = create_state_db_in_memory().expect("db");
+            let _ = crate::claude::test_kill::take();
+            crate::state::register_bridge_turn(
+                &conn,
+                "turn-1",
+                "sess-1",
+                "/tmp/t.log",
+                Some(4_000_080),
+                None,
+                None,
+                Some(4_000_080),
+                None,
+                None,
+                1000,
+            )
+            .expect("register");
+            crate::state::mark_bridge_turn_stopping(&conn, "turn-1", 1500).expect("intent");
+            crate::state::create_pending_approval(
+                &conn,
+                "ap-1",
+                "sess-1",
+                "Bash",
+                "x",
+                true,
+                1000,
+                9_000_000_000,
+            )
+            .expect("approval");
+            crate::state::record_approval_turn_owner(&conn, "ap-1", "turn-1").expect("owner");
+
+            let _probe = crate::claude::test_group_probe::ProbeGuard::set(verdict);
+            let turn = crate::state::list_running_bridge_turns(&conn)
+                .expect("turns")
+                .into_iter()
+                .next()
+                .expect("turn");
+            let settled = advance_stopping_turn(&conn, &turn, 5000).expect("advance");
+            drop(_probe);
+
+            assert_eq!(settled, expect_settled, "{verdict:?}");
+            assert_eq!(
+                crate::state::bridge_turn_status(&conn, "turn-1").expect("status"),
+                Some(expect_status.to_string()),
+                "{verdict:?}: wrong recovery verdict"
+            );
+            let decision: Option<String> = conn
+                .query_row(
+                    "SELECT decision FROM pending_approvals WHERE approval_id = 'ap-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("approval");
+            assert_eq!(
+                decision.as_deref(),
+                Some("expired"),
+                "{verdict:?}: a stopping turn's dialogs close on every pass — the \
+                 stop INTENT is what ends them, not the settle"
+            );
+            let notice: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM outbound_events
+                     WHERE json_extract(payload_json, '$.eventKey') = 'stop-settled:turn-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count");
+            assert_eq!(
+                notice,
+                i64::from(expect_settled),
+                "{verdict:?}: exactly a SETTLED recovery must enqueue its confirmation"
+            );
+            if verdict == Liveness::Alive {
+                assert_eq!(
+                    crate::claude::test_kill::take(),
+                    vec![4_000_080],
+                    "a group still alive must be signalled again"
+                );
+            } else {
+                assert!(
+                    crate::claude::test_kill::take().is_empty(),
+                    "{verdict:?}: nothing to signal"
+                );
+            }
+        }
+    }
+
+    /// A supervised turn is ROUTED into stopping-recovery, not into the
+    /// crash-claim path: with the leader already reaped (`exited`), the
+    /// ordinary flow would settle it as an unexplained failure — burying
+    /// the unproven group — where recovery re-kills and keeps probing.
+    #[test]
+    fn a_supervised_turn_is_routed_to_recovery_not_the_crash_claim() {
+        use crate::claude::Liveness;
+        let _guard = crate::state::test_env_lock();
+        let conn = create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-1",
+            "sess-1",
+            "/tmp/t.log",
+            Some(4_000_097),
+            None,
+            None,
+            Some(4_000_097),
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        crate::state::record_bridge_turn_exit(&conn, "turn-1", Some(0)).expect("exit");
+        conn.execute(
+            "UPDATE bridge_turns SET cleanup_pending = 1 WHERE turn_id = 'turn-1'",
+            [],
+        )
+        .expect("marker");
+
+        let _probe = crate::claude::test_group_probe::ProbeGuard::set(Liveness::Alive);
+        process_bridge_turns(&conn, &bridge_test_config(), 20_000).expect("cycle");
+
+        let status: String = conn
+            .query_row("SELECT status FROM bridge_turns", [], |row| row.get(0))
+            .expect("status");
+        assert_eq!(
+            status, "running",
+            "a supervised turn must not be settled as an unexplained crash"
+        );
+        assert_eq!(
+            crate::claude::test_kill::take(),
+            vec![4_000_097],
+            "recovery must have re-signalled the still-live group instead"
+        );
+    }
+
+    /// An identityless turn that COMPLETES must still deliver its answer
+    /// and settle, and one that never completes must still hit the hard
+    /// timeout — the ordinary flow stays reachable behind the alarm. An
+    /// unconditional `continue` in the supervised branch once made both
+    /// unreachable: answered turns showed running forever.
+    #[test]
+    fn an_identityless_turn_still_completes_and_times_out() {
+        let _guard = crate::state::test_env_lock();
+        // Completion: the answer in the log is delivered and the turn done.
+        let conn = create_state_db_in_memory().expect("db");
+        let log = write_turn_log(
+            "sess-idless-done",
+            &[r#"{"type":"result","subtype":"success","is_error":false,"result":"答案"}"#],
+        );
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-1",
+            "sess-idless",
+            &log.display().to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        let summary = process_bridge_turns(&conn, &bridge_test_config(), 5_000).expect("cycle");
+        assert_eq!(
+            summary["answered"], 1,
+            "the answer must be delivered: {summary}"
+        );
+        assert_eq!(
+            crate::state::bridge_turn_status(&conn, "turn-1").expect("status"),
+            Some("done".to_string()),
+            "a completed identityless turn settles"
+        );
+
+        // Hard timeout: a silent identityless turn expires by fiat at 6h.
+        let conn = create_state_db_in_memory().expect("db");
+        let log = write_turn_log("sess-idless-quiet", &["nothing to see"]);
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-2",
+            "sess-idless-2",
+            &log.display().to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        let past_timeout = 1000 + BRIDGE_TURN_MAX_RUNTIME_MS + 1;
+        process_bridge_turns(&conn, &bridge_test_config(), past_timeout).expect("cycle");
+        assert_eq!(
+            crate::state::bridge_turn_status(&conn, "turn-2").expect("status"),
+            Some("expired".to_string()),
+            "the hard timeout must remain reachable for identityless turns"
+        );
+    }
+
+    /// The birth debt is NOT a stop: a healthy newborn (registered,
+    /// identity not yet landed) whose first tool call already published an
+    /// approval must come through a daemon tick with its dialog open and
+    /// nothing signalled — sweeping it was the review's P1.
+    #[test]
+    fn a_newborns_first_approval_survives_the_daemon_tick() {
+        let _guard = crate::state::test_env_lock();
+        let conn = create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-new",
+            "sess-new",
+            "/tmp/t.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        crate::state::create_pending_approval(
+            &conn,
+            "ap-1",
+            "sess-new",
+            "Bash",
+            "x",
+            true,
+            1500,
+            9_000_000_000,
+        )
+        .expect("approval");
+        crate::state::record_approval_turn_owner(&conn, "ap-1", "turn-new").expect("owner");
+
+        process_bridge_turns(&conn, &bridge_test_config(), 6_000).expect("cycle");
+
+        let decision: Option<String> = conn
+            .query_row(
+                "SELECT decision FROM pending_approvals WHERE approval_id = 'ap-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("approval");
+        assert_eq!(
+            decision, None,
+            "the newborn's dialog must survive the tick — the birth debt is not a stop"
+        );
+        assert!(
+            crate::claude::test_kill::take().is_empty(),
+            "and nothing may be signalled at a turn that was never stopped"
+        );
+        assert_eq!(
+            crate::state::bridge_turn_status(&conn, "turn-new").expect("status"),
+            Some("running".to_string())
+        );
+    }
+
+    /// Sixty quiet seconds prove only that the identity write is late —
+    /// not that no process exists (the CLI can die between a successful
+    /// spawn and the write, leaving a live group). Past the grace the turn
+    /// is alarmed ONCE and KEPT: no terminal status, no marker clearing,
+    /// in both the `running` and the raced-`stopping` shapes.
+    #[test]
+    fn an_identityless_turn_is_alarmed_and_kept_not_buried() {
+        let _guard = crate::state::test_env_lock();
+        for stopping in [false, true] {
+            let conn = create_state_db_in_memory().expect("db");
+            let _ = crate::claude::test_kill::take();
+            crate::state::register_bridge_turn(
+                &conn,
+                "turn-1",
+                "sess-1",
+                "/tmp/t.log",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                1000,
+            )
+            .expect("register");
+            if stopping {
+                crate::state::mark_bridge_turn_stopping(&conn, "turn-1", 1500).expect("stop");
+            }
+            let expected_status = if stopping { "stopping" } else { "running" };
+
+            // Two ticks past the grace: the alarm must fire exactly once.
+            process_bridge_turns(&conn, &bridge_test_config(), 1000 + IDENTITY_GRACE_MS + 1)
+                .expect("cycle");
+            process_bridge_turns(
+                &conn,
+                &bridge_test_config(),
+                1000 + IDENTITY_GRACE_MS + 5000,
+            )
+            .expect("cycle again");
+
+            let (status, marker): (String, i64) = conn
+                .query_row(
+                    "SELECT status, cleanup_pending FROM bridge_turns",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("row");
+            assert_eq!(
+                status, expected_status,
+                "no evidence, no terminal: a live group may exist behind this row"
+            );
+            if !stopping {
+                assert_eq!(marker, 1, "and the birth debt stays on the books");
+            }
+            assert!(
+                crate::claude::test_kill::take().is_empty(),
+                "stopping={stopping}: nothing may be signalled without an identity"
+            );
+            let notice: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM outbound_events
+                     WHERE json_extract(payload_json, '$.eventKey') = 'identityless-turn:turn-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count");
+            assert_eq!(
+                notice, 1,
+                "stopping={stopping}: alarmed exactly once, kept forever"
+            );
+        }
+    }
+
+    /// A TERMINAL row that still carries the cleanup marker is walked by
+    /// the daemon end to end: scanned (a running-only scan never saw it),
+    /// probed, and — once the group is proven empty — released; prune
+    /// spares it while marked and collects it after.
+    #[test]
+    fn a_terminal_marked_row_is_supervised_until_proven_empty() {
+        use crate::claude::Liveness;
+        let _guard = crate::state::test_env_lock();
+        for marker in [1_i64, 2] {
+            let conn = create_state_db_in_memory().expect("db");
+            let _ = crate::claude::test_kill::take();
+            crate::state::register_bridge_turn(
+                &conn,
+                "turn-1",
+                "sess-1",
+                "/tmp/t.log",
+                Some(4_000_098),
+                None,
+                None,
+                Some(4_000_098),
+                None,
+                None,
+                1000,
+            )
+            .expect("register");
+            crate::state::mark_bridge_turn_finished(&conn, "turn-1", "failed", 1500).expect("bury");
+            // BOTH marker flavours: `cleanup_pending = 1` in the scan predicate
+            // let value 2 (a failure cleanup racing a terminal writer) slip out
+            // of supervision forever.
+            conn.execute(
+                "UPDATE bridge_turns SET cleanup_pending = ?1 WHERE turn_id = 'turn-1'",
+                rusqlite::params![marker],
+            )
+            .expect("marker");
+
+            let far_future = 1000 + 31 * 24 * 60 * 60 * 1000;
+            crate::state::prune_state_logs(&conn, far_future).expect("prune");
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM bridge_turns", [], |row| row.get(0))
+                .expect("count");
+            assert_eq!(
+                rows, 1,
+                "prune must spare a supervised row, whatever its age"
+            );
+
+            {
+                let _probe = crate::claude::test_group_probe::ProbeGuard::set(Liveness::Ended);
+                process_bridge_turns(&conn, &bridge_test_config(), 2_000).expect("cycle");
+            }
+            let (status, marker): (String, i64) = conn
+                .query_row(
+                    "SELECT status, cleanup_pending FROM bridge_turns",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("row");
+            assert_eq!(status, "failed", "the terminal status is not rewritten");
+            assert_eq!(marker, 0, "but the proven-empty group releases the marker");
+
+            crate::state::prune_state_logs(&conn, far_future).expect("prune again");
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM bridge_turns", [], |row| row.get(0))
+                .expect("count");
+            assert_eq!(rows, 0, "and an unmarked settled row is ordinary history");
+        }
+    }
+
+    /// A turn's ORDINARY end closes what it owns, atomically — completion
+    /// and failure both. These rows never pass the stopping-recovery
+    /// sweeper, so without this their approvals and queued buttons stayed
+    /// answerable after the terminal status.
+    #[test]
+    fn ordinary_terminals_close_owned_dialogs() {
+        let _guard = crate::state::test_env_lock();
+        for answered in [true, false] {
+            let conn = create_state_db_in_memory().expect("db");
+            let log = write_turn_log(
+                &format!("dlg{}-{}", answered as u8, std::process::id()),
+                if answered {
+                    &[r#"{"type":"result","subtype":"success","is_error":false,"result":"答"}"#]
+                } else {
+                    &["no result"]
+                },
+            );
+            crate::state::register_bridge_turn(
+                &conn,
+                "turn-1",
+                "sess-dlg",
+                &log.display().to_string(),
+                Some(4_300_000),
+                None,
+                None,
+                None,
+                None,
+                None,
+                1000,
+            )
+            .expect("register");
+            if !answered {
+                crate::state::record_bridge_turn_exit(&conn, "turn-1", Some(1)).expect("exit");
+            }
+            crate::state::create_pending_approval(
+                &conn,
+                "ap-1",
+                "sess-dlg",
+                "Bash",
+                "x",
+                true,
+                1500,
+                9_000_000_000,
+            )
+            .expect("approval");
+            crate::state::record_approval_turn_owner(&conn, "ap-1", "turn-1").expect("owner");
+            enqueue_outbound_event(
+                &conn,
+                &json!({
+                    "type": "approval_request", "threadId": "sess-dlg",
+                    "eventKey": "approval:ap-1", "observedAt": 1500
+                }),
+                1500,
+                "bridge",
+            )
+            .expect("button");
+
+            process_bridge_turns(&conn, &bridge_test_config(), 20_000).expect("cycle");
+
+            let decision: Option<String> = conn
+                .query_row(
+                    "SELECT decision FROM pending_approvals WHERE approval_id = 'ap-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("row");
+            assert_eq!(
+                decision.as_deref(),
+                Some("expired"),
+                "answered={answered}: the dialog closes with the terminal status"
+            );
+            let buttons: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM outbound_events
+                     WHERE json_extract(payload_json, '$.eventKey') = 'approval:ap-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count");
+            assert_eq!(
+                buttons, 0,
+                "answered={answered}: and its queued button is withdrawn"
+            );
+        }
+    }
+
+    /// Orphan reclaim: an object no row references is removed once past
+    /// the grace; a referenced one is untouched; a FRESH unreferenced one
+    /// survives — that window is a CLI between `create` and its
+    /// registration commit, or a parallel test with rows in its own
+    /// database.
+    #[test]
+    fn orphan_turn_objects_are_reclaimed_after_the_grace() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-gcroot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let _root_guard = crate::state::EnvVarGuard::set("TINYCTB_CGROUP_ROOT", &root);
+        let conn = create_state_db_in_memory().expect("db");
+
+        let orphan = root.join("turn-orphan");
+        fs::create_dir(&orphan).expect("orphan");
+        let owned = root.join("turn-owned");
+        fs::create_dir(&owned).expect("owned");
+        crate::state::register_bridge_turn(
+            &conn,
+            "owned",
+            "sess-gc",
+            "/tmp/t.log",
+            Some(4_200_000),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        crate::state::record_turn_cgroup(&conn, "owned", owned.to_str().expect("utf8"))
+            .expect("bind");
+
+        gc_orphan_turn_objects(&conn, Duration::ZERO).expect("gc");
+        assert!(!orphan.exists(), "an unreferenced object is reclaimed");
+        assert!(owned.exists(), "a referenced object is untouched");
+
+        fs::create_dir(&orphan).expect("fresh orphan");
+        gc_orphan_turn_objects(&conn, Duration::from_secs(600)).expect("gc");
+        assert!(
+            orphan.exists(),
+            "a fresh object survives the grace — the create→register window"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A member process entering a turn's object exactly as spawned turns
+    /// do: fork-time raw write into cgroup.procs.
+    #[cfg(target_os = "linux")]
+    fn spawn_member_into(dir: &std::path::Path) -> std::process::Child {
+        let procs = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("cgroup.procs"))
+            .expect("open cgroup.procs");
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let fd = procs.as_raw_fd();
+        let mut command = std::process::Command::new("sleep");
+        command
+            .arg("300")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: raw write on an inherited fd, nothing else.
+        unsafe {
+            command.pre_exec(move || {
+                let buf = b"0\n";
+                if libc::write(fd, buf.as_ptr().cast(), buf.len()) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("spawn member");
+        drop(procs);
+        child
+    }
+
+    /// A turn's ORDINARY end sweeps its object too. An answered turn whose
+    /// background survivor keeps the cgroup populated must not slip out of
+    /// every scan as `done` — the settlement kills the tree, proves it
+    /// empty, and removes the object. Likewise the no-answer failure path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ordinary_completion_and_failure_sweep_the_object() {
+        let _guard = crate::state::test_env_lock();
+        for answered in [true, false] {
+            let conn = create_state_db_in_memory().expect("db");
+            let _ = crate::claude::test_kill::take();
+            let turn_id = format!("cgend{}-{}", answered as u8, std::process::id());
+            let Some(dir) = crate::claude::turn_cgroup::create(&turn_id) else {
+                eprintln!("host cannot provide a cgroup subtree; skipping");
+                return;
+            };
+            let log = write_turn_log(
+                &format!("{turn_id}-log"),
+                if answered {
+                    &[r#"{"type":"result","subtype":"success","is_error":false,"result":"答案"}"#]
+                } else {
+                    &["no result at all"]
+                },
+            );
+            crate::state::register_bridge_turn(
+                &conn,
+                &turn_id,
+                "sess-cgend",
+                &log.display().to_string(),
+                Some(4_100_100),
+                None,
+                None,
+                None,
+                None,
+                None,
+                1000,
+            )
+            .expect("register");
+            crate::state::record_turn_cgroup(&conn, &turn_id, &dir.display().to_string())
+                .expect("bind");
+            if !answered {
+                // The leader is reaped without an answer: the failure path.
+                crate::state::record_bridge_turn_exit(&conn, &turn_id, Some(0)).expect("exit");
+            }
+
+            // The background survivor, plus a stand-in for init that reaps
+            // it once the sweep's kill lands.
+            let member = spawn_member_into(&dir);
+            let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut member = member;
+                let _ = member.wait();
+                let _ = reaped_tx.send(());
+            });
+
+            process_bridge_turns(&conn, &bridge_test_config(), 20_000).expect("cycle");
+
+            assert!(
+                reaped_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+                "answered={answered}: the survivor must be killed by the settlement sweep"
+            );
+            let (status, marker): (String, i64) = conn
+                .query_row(
+                    "SELECT status, cleanup_pending FROM bridge_turns",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("row");
+            assert_eq!(
+                status,
+                if answered { "done" } else { "failed" },
+                "answered={answered}"
+            );
+            assert_eq!(
+                marker, 0,
+                "answered={answered}: emptiness proven, supervision released"
+            );
+            assert!(
+                !dir.exists(),
+                "answered={answered}: the object goes with the turn"
+            );
+        }
+    }
+
+    /// The ownership object drives recovery END TO END on a REAL kernel
+    /// cgroup: a populated object reads Alive (and the turn is
+    /// re-signalled), an emptied one settles the turn, and the settle
+    /// removes the object. No pids are consulted anywhere.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_ownership_drives_recovery_end_to_end() {
+        let _guard = crate::state::test_env_lock();
+        let conn = create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        let turn_id = format!("cgtest-{}", std::process::id());
+        let Some(dir) = crate::claude::turn_cgroup::create(&turn_id) else {
+            eprintln!("host cannot provide a cgroup subtree; skipping");
+            return;
+        };
+        crate::state::register_bridge_turn(
+            &conn,
+            &turn_id,
+            "sess-cg",
+            "/tmp/t.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        crate::state::record_turn_cgroup(&conn, &turn_id, &dir.display().to_string())
+            .expect("bind");
+        crate::state::mark_bridge_turn_stopping(&conn, &turn_id, 1500).expect("stop");
+
+        // A REAL member enters the object the same way spawned turns do:
+        // by writing itself into cgroup.procs between fork and exec.
+        let procs = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("cgroup.procs"))
+            .expect("open cgroup.procs");
+        let mut member = {
+            use std::os::unix::io::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            let fd = procs.as_raw_fd();
+            let mut command = std::process::Command::new("sleep");
+            command
+                .arg("300")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            // SAFETY: raw write on an inherited fd, nothing else.
+            unsafe {
+                command.pre_exec(move || {
+                    let buf = b"0\n";
+                    if libc::write(fd, buf.as_ptr().cast(), buf.len()) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command.spawn().expect("spawn member")
+        };
+        drop(procs);
+
+        let turn = crate::state::list_running_bridge_turns(&conn)
+            .expect("turns")
+            .into_iter()
+            .find(|turn| turn.turn_id == turn_id)
+            .expect("turn");
+        assert_eq!(
+            turn.cgroup_path.as_deref(),
+            Some(dir.to_str().expect("utf8")),
+            "the row must carry its ownership object"
+        );
+
+        let settled = advance_stopping_turn(&conn, &turn, 5_000).expect("advance");
+        assert!(!settled, "a populated object must not settle");
+        assert_eq!(
+            crate::claude::test_kill::take().len(),
+            1,
+            "and the live group is re-signalled"
+        );
+
+        let _ = member.kill();
+        let _ = member.wait();
+
+        let settled = advance_stopping_turn(&conn, &turn, 9_000).expect("advance");
+        assert!(settled, "an emptied object settles the turn");
+        assert_eq!(
+            crate::state::bridge_turn_status(&conn, &turn_id).expect("status"),
+            Some("stopped".to_string())
+        );
+        assert!(!dir.exists(), "and the settle removes the ownership object");
+    }
+
+    /// A supervised (cleanup-marked) turn is held open through Alive and
+    /// Unknown verdicts — status untouched, marker kept — and released
+    /// exactly when the group is proven empty: settled, marker lifted.
+    #[test]
+    fn supervision_ends_only_when_the_group_is_proven_empty() {
+        use crate::claude::Liveness;
+        let _guard = crate::state::test_env_lock();
+        let conn = create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-1",
+            "sess-1",
+            "/tmp/t.log",
+            Some(4_000_095),
+            None,
+            None,
+            Some(4_000_095),
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        conn.execute(
+            "UPDATE bridge_turns SET cleanup_pending = 1 WHERE turn_id = 'turn-1'",
+            [],
+        )
+        .expect("marker");
+        let turn = crate::state::list_running_bridge_turns(&conn)
+            .expect("turns")
+            .into_iter()
+            .next()
+            .expect("turn");
+        let state = |conn: &Connection| -> (String, i64) {
+            conn.query_row(
+                "SELECT status, cleanup_pending FROM bridge_turns",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row")
+        };
+
+        {
+            let _probe = crate::claude::test_group_probe::ProbeGuard::set(Liveness::Alive);
+            advance_stopping_turn(&conn, &turn, 5_000).expect("advance");
+        }
+        assert_eq!(
+            state(&conn),
+            ("running".to_string(), 1),
+            "a live group keeps the row open and supervised"
+        );
+
+        {
+            let _probe = crate::claude::test_group_probe::ProbeGuard::set(Liveness::Ended);
+            advance_stopping_turn(&conn, &turn, 9_000).expect("advance");
+        }
+        assert_eq!(
+            state(&conn),
+            ("stopped".to_string(), 0),
+            "a proven-empty group settles the row and lifts the marker"
+        );
+    }
+
+    /// Re-kills of a stopping turn back off exponentially: each attempt can
+    /// hold the daemon loop for seconds of confirmation, so a group that
+    /// shrugs KILL off must not be re-signalled every cycle.
+    #[test]
+    fn alive_rekills_back_off_between_attempts() {
+        use crate::claude::Liveness;
+        let _guard = crate::state::test_env_lock();
+        let conn = create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-1",
+            "sess-1",
+            "/tmp/t.log",
+            Some(4_000_085),
+            None,
+            None,
+            Some(4_000_085),
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        crate::state::mark_bridge_turn_stopping(&conn, "turn-1", 1500).expect("intent");
+        let _probe = crate::claude::test_group_probe::ProbeGuard::set(Liveness::Alive);
+        let turn = crate::state::list_running_bridge_turns(&conn)
+            .expect("turns")
+            .into_iter()
+            .next()
+            .expect("turn");
+
+        advance_stopping_turn(&conn, &turn, 5_000).expect("advance");
+        assert_eq!(
+            crate::claude::test_kill::take(),
+            vec![4_000_085],
+            "the first pass signals"
+        );
+        advance_stopping_turn(&conn, &turn, 5_500).expect("advance");
+        assert!(
+            crate::claude::test_kill::take().is_empty(),
+            "a re-kill inside the backoff window must be skipped"
+        );
+        advance_stopping_turn(&conn, &turn, 8_000).expect("advance");
+        assert_eq!(
+            crate::claude::test_kill::take(),
+            vec![4_000_085],
+            "past the window it signals again"
+        );
+        // Wall-clock regression fails OPEN: a stamp from the future must
+        // not freeze retries until the clock catches back up to it.
+        conn.execute(
+            "UPDATE bridge_turns SET last_stop_attempt_at = 1000000 WHERE turn_id = 'turn-1'",
+            [],
+        )
+        .expect("future stamp");
+        advance_stopping_turn(&conn, &turn, 9_000).expect("advance");
+        assert_eq!(
+            crate::claude::test_kill::take(),
+            vec![4_000_085],
+            "a future stamp must not freeze the re-kill"
+        );
+    }
+
     #[test]
     fn a_silent_candidate_does_not_block_a_working_one() {
         let dir = temp_dir("parallel");
@@ -2486,10 +3882,11 @@ mod tests {
     /// and ours must come first so a desktop-launched daemon uses its own.
     #[test]
     fn x_candidates_accept_display_without_xauthority() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
-        let previous = (env::var("DISPLAY").ok(), env::var("XAUTHORITY").ok());
-        env::set_var("DISPLAY", ":99");
-        env::remove_var("XAUTHORITY");
+        let _guard = crate::state::test_env_lock();
+        // RAII: asserts fire BETWEEN the mutations below, so a failure must
+        // still hand the session's real DISPLAY/XAUTHORITY back.
+        let _display = crate::state::EnvVarGuard::set("DISPLAY", ":99");
+        let _xauthority = crate::state::EnvVarGuard::clear("XAUTHORITY");
         let candidates = x_environment_candidates();
         assert_eq!(
             candidates.first(),
@@ -2512,15 +3909,6 @@ mod tests {
                 .any(|(display, _)| display.is_empty()),
             "an empty DISPLAY must never be offered"
         );
-
-        match previous.0 {
-            Some(value) => env::set_var("DISPLAY", value),
-            None => env::remove_var("DISPLAY"),
-        }
-        match previous.1 {
-            Some(value) => env::set_var("XAUTHORITY", value),
-            None => env::remove_var("XAUTHORITY"),
-        }
     }
 
     #[test]
@@ -2528,7 +3916,7 @@ mod tests {
         if !cfg!(any(target_os = "linux", target_os = "macos")) {
             return;
         }
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = TempServiceEnv::new("install-dry-run");
         let result = install_daemon_service(DEFAULT_DAEMON_LABEL, "bin/tinyctb", true)
             .expect("daemon install dry run");
@@ -2549,7 +3937,7 @@ mod tests {
         // away marker: these write it through the shared state dir, and an
         // unlocked writer flipping it mid-run is what made the question-gate
         // tests fail intermittently.
-        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env_guard = crate::state::test_env_lock();
         let conn = create_state_db_in_memory().expect("db");
         let event = json!({
             "type": "thread_waiting",
@@ -2598,7 +3986,7 @@ mod tests {
         // away marker: these write it through the shared state dir, and an
         // unlocked writer flipping it mid-run is what made the question-gate
         // tests fail intermittently.
-        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env_guard = crate::state::test_env_lock();
         let conn = create_state_db_in_memory().expect("db");
         let log = write_turn_log(
             "sess-log-1000",
@@ -2708,7 +4096,7 @@ mod tests {
         // away marker: these write it through the shared state dir, and an
         // unlocked writer flipping it mid-run is what made the question-gate
         // tests fail intermittently.
-        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env_guard = crate::state::test_env_lock();
         let conn = create_state_db_in_memory().expect("db");
         let completed = json!({
             "type": "thread_completed",
@@ -2824,7 +4212,7 @@ mod tests {
         // away marker: these write it through the shared state dir, and an
         // unlocked writer flipping it mid-run is what made the question-gate
         // tests fail intermittently.
-        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env_guard = crate::state::test_env_lock();
         let conn = create_state_db_in_memory().expect("db");
         crate::claude::set_away_mode(&conn, true, 500).expect("away on");
         let event = |etype: &str, thread: &str, key: &str, at: u64, kind: &str| {
@@ -3044,6 +4432,7 @@ mod tests {
             pgid: None,
             proc_start_ticks: None,
             boot_id: None,
+            cgroup_path: None,
         };
         // Sabotage the outbox: every insert aborts, as a full-disk or
         // corrupted database would.
@@ -3125,6 +4514,7 @@ mod tests {
             pgid: None,
             proc_start_ticks: None,
             boot_id: None,
+            cgroup_path: None,
         };
         // The identity write lands before the verdict is applied.
         assert_eq!(
@@ -3214,7 +4604,8 @@ mod tests {
             1000,
         )
         .expect("register");
-        crate::state::record_bridge_turn_exit(&conn, own_pid, Some(1)).expect("record exit");
+        crate::state::record_bridge_turn_exit(&conn, "sess-exit-1000", Some(1))
+            .expect("record exit");
 
         let summary = process_bridge_turns(&conn, &bridge_test_config(), 20_000).expect("process");
         assert_eq!(summary["failed"], 1, "{summary}");
@@ -3224,6 +4615,48 @@ mod tests {
             })
             .expect("failure row");
         assert!(payload.contains("status 1"), "payload: {payload}");
+    }
+
+    /// A reaped exit lands on exactly the reaped TURN. Two active rows can
+    /// share a pid across a daemon restart (recycling); stamping by pid
+    /// marked both, and the innocent one was then settled as a crash.
+    #[test]
+    fn a_reaped_exit_marks_only_its_own_turn() {
+        let conn = create_state_db_in_memory().expect("db");
+        for turn_id in ["turn-stale", "turn-fresh"] {
+            crate::state::register_bridge_turn(
+                &conn,
+                turn_id,
+                "sess-1",
+                "/tmp/t.log",
+                Some(7_777),
+                None,
+                None,
+                Some(7_777),
+                None,
+                None,
+                1000,
+            )
+            .expect("register");
+        }
+        crate::state::mark_bridge_turn_stopping(&conn, "turn-stale", 1500).expect("intent");
+
+        crate::state::record_bridge_turn_exit(&conn, "turn-fresh", Some(0)).expect("record");
+
+        let exited = |turn: &str| -> i64 {
+            conn.query_row(
+                "SELECT exited FROM bridge_turns WHERE turn_id = ?1",
+                [turn],
+                |row| row.get(0),
+            )
+            .expect("row")
+        };
+        assert_eq!(exited("turn-fresh"), 1, "the reaped turn records its exit");
+        assert_eq!(
+            exited("turn-stale"),
+            0,
+            "the stale turn sharing the pid must NOT be marked exited"
+        );
     }
 
     /// PID reuse after a daemon restart can make `kill -0` lie forever; the
@@ -3424,7 +4857,7 @@ mod tests {
         // away marker: these write it through the shared state dir, and an
         // unlocked writer flipping it mid-run is what made the question-gate
         // tests fail intermittently.
-        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env_guard = crate::state::test_env_lock();
         let conn = create_state_db_in_memory().expect("db");
         set_away_mode(&conn, true, 2000).expect("away on");
         let events = vec![
@@ -3452,7 +4885,7 @@ mod tests {
         // away marker: these write it through the shared state dir, and an
         // unlocked writer flipping it mid-run is what made the question-gate
         // tests fail intermittently.
-        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env_guard = crate::state::test_env_lock();
         let conn = create_state_db_in_memory().expect("db");
         set_away_mode(&conn, true, 1_776_219_288_240).expect("away on");
         let events = vec![
@@ -3481,7 +4914,7 @@ mod tests {
         // away marker: these write it through the shared state dir, and an
         // unlocked writer flipping it mid-run is what made the question-gate
         // tests fail intermittently.
-        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env_guard = crate::state::test_env_lock();
         let conn = create_state_db_in_memory().expect("db");
         let no_filter: Option<&std::collections::BTreeSet<String>> = None;
 
@@ -3548,7 +4981,7 @@ mod tests {
         // away marker: these write it through the shared state dir, and an
         // unlocked writer flipping it mid-run is what made the question-gate
         // tests fail intermittently.
-        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env_guard = crate::state::test_env_lock();
         let conn = create_state_db_in_memory().expect("db");
         let no_filter: Option<&std::collections::BTreeSet<String>> = None;
 
@@ -3587,7 +5020,7 @@ mod tests {
         // away marker: these write it through the shared state dir, and an
         // unlocked writer flipping it mid-run is what made the question-gate
         // tests fail intermittently.
-        let _env_guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env_guard = crate::state::test_env_lock();
         let conn = create_state_db_in_memory().expect("db");
         set_away_mode(&conn, true, 1000).expect("away on");
         let event = json!({

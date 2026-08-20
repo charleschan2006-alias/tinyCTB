@@ -44,9 +44,9 @@ use std::time::Duration;
 use crate::claude::{generate_session_uuid, truncate_tool_detail};
 use crate::config::load_daemon_config;
 use crate::state::{
-    approval_auto_allowed, approval_decision, create_pending_approval, create_state_db,
-    enqueue_outbound_event, insert_telegram_callback_route, remote_mode_status_path,
-    set_approval_auto_allow, state_db_path, TelegramCallbackAction, TelegramCallbackRoute,
+    approval_auto_allowed, approval_decision, create_state_db, enqueue_outbound_event,
+    insert_telegram_callback_route, remote_mode_status_path, set_approval_auto_allow,
+    state_db_path, TelegramCallbackAction, TelegramCallbackRoute,
 };
 
 /// How often a blocked gate re-reads its answer row AND the keypress
@@ -722,6 +722,15 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
     // already granted this, and presence must never resurrect a prompt they
     // paid a tap to silence.
     if approval_auto_allowed(&conn, &thread_id, &tool_name)? {
+        // The session grant is standing, but its CONSUMPTION still passes
+        // the final owner re-check: a `/stop` that already committed must
+        // not have tools riding a pre-stop grant.
+        if kind == GateKind::Headless && !consume_headless_authorization(&conn)? {
+            return Ok(kind.deny(&format!(
+                "this bridge turn was stopped, so the session grant for {tool_name} \
+                 no longer applies and it was not run. Do not retry; stop."
+            )));
+        }
         return Ok(kind.allow(&format!(
             "{tool_name} was approved for this session from Telegram"
         )));
@@ -765,46 +774,38 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
     } else {
         Duration::from_secs(claude.approval_timeout_seconds.clamp(5, 86_400))
     };
-    create_pending_approval(
+    let owning_turn = std::env::var(crate::claude::BRIDGE_TURN_ENV).ok();
+    match publish_approval_request(
         &conn,
+        &telegram.chat_id,
         &approval_id,
         &thread_id,
         &tool_name,
         &summary,
         kind == GateKind::Headless,
+        owning_turn.as_deref(),
+        payload.get("cwd").and_then(Value::as_str),
         now,
         now + wait.as_millis() as u64,
-    )?;
-
-    // The buttons are registered before the message is sent so the callback
-    // can be resolved the moment the user taps.
-    let buttons = approval_answer_buttons(&conn, &telegram.chat_id, &thread_id, &approval_id, now)?;
-
-    // Whether silence will deny is part of the request, not a footnote: the
-    // user decides differently when "ignore it" means "the task stops here".
-    // The admission check already proved this is a running bridge turn.
-    let blocking = kind == GateKind::Headless;
-    let cwd = payload.get("cwd").and_then(Value::as_str);
-    let event = json!({
-        "type": "approval_request",
-        "threadId": thread_id,
-        "approvalId": approval_id,
-        "toolName": tool_name,
-        "observedAt": now,
-        "eventKey": format!("approval:{approval_id}"),
-        "lastPreview": summary,
-        "buttons": buttons,
-        "headless": blocking,
-        "thread": {
-            "threadId": thread_id,
-            "cwd": cwd,
-            "project": crate::projects::derive_project_label(cwd),
-            "lastPreview": summary
+    )? {
+        // Fresh, or already open from an interrupted run of this same
+        // gate: either way the row is live and the wait below owns it.
+        Publication::Published | Publication::AlreadyPublished => {}
+        // Republished after an answer: honour it, never re-ask — reopening
+        // is how a stale sibling button once flipped a deny into an allow.
+        Publication::AlreadyDecided(decision) => {
+            return apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now);
         }
-    });
-    // origin "bridge": an approval request is something the user asked for by
-    // going away, and it must survive /back's away-backlog cleanup.
-    enqueue_outbound_event(&conn, &event, now, "bridge")?;
+        // The admission check saw `running`, but `/stop` committed in
+        // between: publication re-verifies the owner INSIDE its
+        // transaction, and a refusal means the stop won.
+        Publication::OwnerNotRunning => {
+            return Ok(kind.deny(&format!(
+                "this bridge turn is being stopped, so its approval window is closed and \
+                 {tool_name} was not run. Do not retry; stop."
+            )));
+        }
+    }
 
     // --- wait for the answer ----------------------------------------------
     let deadline = std::time::Instant::now() + wait;
@@ -813,6 +814,17 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
         if let Some(decision) = approval_decision(&conn, &approval_id)? {
             if decision != "expired" {
                 return apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now);
+            }
+            // Someone else closed this window — for a headless turn that is
+            // `/stop` sweeping the dialogs the turn owns. Polling out the
+            // remaining window (up to a day) would hold the tool blocked
+            // for a turn the user already ended; the honest ending is the
+            // same one a timeout reaches, now.
+            if kind == GateKind::Headless {
+                return Ok(kind.deny(&format!(
+                    "this approval was closed by the bridge (the turn is being \
+                     stopped), so {tool_name} was not run. Do not retry; stop."
+                )));
             }
         }
         // The user is back — input devices woke up, or `/back` arrived. Hand
@@ -1169,6 +1181,42 @@ fn answered(questions: &[Value], question_text: &str, answer: &str) -> Value {
 
 /// Turn a recorded answer into the hook's reply. Kept in one place so the
 /// polling loop and the timeout race resolve an answer identically.
+/// The FINAL consumption of any authorization by a HEADLESS gate:
+/// re-verifies, in one IMMEDIATE transaction, that the owning turn is
+/// still `running`. `/stop` commits `stopping` and its dialog sweep
+/// atomically, so whichever transaction commits second sees the other — a
+/// stop that landed first turns this into a deny; one that lands after
+/// has its group kill already aimed at whatever the tool starts. The
+/// admission check alone was a single look at entry; a session auto-allow
+/// or an already-recorded `allow` could otherwise ride past a stop that
+/// committed while the gate was waiting.
+fn consume_headless_authorization(conn: &rusqlite::Connection) -> Result<bool> {
+    let Some(turn_id) = std::env::var(crate::claude::BRIDGE_TURN_ENV)
+        .ok()
+        .filter(|token| !token.is_empty())
+    else {
+        // No owner token: not a bridge turn; nothing to re-verify.
+        return Ok(true);
+    };
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let row: Option<(String, i64)> = {
+        use rusqlite::OptionalExtension as _;
+        tx.query_row(
+            "SELECT status, cleanup_pending FROM bridge_turns WHERE turn_id = ?1",
+            rusqlite::params![turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+    };
+    tx.commit()?;
+    // `running` alone is not enough: a row still in birth debt, or one
+    // whose cleanup marker landed while the stopping CAS has not yet, must
+    // not have tools riding through the window. The identity handshake at
+    // admission pays a healthy newborn's debt BEFORE any consumption, so
+    // this never blocks the ordinary path.
+    Ok(matches!(row, Some((status, marker)) if status == "running" && marker == 0))
+}
+
 fn apply_decision(
     conn: &rusqlite::Connection,
     kind: GateKind,
@@ -1177,6 +1225,18 @@ fn apply_decision(
     decision: &str,
     now: u64,
 ) -> Result<Value> {
+    // Every allow-shaped decision for a headless turn passes the final
+    // owner re-check, whatever path delivered it here (a fresh tap, a
+    // pre-recorded decision, a replayed publication).
+    if kind == GateKind::Headless
+        && matches!(decision, "allow" | "allow_session")
+        && !consume_headless_authorization(conn)?
+    {
+        return Ok(kind.deny(&format!(
+            "this bridge turn was stopped before the authorization for {tool_name} \
+             could be used, so it was not run. Do not retry; stop."
+        )));
+    }
     match decision {
         "allow" => Ok(kind.allow("Approved from Telegram")),
         "allow_session" => {
@@ -1205,6 +1265,124 @@ fn apply_decision(
 /// the blocked hook polls the ROW, so any registered button that writes the
 /// row answers it — whichever message the user happens to have in front of
 /// them. One-answer-per-approval is enforced by the row, not the message.
+/// Publish an approval request ATOMICALLY: the owner re-verification, the
+/// approval row, its callback routes, and the outbox button commit — or
+/// vanish — together. Published piecemeal, a `/stop` that landed between
+/// the row and the button found nothing to withdraw yet, and the stopped
+/// turn still received a live-looking button.
+///
+/// IMMEDIATE, so the owner check and every write serialise against the
+/// stop's intent transaction: whichever commits second sees the other's
+/// work in full — a stop after this commit sweeps everything published
+/// here; a stop before it makes this refuse.
+///
+/// It is also idempotent by APPROVAL ID: the same `tool_use_id`
+/// republished (an interrupted gate re-run, a redelivered hook) must not
+/// reopen a decided prompt — REPLACE semantics here once reset a recorded
+/// `deny` to NULL, pushed no new message (the outbox key already existed),
+/// and left a stale sibling button able to flip the answer to allow. An
+/// existing OPEN row keeps its routes and button untouched; an existing
+/// decision is handed back to be honoured, never re-asked.
+///
+/// `headless` doubles as the event's blocking flag: whether silence will
+/// deny is part of the request, not a footnote.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn publish_approval_request(
+    conn: &rusqlite::Connection,
+    chat_id: &str,
+    approval_id: &str,
+    thread_id: &str,
+    tool_name: &str,
+    summary: &str,
+    headless: bool,
+    owning_turn: Option<&str>,
+    cwd: Option<&str>,
+    now: u64,
+    expires_at: u64,
+) -> Result<Publication> {
+    use rusqlite::OptionalExtension as _;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    if let Some(turn_id) = owning_turn {
+        let status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM bridge_turns WHERE turn_id = ?1",
+                rusqlite::params![turn_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if status.as_deref() != Some("running") {
+            return Ok(Publication::OwnerNotRunning);
+        }
+    }
+    let existing: Option<Option<String>> = tx
+        .query_row(
+            "SELECT decision FROM pending_approvals WHERE approval_id = ?1",
+            rusqlite::params![approval_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(decision) = existing {
+        return Ok(match decision {
+            Some(decision) => Publication::AlreadyDecided(decision),
+            None => Publication::AlreadyPublished,
+        });
+    }
+    crate::state::create_pending_approval(
+        &tx,
+        approval_id,
+        thread_id,
+        tool_name,
+        summary,
+        headless,
+        now,
+        expires_at,
+    )?;
+    if let Some(turn_id) = owning_turn {
+        crate::state::record_approval_turn_owner(&tx, approval_id, turn_id)?;
+    }
+    // Buttons register their callback routes as rows, which is exactly why
+    // they must share this transaction.
+    let buttons = approval_answer_buttons(&tx, chat_id, thread_id, approval_id, now)?;
+    let event = json!({
+        "type": "approval_request",
+        "threadId": thread_id,
+        "approvalId": approval_id,
+        "toolName": tool_name,
+        "observedAt": now,
+        "eventKey": format!("approval:{approval_id}"),
+        "lastPreview": summary,
+        "buttons": buttons,
+        "headless": headless,
+        "thread": {
+            "threadId": thread_id,
+            "cwd": cwd,
+            "project": crate::projects::derive_project_label(cwd),
+            "lastPreview": summary
+        }
+    });
+    // origin "bridge": an approval request is something the user asked for
+    // by going away, and it must survive /back's away-backlog cleanup.
+    enqueue_outbound_event(&tx, &event, now, "bridge")?;
+    tx.commit()?;
+    Ok(Publication::Published)
+}
+
+/// What publishing an approval request actually did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Publication {
+    /// Row, owner, routes and outbox button all committed together.
+    Published,
+    /// The same approval id is already OPEN — its routes and button stand;
+    /// nothing was touched, and the caller should simply wait on it.
+    AlreadyPublished,
+    /// The same approval id was already decided. The decision must be
+    /// honoured, never re-asked.
+    AlreadyDecided(String),
+    /// The owner turn is no longer `running` — `/stop` got there first.
+    /// Nothing was written.
+    OwnerNotRunning,
+}
+
 pub(crate) fn approval_answer_buttons(
     conn: &rusqlite::Connection,
     chat_id: &str,
@@ -1347,6 +1525,108 @@ pub(crate) fn tool_call_summary(tool_name: &str, tool_input: Option<&Value>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The final consumption of an allow re-checks the owner: the SAME
+    /// recorded decision that was honoured while the turn ran must turn
+    /// into a deny once `/stop` has committed — a session grant or a
+    /// pre-recorded allow must not ride past the stop.
+    #[test]
+    fn an_allow_is_not_consumable_after_the_stop_committed() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-g",
+            "sess-g",
+            "/tmp/t.log",
+            Some(4_500),
+            None,
+            None,
+            Some(4_500),
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        let _token = crate::state::EnvVarGuard::set(crate::claude::BRIDGE_TURN_ENV, "turn-g");
+
+        let allowed = apply_decision(&conn, GateKind::Headless, "sess-g", "Bash", "allow", 2000)
+            .expect("apply");
+        assert_eq!(
+            allowed["hookSpecificOutput"]["permissionDecision"], "allow",
+            "while the turn runs, the allow is honoured: {allowed}"
+        );
+
+        crate::state::mark_bridge_turn_stopping(&conn, "turn-g", 3000).expect("stop");
+        let denied = apply_decision(&conn, GateKind::Headless, "sess-g", "Bash", "allow", 4000)
+            .expect("apply");
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"], "deny",
+            "after the stop committed, the same allow must deny: {denied}"
+        );
+        let session = apply_decision(
+            &conn,
+            GateKind::Headless,
+            "sess-g",
+            "Bash",
+            "allow_session",
+            5000,
+        )
+        .expect("apply");
+        assert_eq!(
+            session["hookSpecificOutput"]["permissionDecision"], "deny",
+            "a session grant must not ride past the stop either: {session}"
+        );
+    }
+
+    /// The consumption predicate demands a PAID debt, not just `running`:
+    /// an unresolved birth-debt row must not have tools riding through,
+    /// and the handshake — which pays the debt — is what re-opens the way.
+    #[test]
+    fn an_allow_waits_for_the_identity_debt() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-d",
+            "sess-d",
+            "/tmp/t.log",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        let _token = crate::state::EnvVarGuard::set(crate::claude::BRIDGE_TURN_ENV, "turn-d");
+
+        let denied = apply_decision(&conn, GateKind::Headless, "sess-d", "Bash", "allow", 2000)
+            .expect("apply");
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"], "deny",
+            "an unpaid birth debt must not be ridden through: {denied}"
+        );
+
+        crate::state::record_bridge_turn_spawn(
+            &conn,
+            "turn-d",
+            Some(4_600),
+            None,
+            None,
+            Some(4_600),
+            Some("777"),
+            Some("boot-y"),
+        )
+        .expect("identity write");
+        let allowed = apply_decision(&conn, GateKind::Headless, "sess-d", "Bash", "allow", 3000)
+            .expect("apply");
+        assert_eq!(
+            allowed["hookSpecificOutput"]["permissionDecision"], "allow",
+            "the identity write pays the debt and re-opens the way: {allowed}"
+        );
+    }
     use crate::config::{ClaudeConfig, DaemonConfig, TelegramConfig};
     use crate::state::{record_approval_decision, write_away_marker_for_test};
     use std::fs;
@@ -1450,14 +1730,14 @@ mod tests {
 
     #[test]
     fn gate_stays_out_of_the_way_when_not_away() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("not-away", false, 5);
         assert_eq!(gate(bash_payload()), json!({}), "no opinion while present");
     }
 
     #[test]
     fn gate_skips_bridge_initiated_turns() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("bypass", true, 5);
         let mut payload = bash_payload();
         payload["permission_mode"] = json!("bypassPermissions");
@@ -1474,7 +1754,7 @@ mod tests {
     /// return value alone.
     #[test]
     fn gate_ignores_tools_outside_the_configured_list() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::with_tools("ungated-tool", true, 30, vec!["Bash".to_string()]);
         let mut payload = bash_payload();
         payload["tool_name"] = json!("Read");
@@ -1529,15 +1809,19 @@ mod tests {
     }
 
     fn register_turn_for(conn: &rusqlite::Connection, thread_id: &str) {
+        // With a pid: this helper models an ESTABLISHED running turn, whose
+        // identity write (or cgroup binding) already paid the birth debt —
+        // a debtor row is deliberately denied consumption, and has its own
+        // tests.
         crate::state::register_bridge_turn(
             conn,
             "turn-1",
             thread_id,
             "/tmp/turn.log",
+            Some(4_700),
             None,
             None,
-            None,
-            None,
+            Some(4_700),
             None,
             None,
             900,
@@ -1551,7 +1835,7 @@ mod tests {
     /// "no opinion" as permission to proceed. So silence must deny.
     #[test]
     fn headless_gate_denies_when_nobody_answers() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("headless-timeout", true, 5); // clamped minimum
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
         enter_bridge_turn(&conn, "sess-headless");
@@ -1596,7 +1880,7 @@ mod tests {
     /// have, and sat out the full timeout.
     #[test]
     fn headless_gate_leaves_an_unregistered_session_its_terminal() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("headless-unregistered", true, 30);
         let started = std::time::Instant::now();
         let result = headless_gate(headless_payload());
@@ -1629,7 +1913,7 @@ mod tests {
     /// and certainly not a pass.
     #[test]
     fn headless_gate_denies_stragglers_of_a_settled_turn() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("headless-straggler", true, 30);
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
         enter_bridge_turn(&conn, "sess-headless");
@@ -1660,7 +1944,7 @@ mod tests {
     /// denials inside sessions the bridge does not own.
     #[test]
     fn headless_gate_spares_tokenless_sessions_even_with_broken_state() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("headless-broken-state", true, 30);
         // Point the state dir at a regular FILE: any database open under it
         // fails. The away marker is unreadable too, which must not matter —
@@ -1684,7 +1968,7 @@ mod tests {
     /// for a headless turn the empty object IS the guess, so only deny works.
     #[test]
     fn unknown_decision_resolves_per_gate() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("unknown-decision", true, 30);
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
         let interactive = apply_decision(
@@ -1712,7 +1996,7 @@ mod tests {
     /// unchecked. This is the regression test for exactly that bug.
     #[test]
     fn headless_gate_engages_with_away_off() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("headless-away-off", false, 30);
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
         enter_bridge_turn(&conn, "sess-headless");
@@ -1750,7 +2034,7 @@ mod tests {
     /// execution, and "the config was unreadable" is not an approval.
     #[test]
     fn headless_gate_fails_closed_when_config_is_unreadable() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("headless-bad-config", true, 30);
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
         enter_bridge_turn(&conn, "sess-headless");
@@ -1781,7 +2065,7 @@ mod tests {
     /// same from the return value alone.
     #[test]
     fn headless_gate_does_not_touch_read_only_tools() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("headless-read", true, 30);
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
         enter_bridge_turn(&conn, "sess-headless");
@@ -1816,7 +2100,7 @@ mod tests {
     /// call runs despite the user having denied it.
     #[test]
     fn headless_gate_answers_in_the_pretooluse_contract() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("headless-answered", true, 30);
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
         enter_bridge_turn(&conn, "sess-headless");
@@ -1858,7 +2142,7 @@ mod tests {
     /// requests for it; if neither did, it would run unchecked.
     #[test]
     fn the_two_gates_do_not_overlap() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("gate-split", true, 30);
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
         enter_bridge_turn(&conn, "sess-headless");
@@ -1886,7 +2170,7 @@ mod tests {
     /// (which have no AskUserQuestion tool at all).
     #[test]
     fn prompt_context_matches_where_the_user_is() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("prompt-context", false, 30);
         let run = || {
             let mut reader = std::io::Cursor::new(r#"{"hook_event_name":"UserPromptSubmit"}"#);
@@ -1927,7 +2211,7 @@ mod tests {
     /// terminal, instantly — the push still goes out; presence only decides who ends up answering.
     #[test]
     fn gate_steps_aside_for_a_present_user_but_still_pushes() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("present-user", true, 30);
         std::env::set_var("TINYCTB_TEST_IDLE_MS", "500");
 
@@ -1970,7 +2254,7 @@ mod tests {
     /// (measured 2026-08-17: 21 orphaned gates, 58 stale pushes).
     #[test]
     fn gate_stops_when_the_call_is_decided_in_the_terminal() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("decided-elsewhere", true, 120);
         let transcript = std::env::temp_dir().join(format!(
             "tinyctb-gate-transcript-{}.jsonl",
@@ -2288,7 +2572,7 @@ mod tests {
     /// is exercised here.
     #[test]
     fn keypress_age_reads_the_real_record_and_distrusts_bad_clocks() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let temp = std::env::temp_dir().join(format!("tinyctb-keyage-{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp);
         fs::create_dir_all(&temp).expect("dir");
@@ -2364,7 +2648,7 @@ mod tests {
     /// invisible forever, and the gate sits out its whole window.
     #[test]
     fn a_fast_terminal_answer_is_not_swallowed_by_the_boundary() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("fast-answer", true, 120);
         let transcript =
             std::env::temp_dir().join(format!("tinyctb-fast-answer-{}.jsonl", std::process::id()));
@@ -2436,7 +2720,7 @@ mod tests {
     /// `settling_honours_a_tap_and_only_withdraws_withdrawable_pushes`.
     #[test]
     fn a_tap_during_the_wait_decides_even_as_the_transcript_moves_on() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("tap-wins-race", true, 120);
         let transcript =
             std::env::temp_dir().join(format!("tinyctb-tap-race-{}.jsonl", std::process::id()));
@@ -2504,7 +2788,7 @@ mod tests {
     /// only honest endings stay: an explicit Telegram decision, or deny.
     #[test]
     fn headless_gate_is_not_released_by_a_foreign_assistant_record() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("headless-foreign-assistant", true, 5);
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
         enter_bridge_turn(&conn, "sess-headless");
@@ -2556,7 +2840,7 @@ mod tests {
     /// to it. Both gates.
     #[test]
     fn windowless_sessions_ask_remotely_even_with_away_off() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("windowless-away-off", false, 5);
         std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
         // A windowless gate waits a DAY, so each half needs the transcript
@@ -2635,7 +2919,7 @@ mod tests {
     /// belongs to the terminal outright — no row, no push, no wait.
     #[test]
     fn windowed_question_with_away_off_returns_immediately() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("windowed-away-off", false, 30);
 
         let started = std::time::Instant::now();
@@ -2660,7 +2944,7 @@ mod tests {
     /// still ends the wait early through the transcript watcher.
     #[test]
     fn windowless_question_gets_the_long_window_and_still_exits_on_evidence() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("windowless-question", true, 30);
         std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
         let transcript = std::env::temp_dir().join(format!(
@@ -2724,7 +3008,7 @@ mod tests {
     /// which is also what makes /threads able to re-offer the buttons.
     #[test]
     fn windowless_session_keeps_the_remote_window_open() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("windowless-present", true, 30);
         std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
         // User is at the keyboard — for a windowed session this alone would
@@ -2772,7 +3056,7 @@ mod tests {
     /// still clear it.
     #[test]
     fn returning_user_does_not_steal_a_windowless_prompt() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("windowless-returns", true, 30);
         std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
         std::env::set_var("TINYCTB_TEST_IDLE_MS", "3600000");
@@ -2808,7 +3092,7 @@ mod tests {
     /// are at the keyboard now.
     #[test]
     fn auto_allow_beats_presence() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("auto-allow-present", true, 30);
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
         crate::state::set_approval_auto_allow(&conn, "sess-gate", "Bash", 900).expect("auto allow");
@@ -2829,7 +3113,7 @@ mod tests {
     /// window safe to configure.
     #[test]
     fn gate_releases_to_the_terminal_when_the_user_returns() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("user-returns", true, 30);
         // Idle for an hour when the gate fires.
         std::env::set_var("TINYCTB_TEST_IDLE_MS", "3600000");
@@ -2869,7 +3153,7 @@ mod tests {
     /// prompt to its terminal.
     #[test]
     fn gate_releases_to_the_terminal_on_back() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("back-release", true, 30);
         // No desktop signal at all: presence unknown.
         let returner = std::thread::spawn(|| {
@@ -2892,7 +3176,7 @@ mod tests {
     /// atomic, not a blind expiry.
     #[test]
     fn a_tap_racing_the_returning_user_still_wins() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("tap-vs-return", true, 30);
         std::env::set_var("TINYCTB_TEST_IDLE_MS", "3600000");
 
@@ -2930,7 +3214,7 @@ mod tests {
     /// The safety rule: waiting out the clock is NOT consent.
     #[test]
     fn gate_timeout_never_allows() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("timeout", true, 5); // clamped minimum
         let started = std::time::Instant::now();
         let result = gate(bash_payload());
@@ -2957,7 +3241,7 @@ mod tests {
 
     #[test]
     fn gate_returns_the_answer_given_from_telegram() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("answered", true, 30);
         // Answer asynchronously, as the daemon would on a button tap.
         let handle = std::thread::spawn(|| {
@@ -3003,7 +3287,7 @@ mod tests {
     /// side effect the exited hook can no longer perform).
     #[test]
     fn late_tap_after_timeout_is_refused() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("late-tap", true, 5);
         let result = gate(bash_payload());
         assert_eq!(result, json!({}), "timeout yields no opinion");
@@ -3191,7 +3475,7 @@ mod tests {
     /// model as the tool's own result.
     #[test]
     fn question_gate_returns_the_option_the_user_tapped() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("question-option", true, 30);
         let handle = std::thread::spawn(|| {
             let conn = create_state_db(&state_db_path().expect("path")).expect("db");
@@ -3256,7 +3540,7 @@ mod tests {
     /// `3,1,2`, which is why phases 2 and 3 are one feature.
     #[test]
     fn question_gate_accepts_a_free_text_answer() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("question-text", true, 30);
         let handle = std::thread::spawn(|| {
             let conn = create_state_db(&state_db_path().expect("path")).expect("db");
@@ -3310,7 +3594,7 @@ mod tests {
     /// letter-code shortcut must not treat one as a separator.
     #[test]
     fn a_label_containing_a_comma_survives_a_tap_unchanged() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("question-comma-label", true, 30);
         let handle = std::thread::spawn(|| {
             let conn = create_state_db(&state_db_path().expect("path")).expect("db");
@@ -3374,7 +3658,7 @@ mod tests {
     /// comma-separated reply, the shape the tool documents.
     #[test]
     fn multi_select_question_asks_for_a_comma_separated_reply() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("question-multi", true, 30);
         let handle = std::thread::spawn(|| {
             let conn = create_state_db(&state_db_path().expect("path")).expect("db");
@@ -3436,7 +3720,7 @@ mod tests {
     /// it — a trimmed key would not match `questions[].question`.
     #[test]
     fn answers_key_preserves_the_original_question_text() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("question-key", true, 30);
         let handle = std::thread::spawn(|| {
             let conn = create_state_db(&state_db_path().expect("path")).expect("db");
@@ -3476,7 +3760,7 @@ mod tests {
 
     #[test]
     fn question_gate_stays_out_of_the_way() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("question-skip", true, 30);
 
         // Not the question tool.
@@ -3511,7 +3795,7 @@ mod tests {
     /// is refused rather than reported as accepted.
     #[test]
     fn question_gate_timeout_falls_back_to_the_terminal() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("question-timeout", true, 5);
         let started = std::time::Instant::now();
         assert_eq!(question_gate(question_payload()), json!({}));
@@ -3534,7 +3818,7 @@ mod tests {
     /// an agent doing many Bash calls needs one tap per call.
     #[test]
     fn session_scoped_allow_short_circuits_later_calls() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("session-allow", true, 30);
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
         crate::state::set_approval_auto_allow(&conn, "sess-gate", "Bash", 900).expect("auto allow");

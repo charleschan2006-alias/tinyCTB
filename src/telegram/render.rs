@@ -663,6 +663,8 @@ pub(crate) fn telegram_help_text() -> String {
         "/back - stop remote Claude mode",
         "/threads - show the 5 most recent Claude sessions",
         "/threads <count> - show that many recent Claude sessions",
+        "/stop - stop every running headless turn",
+        "/stop <id> - stop only the session whose id starts with that",
         "/new <prompt> - start a new Claude session",
         "/new - ask for a prompt in a reply",
         "/project - list projects",

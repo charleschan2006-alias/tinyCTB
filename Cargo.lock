@@ -1046,12 +1046,13 @@ dependencies = [
 
 [[package]]
 name = "tinyctb"
-version = "0.2.3"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "clap",
  "dirs",
  "fs2",
+ "libc",
  "notify",
  "rusqlite",
  "serde",

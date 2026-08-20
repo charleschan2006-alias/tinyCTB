@@ -54,6 +54,7 @@ enum TelegramInboundCommand {
     Repair,
     Status,
     Threads(Option<String>),
+    Stop(Option<String>),
     NewThread(Option<String>),
     Project(Option<String>),
     Unknown(String),
@@ -207,6 +208,7 @@ fn send_telegram_command_text(
 }
 
 #[cfg(test)]
+#[cfg(test)]
 fn send_telegram_command_text(
     _telegram: &TelegramConfig,
     text: &str,
@@ -322,6 +324,7 @@ fn parse_telegram_command_text(text: &str) -> Option<TelegramInboundCommand> {
         "/repair" => Some(TelegramInboundCommand::Repair),
         "/status" => Some(TelegramInboundCommand::Status),
         "/threads" => Some(TelegramInboundCommand::Threads(rest.map(str::to_string))),
+        "/stop" => Some(TelegramInboundCommand::Stop(rest.map(str::to_string))),
         "/new" => Some(TelegramInboundCommand::NewThread(rest.map(str::to_string))),
         "/project" => Some(TelegramInboundCommand::Project(rest.map(str::to_string))),
         _ => Some(TelegramInboundCommand::Unknown(raw_command.to_string())),
@@ -747,6 +750,15 @@ pub(crate) fn refresh_telegram_typing_indicators(
         "expired": expired,
         "failed": failed
     }))
+}
+
+/// Clear the typing bubble for a thread, for callers outside this module
+/// that do not hold a `TelegramConfig` (the daemon's stop recovery).
+pub(crate) fn clear_typing_for_thread(conn: &Connection, thread_id: &str) -> Result<()> {
+    let Some(config) = load_daemon_config().ok().and_then(|config| config.telegram) else {
+        return Ok(());
+    };
+    clear_telegram_typing_indicator(conn, &config, thread_id)
 }
 
 fn clear_telegram_typing_indicator(
@@ -1401,6 +1413,488 @@ fn order_threads_for_display(
     threads
 }
 
+/// `/stop <id>` needs at least this many characters. Session ids are UUIDs
+/// and this is the short form `/threads` prints; anything shorter is asking
+/// the bridge to guess, and a wrong guess kills work the user wanted.
+const STOP_TARGET_MIN_CHARS: usize = 8;
+
+/// A prefix long enough to tell this id apart from the others offered.
+/// Printing the same truncated 8 characters twice ("abcd1234、abcd1234") is
+/// worse than useless: it asks for a longer prefix while hiding the
+/// characters that would make one.
+fn disambiguating_prefix(id: &str, others: &std::collections::BTreeSet<&str>) -> String {
+    let chars: Vec<char> = id.chars().collect();
+    for take in STOP_TARGET_MIN_CHARS..=chars.len() {
+        let candidate: String = chars.iter().take(take).collect();
+        if others
+            .iter()
+            .filter(|other| other.starts_with(&candidate))
+            .count()
+            == 1
+        {
+            return candidate;
+        }
+    }
+    id.to_string()
+}
+
+pub(crate) fn short_thread_id(thread_id: &str) -> String {
+    thread_id.chars().take(8).collect()
+}
+
+/// `/stop` — the emergency brake for a headless turn that is running away.
+///
+/// Scope is deliberately narrow: only rows in `bridge_turns` with status
+/// `running`, i.e. turns THIS bridge started for a Telegram message. A
+/// session the user opened in their own terminal has no such row and cannot
+/// be reached from here at all.
+fn execute_stop_command(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    target: Option<&str>,
+    invocation_id: &str,
+    now: u64,
+    timeout: Duration,
+) -> Result<Value> {
+    // A redelivered update resumes its RECORDED operation — never a fresh
+    // interpretation over whatever happens to be running by now. Without
+    // this, a crash after the stops committed replayed into "nothing is
+    // running" while the outbox was saying "stopped"; and an early exit
+    // ("nothing to stop", "ambiguous") replayed after new turns started
+    // would reinterpret into stopping work that did not exist when the
+    // user sent the command.
+    if let Some(stored) = crate::state::stop_operation(conn, invocation_id)? {
+        return resume_stop_operation(conn, telegram, &stored, invocation_id, now, timeout);
+    }
+
+    let target = target.map(str::trim).filter(|value| !value.is_empty());
+    let running = crate::state::list_running_bridge_turns(conn)?;
+
+    if let Some(prefix) = target {
+        if prefix.chars().count() < STOP_TARGET_MIN_CHARS {
+            let text = format!(
+                "`{prefix}` 太短了，至少要 {STOP_TARGET_MIN_CHARS} 位（/threads 显示的短 ID 就是这个长度）。"
+            );
+            // Frozen BEFORE the reply: this resolution is what a redelivery
+            // of the same update must repeat, whatever is running by then.
+            crate::state::record_stop_operation(
+                conn,
+                invocation_id,
+                "too_short",
+                &[],
+                Some(&text),
+                now,
+            )?;
+            let sent = send_telegram_command_text(telegram, &text, timeout).ok();
+            return Ok(json!({
+                "ok": false, "action": "telegram_stop", "reason": "target_too_short",
+                "stopped": 0, "sent": sent
+            }));
+        }
+    }
+
+    // Match the SESSION id only. `turn_id` is an internal handle the user
+    // never sees, and matching it too would let one prefix mean two things.
+    let selected = running
+        .iter()
+        .filter(|turn| match target {
+            Some(prefix) => turn.thread_id.starts_with(prefix),
+            None => true,
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(prefix) = target {
+        let distinct = selected
+            .iter()
+            .map(|turn| turn.thread_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if distinct.len() > 1 {
+            // Refuse rather than fan out: a `/stop` that kills more sessions
+            // than the user meant is exactly the damage this command can do.
+            let text = format!(
+                "`{prefix}` 匹配到 {} 个会话：{}。请给出更长的前缀——我不会替你猜该停哪个。",
+                distinct.len(),
+                distinct
+                    .iter()
+                    .map(|id| disambiguating_prefix(id, &distinct))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            );
+            // Frozen: a replay after one candidate finished must NOT
+            // reinterpret and kill the survivor the user never confirmed.
+            crate::state::record_stop_operation(
+                conn,
+                invocation_id,
+                "ambiguous",
+                &[],
+                Some(&text),
+                now,
+            )?;
+            let sent = send_telegram_command_text(telegram, &text, timeout).ok();
+            return Ok(json!({
+                "ok": false, "action": "telegram_stop", "reason": "ambiguous_target",
+                "matched": distinct.len(), "stopped": 0, "sent": sent
+            }));
+        }
+    }
+
+    if selected.is_empty() {
+        let text = match target {
+            Some(prefix) if !running.is_empty() => format!(
+                "没有匹配 `{prefix}` 的运行中回合。当前运行中：{}",
+                running
+                    .iter()
+                    .map(|turn| short_thread_id(&turn.thread_id))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ),
+            Some(prefix) => format!("没有匹配 `{prefix}` 的运行中回合，当前也没有无头回合在跑。"),
+            None => "没有正在运行的无头回合。".to_string(),
+        };
+        // Frozen: "nothing to stop" is this update's answer FOREVER — a
+        // replay must never become "stop everything" just because new turns
+        // started before the redelivery.
+        crate::state::record_stop_operation(conn, invocation_id, "empty", &[], Some(&text), now)?;
+        // A failed reply must not fail the command: nothing was stopped, but
+        // erroring here would ack the update while reporting "not handled".
+        let sent = send_telegram_command_text(telegram, &text, timeout).ok();
+        return Ok(json!({
+            "ok": sent.is_some(), "action": "telegram_stop", "stopped": 0,
+            "running": running.len(), "sent": sent
+        }));
+    }
+
+    // ONE transaction for the whole ACCEPTANCE: the operation record and,
+    // for every selected turn, its `stopping` CAS, its dialog sweep, and
+    // its REQUESTED receipt. Any failure rolls the entire command back to
+    // "never happened". There is NO automatic retry — the dispatcher
+    // records the error and advances the offset — but because nothing
+    // committed, the user's next /stop interprets a clean world; what the
+    // rollback rules out is the half-accepted state. After the commit, the
+    // daemon owns completion for every turn even if none of the signalling
+    // below ever runs. Committing the acceptance piecemeal was the
+    // review's P1: an intent error midway left earlier turns stopped,
+    // later ones running forever, receipts delivered and the offset
+    // advanced past the update.
+    let turn_ids: Vec<String> = selected.iter().map(|turn| turn.turn_id.clone()).collect();
+    let tx = conn.unchecked_transaction()?;
+    crate::state::record_stop_operation(&tx, invocation_id, "turns", &turn_ids, None, now)?;
+    let mut swept = Vec::with_capacity(selected.len());
+    for turn in &selected {
+        swept.push(stop_intent(&tx, turn, invocation_id, now)?);
+    }
+    tx.commit()?;
+
+    let mut lines = Vec::new();
+    let mut stopped = 0usize;
+    for (turn, settled_prompts) in selected.iter().zip(swept) {
+        let outcome = stop_execute(conn, telegram, turn, invocation_id, settled_prompts, now)?;
+        if outcome.claimed {
+            stopped += 1;
+        }
+        lines.push(outcome.summary);
+    }
+    // No direct send of the outcomes: every summary is already an OUTBOX
+    // row committed with its turn's state change (see `stop_bridge_turn`),
+    // so a crash from here on can neither lose a story nor need a receipt
+    // fallback. The fast lane delivers them within a cycle.
+    Ok(json!({
+        "ok": true, "action": "telegram_stop", "stopped": stopped,
+        "attempted": selected.len(), "queuedSummaries": lines.len(),
+        "summaries": lines
+    }))
+}
+
+/// Resume a `/stop` whose Telegram update was redelivered — strictly from
+/// its RECORDED interpretation. An early-exit resolution replays its stored
+/// reply verbatim. A turn resolution handles each recorded turn by what the
+/// DATABASE says about it now: still running → the stop is performed (the
+/// crash interrupted it); `stopping` → the intent already committed, and
+/// the requested receipt committed with the operation itself, so the daemon
+/// owns the rest; settled → its terminal receipt already committed. Nothing
+/// here re-reads the running set.
+fn resume_stop_operation(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    operation: &crate::state::StopOperation,
+    invocation_id: &str,
+    now: u64,
+    timeout: Duration,
+) -> Result<Value> {
+    if operation.kind != "turns" {
+        // The frozen answer, repeated verbatim; best-effort like the
+        // original (nothing was stopped then, nothing is stopped now).
+        let sent = operation
+            .reply
+            .as_deref()
+            .and_then(|reply| send_telegram_command_text(telegram, reply, timeout).ok());
+        return Ok(json!({
+            "ok": true, "action": "telegram_stop", "replayed": true,
+            "kind": operation.kind, "stopped": 0, "sent": sent
+        }));
+    }
+    let mut lines = Vec::new();
+    let mut stopped = 0usize;
+    for turn_id in &operation.turn_ids {
+        let Some(turn) = crate::state::bridge_turn_by_id(conn, turn_id)? else {
+            lines.push(format!("回合 {turn_id} 已不在记录中"));
+            continue;
+        };
+        match crate::state::bridge_turn_status(conn, turn_id)?.as_deref() {
+            Some("running") => {
+                let outcome = stop_bridge_turn(conn, telegram, &turn, invocation_id, now)?;
+                if outcome.claimed {
+                    stopped += 1;
+                }
+                lines.push(outcome.summary);
+            }
+            Some("stopping") => lines.push(format!(
+                "🧵 {} — 停止中，daemon 在继续确认",
+                short_thread_id(&turn.thread_id)
+            )),
+            status => lines.push(format!(
+                "🧵 {} — 已结束（{}）",
+                short_thread_id(&turn.thread_id),
+                status.unwrap_or("unknown")
+            )),
+        }
+    }
+    Ok(json!({
+        "ok": true, "action": "telegram_stop", "replayed": true,
+        "stopped": stopped, "attempted": operation.turn_ids.len(), "summaries": lines
+    }))
+}
+
+struct StopOutcome {
+    claimed: bool,
+    summary: String,
+}
+
+/// Kill one turn and settle it, in the order crash-consistency demands.
+///
+/// The kill happens BEFORE anything commits: a daemon dying in between
+/// leaves a row still marked `running`, which the next cycle re-examines and
+/// kills again (idempotent). Committing first and crashing before the kill
+/// would instead leave a live process that nothing tracks any more.
+/// The per-turn summary is enqueued into the OUTBOX inside the same
+/// transaction as the turn's state change — never direct-sent. A crash
+/// anywhere after that commit can therefore not stop a turn and lose the
+/// story; the fast lane delivers within a cycle, and per-turn messages stay
+/// far below Telegram's length limit (joint bodies were what once forced
+/// chunking and per-chunk receipts here). The key carries the originating
+/// command, so two `/stop`s against one turn keep both their receipts.
+/// The INTENT half of stopping one turn, run inside the CALLER's
+/// transaction: the CAS to `stopping`, the sweep of the dialogs the turn
+/// owns (from the moment the user said stop, no owned button may accept an
+/// answer), and the REQUESTED receipt. The fresh command path calls this
+/// for every selected turn inside ONE transaction — a failure on any turn
+/// rolls back all of them plus the operation record, because the
+/// alternative left an accepted operation half-executed forever: offset
+/// advanced, receipts delivered, later turns still `running` with no
+/// scanner ever coming back for them.
+fn stop_intent(
+    conn: &Connection,
+    turn: &crate::state::BridgeTurn,
+    invocation_id: &str,
+    now: u64,
+) -> Result<usize> {
+    let label = short_thread_id(&turn.thread_id);
+    crate::state::mark_bridge_turn_stopping(conn, &turn.turn_id, now)?;
+    let settled_prompts = crate::state::settle_prompts_for_turn(conn, &turn.turn_id, now)?;
+    let requested = format!(
+        "🧵 {label} — 停止请求已受理，正在终止…{}",
+        if settled_prompts > 0 {
+            format!("（已关闭 {settled_prompts} 个等待中的对话框）")
+        } else {
+            String::new()
+        }
+    );
+    enqueue_stop_summary(conn, turn, invocation_id, "requested", &requested, now)?;
+    Ok(settled_prompts)
+}
+
+/// The SIGNALLING half, strictly AFTER the intent committed. From that
+/// commit on the daemon's recovery loop owns completion: an error here (or
+/// a crash) leaves the turn `stopping` — re-killed with backoff, settled
+/// with its terminal receipt — never a `running` row nobody scans.
+///
+/// Settle only what we can PROVE is gone. `kill_turn_process` declines to
+/// signal when the recorded identity no longer matches the pid (restarted
+/// daemon, recycled pid), and reports separately when it signalled but
+/// could not reap in the bound. Recording either as `stopped` would drop a
+/// live process out of every later scan.
+fn stop_execute(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    turn: &crate::state::BridgeTurn,
+    invocation_id: &str,
+    settled_prompts: usize,
+    now: u64,
+) -> Result<StopOutcome> {
+    use crate::claude::KillOutcome;
+    let label = short_thread_id(&turn.thread_id);
+    // The command's own kill is attempt zero — unrecorded, the daemon's
+    // next tick would fire a second kill within a second of this one.
+    crate::state::record_stop_attempt(conn, &turn.turn_id, now)?;
+    // `exited` only means the LEADER was reaped. A grandchild can outlive
+    // it and keep doing exactly what the turn was doing, so the kill path
+    // runs regardless and the group is what decides.
+    let outcome = crate::claude::kill_turn_process(turn);
+    if outcome != KillOutcome::Terminated {
+        let reason = match outcome {
+            KillOutcome::Unverified => {
+                "无法确认进程身份（daemon 重启过或 pid 已被复用），拒绝发信号"
+            }
+            KillOutcome::Undetermined => "已发送终止信号，但未能在限期内确认退出",
+            KillOutcome::Terminated => unreachable!(),
+        };
+        let dialog = if settled_prompts > 0 {
+            format!("已关闭其 {settled_prompts} 个等待中的对话框；")
+        } else {
+            String::new()
+        };
+        let summary = format!(
+            "🧵 {label} — 未确认停止：{reason}。{dialog}回合已标记为停止中，daemon 会持续确认直到整组退出。"
+        );
+        // Best-effort detail: the durable story is already complete without
+        // it (the requested receipt committed with the operation, and the
+        // daemon's recovery settle enqueues the final confirmation) — but a
+        // failure to record it must still be heard somewhere. The SAME
+        // invocation's undelivered "requested" is withdrawn in the same
+        // transaction: retried out of order it would arrive after this,
+        // promising a termination this message already reported on.
+        let queued = (|| -> Result<()> {
+            let tx = conn.unchecked_transaction()?;
+            crate::state::cancel_pending_push_inner(
+                &tx,
+                &format!("stop-summary:{invocation_id}:{}:requested", turn.turn_id),
+                now,
+            )?;
+            enqueue_stop_summary(&tx, turn, invocation_id, "outcome", &summary, now)?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(err) = queued {
+            eprintln!(
+                "tinyctb: failed to queue the stop outcome detail for {}: {err:#}",
+                turn.turn_id
+            );
+        }
+        return Ok(StopOutcome {
+            claimed: false,
+            summary,
+        });
+    }
+
+    // The log tail is read BEFORE the settle transaction so the summary can
+    // commit inside it; the process is dead, the log is stable.
+    let tail = crate::claude::turn_log_tail(std::path::Path::new(&turn.log_path), 300);
+    let ran_for = now.saturating_sub(turn.started_at) / 1000;
+
+    let tx = conn.unchecked_transaction()?;
+    let claimed = crate::state::settle_stopping_turn(&tx, &turn.turn_id, now)?;
+    // The dialogs were already swept in the intent transaction; re-running
+    // is an idempotent no-op that also catches any prompt that raced its
+    // way in between (creation refuses non-running owners, so this is belt
+    // and braces, not load-bearing).
+    let late_prompts = crate::state::settle_prompts_for_turn(&tx, &turn.turn_id, now)?;
+    let settled_prompts = settled_prompts + late_prompts;
+    let summary = if !claimed {
+        format!("🧵 {label} — 已经结束了，无需停止")
+    } else {
+        let dialog = if settled_prompts > 0 {
+            format!("\n同时关闭了 {settled_prompts} 个等待中的对话框")
+        } else {
+            String::new()
+        };
+        format!(
+            "🧵 {label} — 已停止（跑了 {ran_for} 秒）{dialog}\n日志尾部：\n{}",
+            if tail.is_empty() {
+                "(空日志)".to_string()
+            } else {
+                tail
+            }
+        )
+    };
+    // The terminal receipt supersedes every UNDELIVERED "正在终止"/"未确认"
+    // still in the queue — for any invocation: row ordering cannot keep a
+    // failed-and-retried pre-phase from arriving after this one, so the
+    // stale chatter is withdrawn instead. Delivered history stays.
+    crate::state::withdraw_undelivered_stop_chatter(&tx, &turn.turn_id, now)?;
+    enqueue_stop_summary(&tx, turn, invocation_id, "final", &summary, now)?;
+    tx.commit()?;
+
+    if claimed {
+        if let Some(dir) = turn
+            .cgroup_path
+            .as_deref()
+            .and_then(|path| crate::claude::turn_cgroup::validated(path, &turn.turn_id))
+        {
+            // Proven empty and settled: the ownership object has served.
+            let _ = crate::claude::turn_cgroup::remove(&dir);
+        }
+        // Only once NOTHING is still running for this session. Clearing per
+        // stopped turn would cancel the bubble for a sibling turn that is
+        // still working — including one whose kill could not be confirmed.
+        let still_running = crate::state::list_running_bridge_turns(conn)?
+            .iter()
+            .any(|other| other.thread_id == turn.thread_id);
+        if !still_running {
+            // Otherwise the "typing…" bubble keeps promising an answer that
+            // is never coming, for the rest of its TTL.
+            let _ = clear_telegram_typing_indicator(conn, telegram, &turn.thread_id);
+        }
+    }
+    Ok(StopOutcome { claimed, summary })
+}
+
+/// One turn end to end — the RESUME path and direct tests: its own intent
+/// transaction, then the signalling half. The fresh command path does NOT
+/// come through here; its intents batch into a single transaction across
+/// every selected turn.
+fn stop_bridge_turn(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    turn: &crate::state::BridgeTurn,
+    invocation_id: &str,
+    now: u64,
+) -> Result<StopOutcome> {
+    let tx = conn.unchecked_transaction()?;
+    let settled_prompts = stop_intent(&tx, turn, invocation_id, now)?;
+    tx.commit()?;
+    stop_execute(conn, telegram, turn, invocation_id, settled_prompts, now)
+}
+
+/// One durable receipt per (invocation, turn, phase). The invocation keeps
+/// two distinct `/stop`s from deduplicating each other's story away while a
+/// redelivery of the SAME update stays idempotent; the PHASE keeps a later
+/// "final" from colliding with the "requested" receipt of an earlier pass —
+/// with a shared key, `INSERT OR IGNORE` kept the stale unconfirmed text
+/// and the final outcome was lost.
+fn enqueue_stop_summary(
+    conn: &Connection,
+    turn: &crate::state::BridgeTurn,
+    invocation_id: &str,
+    phase: &str,
+    summary: &str,
+    now: u64,
+) -> Result<()> {
+    let event = json!({
+        "type": "bridge_notice",
+        "threadId": turn.thread_id,
+        "observedAt": now,
+        "eventKey": format!("stop-summary:{invocation_id}:{}:{phase}", turn.turn_id),
+        // Structured duplicates of what the key encodes: the terminal
+        // withdrawal matches on THESE, exactly — parsing the key with LIKE
+        // made `_`/`%` in a turn id act as wildcards.
+        "stopTurn": turn.turn_id,
+        "stopPhase": phase,
+        "message": summary,
+    });
+    crate::state::enqueue_outbound_event(conn, &event, now, "bridge")?;
+    Ok(())
+}
+
 fn execute_threads_command(
     conn: &Connection,
     telegram: &TelegramConfig,
@@ -1563,6 +2057,15 @@ fn execute_telegram_command(
 ) -> Result<Value> {
     let chat_id = telegram_chat_id(message).context("Telegram command missing chat.id")?;
     let user_id = telegram_from_user_id(message);
+    // Stable and unique per command: the same message replayed keys the same
+    // (so a retry deduplicates correctly), while two distinct `/stop`s never
+    // collide however similar their effects.
+    let command_invocation_id = format!(
+        "{chat_id}:{}",
+        telegram_message_id(message)
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| now.to_string())
+    );
     match command {
         TelegramInboundCommand::Start | TelegramInboundCommand::Help => {
             let sent = telegram_send_text(telegram, &telegram_help_text(), timeout)?;
@@ -1585,6 +2088,14 @@ fn execute_telegram_command(
             let sent = telegram_send_text(telegram, &telegram_status_text(conn)?, timeout)?;
             Ok(json!({ "ok": true, "action": "telegram_status", "sent": sent }))
         }
+        TelegramInboundCommand::Stop(target) => execute_stop_command(
+            conn,
+            telegram,
+            target.as_deref(),
+            &command_invocation_id,
+            now,
+            timeout,
+        ),
         TelegramInboundCommand::Threads(raw_limit) => execute_threads_command(
             conn, telegram, raw_limit, now, timeout, deadline,
         )
@@ -2515,11 +3026,10 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Mutex;
 
     use crate::{write_daemon_config, DaemonConfig, TelegramConfig};
 
-    fn config_test_lock() -> &'static Mutex<()> {
+    fn config_test_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::state::test_env_lock()
     }
 
@@ -2597,7 +3107,7 @@ mod tests {
 
     #[test]
     fn telegram_setup_dry_run_writes_redacted_daemon_shape() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = config_test_lock();
         let _env = CommandEnv::new("setup-dry-run");
 
         let result = telegram_setup_result(TelegramSetupOptions {
@@ -2661,6 +3171,844 @@ mod tests {
         );
     }
 
+    fn stop_test_config() -> TelegramConfig {
+        TelegramConfig {
+            bot_token: "123:secret".to_string(),
+            chat_id: "456".to_string(),
+            allowed_user_id: Some("789".to_string()),
+        }
+    }
+
+    fn register_running_turn(conn: &Connection, turn: &str, thread: &str, pid: u32, at: u64) {
+        crate::state::register_bridge_turn(
+            conn,
+            turn,
+            thread,
+            "/tmp/turn.log",
+            Some(pid),
+            None,
+            None,
+            None,
+            None,
+            None,
+            at,
+        )
+        .expect("register turn");
+    }
+
+    #[test]
+    fn stop_command_parses_with_and_without_a_target() {
+        assert_eq!(
+            parse_telegram_command_text("/stop"),
+            Some(TelegramInboundCommand::Stop(None))
+        );
+        assert_eq!(
+            parse_telegram_command_text("/stop 3ddecbe8"),
+            Some(TelegramInboundCommand::Stop(Some("3ddecbe8".to_string())))
+        );
+        assert_eq!(
+            parse_telegram_command_text("/stop@tinyctb_bot"),
+            Some(TelegramInboundCommand::Stop(None))
+        );
+    }
+
+    #[test]
+    fn stop_with_nothing_running_says_so() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let result = execute_stop_command(
+            &conn,
+            &stop_test_config(),
+            None,
+            "456:1",
+            1000,
+            Duration::from_secs(1),
+        )
+        .expect("stop");
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["stopped"], 0);
+    }
+
+    /// The core path: kill, settle as `stopped` (not `failed`, which would
+    /// make the daemon push an error for something the user chose), close
+    /// the dialogs THIS turn owned, and withdraw their queued buttons.
+    #[test]
+    fn stop_kills_settles_and_withdraws_the_button() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        register_running_turn(&conn, "turn-1", "sess-runaway", 4_000_001, 1000);
+        crate::state::create_pending_approval(
+            &conn,
+            "ap-1",
+            "sess-runaway",
+            "Bash",
+            "rm -rf /",
+            true,
+            1000,
+            9_000_000_000,
+        )
+        .expect("approval");
+        crate::state::record_approval_turn_owner(&conn, "ap-1", "turn-1").expect("owner");
+        crate::state::enqueue_outbound_event(
+            &conn,
+            &json!({
+                "type": "approval_request", "threadId": "sess-runaway",
+                "eventKey": "approval:ap-1", "updatedAt": 1000
+            }),
+            1000,
+            "bridge",
+        )
+        .expect("queue button");
+
+        let result = execute_stop_command(
+            &conn,
+            &stop_test_config(),
+            None,
+            "456:1",
+            5000,
+            Duration::from_secs(1),
+        )
+        .expect("stop");
+
+        assert_eq!(result["stopped"], 1);
+        assert_eq!(
+            crate::claude::test_kill::take(),
+            vec![4_000_001],
+            "the turn's process group must actually be signalled"
+        );
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM bridge_turns WHERE turn_id = 'turn-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(status, "stopped", "a deliberate stop is not a failure");
+        let decision: Option<String> = conn
+            .query_row(
+                "SELECT decision FROM pending_approvals WHERE approval_id = 'ap-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("approval");
+        assert_eq!(decision.as_deref(), Some("expired"));
+        let button: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events
+                 WHERE json_extract(payload_json, '$.eventKey') = 'approval:ap-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            button, 0,
+            "the button must be withdrawn, not delivered after the turn is gone"
+        );
+        let summary: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events
+                 WHERE json_extract(payload_json, '$.eventKey') = 'stop-summary:456:1:turn-1:final'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            summary, 1,
+            "the outcome must be a durable outbox row, committed with the settle"
+        );
+    }
+
+    /// Ownership is by TURN. A concurrent turn's approval, and a question
+    /// from the user's own terminal, must both survive — and an approval
+    /// with no recorded owner fails OPEN rather than being swept up.
+    #[test]
+    fn stop_only_closes_the_dialogs_its_own_turn_owned() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        register_running_turn(&conn, "turn-doomed", "sess-shared", 4_000_010, 1000);
+        register_running_turn(&conn, "turn-other", "sess-shared", 4_000_011, 1000);
+        for (id, owner) in [
+            ("ap-mine", Some("turn-doomed")),
+            ("ap-sibling", Some("turn-other")),
+            ("ap-orphan", None),
+        ] {
+            crate::state::create_pending_approval(
+                &conn,
+                id,
+                "sess-shared",
+                "Bash",
+                "x",
+                true,
+                1000,
+                9_000_000_000,
+            )
+            .expect("approval");
+            if let Some(owner) = owner {
+                crate::state::record_approval_turn_owner(&conn, id, owner).expect("owner");
+            }
+        }
+        crate::state::create_pending_question(
+            &conn,
+            "q-terminal",
+            "sess-shared",
+            "选哪个？",
+            &["A".to_string()],
+            false,
+            1000,
+            9_000_000_000,
+        )
+        .expect("question");
+
+        // Stop only the doomed turn (both share a session, so target by turn
+        // is impossible — this is the multi-turn-per-session case).
+        let turn = crate::state::list_running_bridge_turns(&conn)
+            .expect("turns")
+            .into_iter()
+            .find(|turn| turn.turn_id == "turn-doomed")
+            .expect("doomed turn");
+        stop_bridge_turn(&conn, &stop_test_config(), &turn, "456:1", 5000).expect("stop");
+
+        let open = |id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT decision FROM pending_approvals WHERE approval_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .expect("row")
+        };
+        assert_eq!(open("ap-mine").as_deref(), Some("expired"));
+        assert_eq!(
+            open("ap-sibling"),
+            None,
+            "a concurrent turn's approval must survive"
+        );
+        assert_eq!(
+            open("ap-orphan"),
+            None,
+            "unknown ownership must fail open, not be swept up"
+        );
+        let answered: Option<String> = conn
+            .query_row(
+                "SELECT answer FROM pending_questions WHERE question_id = 'q-terminal'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("question");
+        assert_eq!(
+            answered, None,
+            "questions are never headless, so /stop must not touch them"
+        );
+    }
+
+    /// A kill that could not be CONFIRMED must not settle the turn. Marking
+    /// it `stopped` would drop a live process out of every later scan, and
+    /// nothing would ever reap it — the failure mode is a runaway turn that
+    /// the bridge has forgotten about.
+    #[test]
+    fn an_unconfirmed_kill_leaves_the_turn_running() {
+        let _guard = crate::state::test_env_lock();
+        for outcome in [
+            crate::claude::KillOutcome::Unverified,
+            crate::claude::KillOutcome::Undetermined,
+        ] {
+            let conn = crate::state::create_state_db_in_memory().expect("db");
+            let _ = crate::claude::test_kill::take();
+            let _kill_guard = crate::claude::test_kill::OutcomeGuard::set(outcome);
+            register_running_turn(&conn, "turn-x", "sess-x", 4_000_030, 1000);
+
+            let result = execute_stop_command(
+                &conn,
+                &stop_test_config(),
+                None,
+                "456:1",
+                5000,
+                Duration::from_secs(1),
+            )
+            .expect("stop");
+
+            assert_eq!(result["stopped"], 0, "{outcome:?} must not count as a stop");
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM bridge_turns WHERE turn_id = 'turn-x'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("row");
+            assert_eq!(
+                status, "stopping",
+                "{outcome:?}: an unconfirmed kill leaves the INTENT, never `stopped`"
+            );
+            assert!(
+                crate::state::list_running_bridge_turns(&conn)
+                    .expect("turns")
+                    .iter()
+                    .any(|turn| turn.turn_id == "turn-x"),
+                "{outcome:?}: and it must stay tracked — its process may still be alive"
+            );
+        }
+    }
+
+    /// A prefix that matches two sessions must be refused, not fanned out.
+    #[test]
+    fn stop_refuses_a_short_or_ambiguous_target() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        register_running_turn(&conn, "turn-a", "abcd1234-aaaa", 4_000_020, 1000);
+        register_running_turn(&conn, "turn-b", "abcd1234-bbbb", 4_000_021, 1000);
+
+        let short = execute_stop_command(
+            &conn,
+            &stop_test_config(),
+            Some("abcd"),
+            "456:1",
+            5000,
+            Duration::from_secs(1),
+        )
+        .expect("short");
+        assert_eq!(short["reason"], "target_too_short");
+
+        let ambiguous = execute_stop_command(
+            &conn,
+            &stop_test_config(),
+            Some("abcd1234"),
+            "456:2",
+            5000,
+            Duration::from_secs(1),
+        )
+        .expect("ambiguous");
+        assert_eq!(ambiguous["reason"], "ambiguous_target");
+        // The SAME update redelivered repeats the frozen refusal — even
+        // though the target still matches two turns it could reinterpret.
+        let replay = execute_stop_command(
+            &conn,
+            &stop_test_config(),
+            Some("abcd1234"),
+            "456:2",
+            6000,
+            Duration::from_secs(1),
+        )
+        .expect("replay");
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["kind"], "ambiguous");
+        assert_eq!(ambiguous["matched"], 2);
+        assert!(
+            crate::claude::test_kill::take().is_empty(),
+            "an ambiguous target must kill nothing at all"
+        );
+        let running: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_turns WHERE status = 'running'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(running, 2, "both turns must survive an ambiguous /stop");
+    }
+
+    /// Mixed outcome: one turn confirmed dead, a sibling in the same session
+    /// still running. The typing bubble must SURVIVE — cancelling it would
+    /// tell the user nothing is working while something still is.
+    #[test]
+    fn typing_survives_while_a_sibling_turn_is_still_running() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        let telegram = stop_test_config();
+        register_running_turn(&conn, "turn-dead", "sess-shared", 4_000_040, 1000);
+        register_running_turn(&conn, "turn-alive", "sess-shared", 4_000_041, 1000);
+        register_telegram_typing_indicator(&conn, &telegram, "sess-shared", 1000)
+            .expect("typing on");
+        let typing_key = telegram_typing_key(&telegram.chat_id, "sess-shared");
+        assert!(
+            crate::state::get_setting_text(&conn, &typing_key)
+                .expect("read")
+                .is_some(),
+            "the bubble must be on before we start"
+        );
+
+        let dead = crate::state::list_running_bridge_turns(&conn)
+            .expect("turns")
+            .into_iter()
+            .find(|turn| turn.turn_id == "turn-dead")
+            .expect("turn");
+        let _kill_guard =
+            crate::claude::test_kill::OutcomeGuard::set(crate::claude::KillOutcome::Terminated);
+        stop_bridge_turn(&conn, &telegram, &dead, "456:1", 5000).expect("stop");
+
+        assert!(
+            crate::state::get_setting_text(&conn, &typing_key)
+                .expect("read")
+                .is_some(),
+            "a sibling is still running, so the bubble must stay"
+        );
+
+        // Now stop the sibling too: with nothing left, the bubble goes.
+        let alive = crate::state::list_running_bridge_turns(&conn)
+            .expect("turns")
+            .into_iter()
+            .find(|turn| turn.turn_id == "turn-alive")
+            .expect("turn");
+        let _kill_guard =
+            crate::claude::test_kill::OutcomeGuard::set(crate::claude::KillOutcome::Terminated);
+        stop_bridge_turn(&conn, &telegram, &alive, "456:2", 6000).expect("stop");
+        assert!(
+            crate::state::get_setting_text(&conn, &typing_key)
+                .expect("read")
+                .is_none(),
+            "with no turn left the bubble must be cleared"
+        );
+    }
+
+    /// The intent is persisted BEFORE the signal, so a crash in between
+    /// still says what happened. Without it the row stays `running` and the
+    /// daemon reports a deliberate stop as "exited without producing an
+    /// answer".
+    #[test]
+    fn a_stop_records_its_intent_before_signalling() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        register_running_turn(&conn, "turn-1", "sess-1", 4_000_050, 1000);
+        // The kill cannot be confirmed, so nothing promotes the row to
+        // `stopped` — exactly the window where only the intent survives.
+        let _kill_guard =
+            crate::claude::test_kill::OutcomeGuard::set(crate::claude::KillOutcome::Undetermined);
+        let turn = crate::state::list_running_bridge_turns(&conn)
+            .expect("turns")
+            .into_iter()
+            .next()
+            .expect("turn");
+        stop_bridge_turn(&conn, &stop_test_config(), &turn, "456:1", 5000).expect("stop");
+
+        assert_eq!(
+            crate::state::bridge_turn_status(&conn, "turn-1").expect("status"),
+            Some("stopping".to_string()),
+            "an unconfirmed kill must leave the INTENT behind, not a bare running row"
+        );
+        assert!(
+            crate::state::list_running_bridge_turns(&conn)
+                .expect("turns")
+                .iter()
+                .any(|turn| turn.turn_id == "turn-1"),
+            "and a stopping turn must stay tracked — its process may still be alive"
+        );
+        assert_eq!(
+            crate::state::stop_attempt_state(&conn, "turn-1").expect("state"),
+            (1, 5000),
+            "the command's own kill must count as attempt zero, or the daemon's \
+             next tick re-kills within a second"
+        );
+    }
+
+    /// The stop OPERATION and its receipts are all-or-nothing, proven by
+    /// sabotage: when the receipts cannot be queued, the whole command must
+    /// fail before any state changes or signals — a turn must never go
+    /// `stopping` while the user holds no durable record of asking, and a
+    /// half-recorded operation must not exist for a replay to trust.
+    #[test]
+    fn a_stop_is_all_or_nothing_with_its_receipt() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        register_running_turn(&conn, "turn-1", "sess-1", 4_000_058, 1000);
+        conn.execute_batch(
+            "CREATE TRIGGER outbox_broken BEFORE INSERT ON outbound_events
+             BEGIN SELECT RAISE(ABORT, 'outbox broken'); END;",
+        )
+        .expect("trigger");
+
+        let result = execute_stop_command(
+            &conn,
+            &stop_test_config(),
+            None,
+            "456:31",
+            5000,
+            Duration::from_secs(1),
+        );
+
+        assert!(result.is_err(), "a broken outbox must fail the command");
+        assert_eq!(
+            crate::state::bridge_turn_status(&conn, "turn-1").expect("status"),
+            Some("running".to_string()),
+            "no receipt → no operation: the turn must stay running for the user's next /stop"
+        );
+        assert!(
+            crate::claude::test_kill::take().is_empty(),
+            "and nothing may have been signalled"
+        );
+        let operations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stop_operations", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(
+            operations, 0,
+            "a rolled-back operation must not exist for a replay to trust"
+        );
+    }
+
+    /// The ACCEPTANCE is one transaction across every selected turn: an
+    /// intent failure on any turn rolls back ALL of them plus the operation
+    /// record and its receipts. Committed piecemeal, an intent error midway
+    /// left earlier turns stopped and later ones running forever — with the
+    /// receipts delivered, the offset advanced, and no scanner ever coming
+    /// back for rows still `running`.
+    #[test]
+    fn a_stop_batch_is_atomic_across_turns() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        register_running_turn(&conn, "turn-1", "sess-a", 4_000_072, 1000);
+        register_running_turn(&conn, "turn-2", "sess-b", 4_000_073, 2000);
+        conn.execute_batch(
+            "CREATE TRIGGER intent_broken BEFORE UPDATE OF status ON bridge_turns
+             WHEN NEW.status = 'stopping' AND NEW.turn_id = 'turn-2'
+             BEGIN SELECT RAISE(ABORT, 'intent broken'); END;",
+        )
+        .expect("trigger");
+
+        let result = execute_stop_command(
+            &conn,
+            &stop_test_config(),
+            None,
+            "456:51",
+            5000,
+            Duration::from_secs(1),
+        );
+
+        assert!(
+            result.is_err(),
+            "a broken intent must fail the whole command"
+        );
+        for turn in ["turn-1", "turn-2"] {
+            assert_eq!(
+                crate::state::bridge_turn_status(&conn, turn).expect("status"),
+                Some("running".to_string()),
+                "{turn} must roll back with the batch — no half-accepted operation"
+            );
+        }
+        assert!(
+            crate::claude::test_kill::take().is_empty(),
+            "and nothing may have been signalled"
+        );
+        let operations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stop_operations", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(operations, 0, "no operation row for a replay to trust");
+        let receipts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM outbound_events", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(
+            receipts, 0,
+            "and no receipt promising work that never began"
+        );
+    }
+
+    /// The exact counterexample from review: `/stop` sees nothing running
+    /// and says so; the daemon dies before the ack; a NEW turn starts; the
+    /// same update is redelivered. The frozen resolution must repeat
+    /// "nothing to stop" — reinterpreting would kill a turn that did not
+    /// exist when the user sent the command.
+    #[test]
+    fn a_replayed_empty_stop_never_kills_later_turns() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+
+        let first = execute_stop_command(
+            &conn,
+            &stop_test_config(),
+            None,
+            "456:41",
+            5000,
+            Duration::from_secs(1),
+        )
+        .expect("first");
+        assert_eq!(first["stopped"], 0);
+
+        register_running_turn(&conn, "turn-late", "sess-late", 4_000_066, 6000);
+
+        let replay = execute_stop_command(
+            &conn,
+            &stop_test_config(),
+            None,
+            "456:41",
+            7000,
+            Duration::from_secs(1),
+        )
+        .expect("replay");
+        assert_eq!(replay["replayed"], true, "{replay}");
+        assert_eq!(replay["kind"], "empty");
+        assert!(
+            crate::claude::test_kill::take().is_empty(),
+            "the frozen empty answer must not become a kill"
+        );
+        assert_eq!(
+            crate::state::bridge_turn_status(&conn, "turn-late").expect("status"),
+            Some("running".to_string()),
+            "the turn that started after the command must be untouched"
+        );
+
+        // A genuinely new command still reaches it.
+        let _kill_guard =
+            crate::claude::test_kill::OutcomeGuard::set(crate::claude::KillOutcome::Terminated);
+        let fresh = execute_stop_command(
+            &conn,
+            &stop_test_config(),
+            None,
+            "456:42",
+            8000,
+            Duration::from_secs(1),
+        )
+        .expect("fresh");
+        assert_eq!(fresh["stopped"], 1);
+    }
+
+    /// A redelivered `/stop` update resumes its RECORDED operation instead
+    /// of reinterpreting the command over the present: after the stop
+    /// committed, a replay used to answer "nothing is running" while the
+    /// outbox was saying "stopped".
+    #[test]
+    fn a_replayed_stop_resumes_its_operation_not_the_present() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        register_running_turn(&conn, "turn-1", "sess-1", 4_000_055, 1000);
+        let _kill_guard =
+            crate::claude::test_kill::OutcomeGuard::set(crate::claude::KillOutcome::Terminated);
+
+        let first = execute_stop_command(
+            &conn,
+            &stop_test_config(),
+            None,
+            "456:21",
+            5000,
+            Duration::from_secs(1),
+        )
+        .expect("stop");
+        assert_eq!(first["stopped"], 1);
+        let events_after_first: i64 = conn
+            .query_row("SELECT COUNT(*) FROM outbound_events", [], |row| row.get(0))
+            .expect("count");
+
+        // The SAME update again (crash-before-ack redelivery).
+        let replay = execute_stop_command(
+            &conn,
+            &stop_test_config(),
+            None,
+            "456:21",
+            6000,
+            Duration::from_secs(1),
+        )
+        .expect("replay");
+        assert_eq!(replay["replayed"], true, "{replay}");
+        assert_eq!(
+            replay["attempted"], 1,
+            "the replay must speak about the RECORDED turn, not the empty present"
+        );
+        let line = replay["summaries"][0].as_str().expect("line");
+        assert!(
+            line.contains("已结束") && line.contains("stopped"),
+            "the replay reports the recorded turn's fate: {line}"
+        );
+        let events_after_replay: i64 = conn
+            .query_row("SELECT COUNT(*) FROM outbound_events", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(
+            events_after_first, events_after_replay,
+            "a replay must not mint new receipts for work already receipted"
+        );
+
+        // A genuinely NEW command with nothing running still says so.
+        let fresh = execute_stop_command(
+            &conn,
+            &stop_test_config(),
+            None,
+            "456:22",
+            7000,
+            Duration::from_secs(1),
+        )
+        .expect("fresh");
+        assert_eq!(fresh["stopped"], 0);
+    }
+
+    /// Every outcome is a durable receipt COMMITTED WITH the state change
+    /// itself, keyed by the invocation — deleting the production enqueue in
+    /// `stop_bridge_turn` turns this red. Two `/stop`s against the same
+    /// turn keep both receipts (no deduplication), while a redelivery of
+    /// the SAME update stays idempotent by key.
+    #[test]
+    fn stop_summaries_are_durable_and_keyed_by_invocation() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        register_running_turn(&conn, "turn-1", "sess-1", 4_000_070, 1000);
+        // The kill stays unconfirmed, so the turn survives as `stopping`
+        // and the second `/stop` has the same turn to act on.
+        let _kill_guard =
+            crate::claude::test_kill::OutcomeGuard::set(crate::claude::KillOutcome::Undetermined);
+
+        let first = execute_stop_command(
+            &conn,
+            &stop_test_config(),
+            None,
+            "456:11",
+            5000,
+            Duration::from_secs(1),
+        )
+        .expect("stop");
+        assert_eq!(first["queuedSummaries"], 1);
+        let second = execute_stop_command(
+            &conn,
+            &stop_test_config(),
+            None,
+            "456:12",
+            6000,
+            Duration::from_secs(1),
+        )
+        .expect("stop again");
+        assert_eq!(second["queuedSummaries"], 1);
+
+        let keys: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT json_extract(payload_json, '$.eventKey') FROM outbound_events
+                     ORDER BY 1",
+                )
+                .expect("stmt");
+            let rows = stmt
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .expect("rows");
+            rows
+        };
+        assert_eq!(
+            keys,
+            vec![
+                "stop-summary:456:11:turn-1:outcome".to_string(),
+                "stop-summary:456:12:turn-1:outcome".to_string(),
+            ],
+            "each invocation keeps its own LATEST receipt; its superseded \
+             undelivered `requested` is withdrawn so a retry cannot deliver \
+             it after the outcome it precedes"
+        );
+    }
+
+    /// The buttons die at the INTENT: even a kill that cannot be confirmed
+    /// must leave no live dialog behind. Until this was transactional with
+    /// `stopping`, an Undetermined kill kept the buttons alive and a later
+    /// tap handed the blocked headless gate an `allow` for a turn the user
+    /// had already ended.
+    #[test]
+    fn a_stop_that_cannot_confirm_still_kills_the_buttons() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        register_running_turn(&conn, "turn-1", "sess-1", 4_000_060, 1000);
+        crate::state::create_pending_approval(
+            &conn,
+            "ap-1",
+            "sess-1",
+            "Bash",
+            "x",
+            true,
+            1000,
+            9_000_000_000,
+        )
+        .expect("approval");
+        crate::state::record_approval_turn_owner(&conn, "ap-1", "turn-1").expect("owner");
+        crate::state::enqueue_outbound_event(
+            &conn,
+            &json!({
+                "type": "approval_request", "threadId": "sess-1",
+                "eventKey": "approval:ap-1", "updatedAt": 1000
+            }),
+            1000,
+            "bridge",
+        )
+        .expect("queue button");
+        let _kill_guard =
+            crate::claude::test_kill::OutcomeGuard::set(crate::claude::KillOutcome::Undetermined);
+        let turn = crate::state::list_running_bridge_turns(&conn)
+            .expect("turns")
+            .into_iter()
+            .next()
+            .expect("turn");
+
+        stop_bridge_turn(&conn, &stop_test_config(), &turn, "456:1", 5000).expect("stop");
+
+        assert_eq!(
+            crate::state::bridge_turn_status(&conn, "turn-1").expect("status"),
+            Some("stopping".to_string()),
+            "an unconfirmed kill leaves the turn stopping"
+        );
+        let decision: Option<String> = conn
+            .query_row(
+                "SELECT decision FROM pending_approvals WHERE approval_id = 'ap-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("approval");
+        assert_eq!(
+            decision.as_deref(),
+            Some("expired"),
+            "the dialog must die with the INTENT, not with the settle"
+        );
+        let button: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events
+                 WHERE json_extract(payload_json, '$.eventKey') = 'approval:ap-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            button, 0,
+            "and its queued button must be withdrawn even though the kill is unconfirmed"
+        );
+    }
+
+    /// The ambiguity message has to be ACTIONABLE. Printing the same
+    /// truncated eight characters twice asks for a longer prefix while
+    /// hiding the very characters that would make one.
+    #[test]
+    fn the_ambiguity_message_shows_distinguishing_prefixes() {
+        let ids: std::collections::BTreeSet<&str> =
+            ["abcd1234-aaaa", "abcd1234-bbbb"].into_iter().collect();
+        let first = disambiguating_prefix("abcd1234-aaaa", &ids);
+        let second = disambiguating_prefix("abcd1234-bbbb", &ids);
+        assert_ne!(
+            first, second,
+            "two candidates must not print identically: {first} vs {second}"
+        );
+        assert!(first.starts_with("abcd1234-a"), "got {first}");
+        assert!(second.starts_with("abcd1234-b"), "got {second}");
+        // And a unique id still gets the short form.
+        let alone: std::collections::BTreeSet<&str> = ["ffff0000-zzzz"].into_iter().collect();
+        assert_eq!(disambiguating_prefix("ffff0000-zzzz", &alone), "ffff0000");
+    }
+
+    /// /stop can only reach rows this bridge created. A session opened in the
+    /// user's own terminal has no `bridge_turns` row at all.
+    #[test]
+    fn stop_never_touches_a_session_without_a_bridge_turn() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_kill::take();
+        let result = execute_stop_command(
+            &conn,
+            &stop_test_config(),
+            Some("sess-terminal"),
+            "456:1",
+            5000,
+            Duration::from_secs(1),
+        )
+        .expect("stop");
+        assert_eq!(result["stopped"], 0);
+        assert!(crate::claude::test_kill::take().is_empty());
+    }
+
     #[test]
     fn telegram_command_extraction_requires_standalone_authorized_message() {
         let telegram = TelegramConfig {
@@ -2708,7 +4056,7 @@ mod tests {
     fn telegram_reply_spawns_headless_resume_without_waiting() {
         // test_spawn::RECORDED is a process-global; without the shared env
         // lock this test races claude.rs's spawn tests under parallel runs.
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let conn = crate::state::create_state_db_in_memory().expect("db");
         let config = test_daemon_config();
         let _ = crate::claude::test_spawn::take();
@@ -2757,7 +4105,7 @@ mod tests {
         use std::io::{BufRead, BufReader};
         use std::os::unix::net::UnixListener;
 
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let conn = crate::state::create_state_db_in_memory().expect("db");
         let config = test_daemon_config();
         let dir = std::env::temp_dir().join(format!("tinyctb-live-reply-{}", std::process::id()));
@@ -2891,7 +4239,7 @@ mod tests {
     /// the approval quietly timed out.
     #[test]
     fn text_reply_never_authorises_an_approval() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = CommandEnv::new("text-not-consent");
         let config = test_daemon_config();
         write_daemon_config(&config).expect("config");
@@ -2950,7 +4298,7 @@ mod tests {
     /// carries information, never permission.
     #[test]
     fn text_reply_answers_a_question_but_only_ever_as_content() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = CommandEnv::new("text-is-answer");
         let config = test_daemon_config();
         write_daemon_config(&config).expect("config");
@@ -3001,7 +4349,7 @@ mod tests {
     /// as chat.
     #[test]
     fn reply_to_a_settled_dialog_is_still_recognised() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = CommandEnv::new("settled-dialog");
         let config = test_daemon_config();
         write_daemon_config(&config).expect("config");
@@ -3083,7 +4431,7 @@ mod tests {
     /// ANY chunk must still count as replying to that dialog.
     #[test]
     fn reply_to_any_chunk_of_a_split_dialog_is_recognised() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = CommandEnv::new("split-dialog");
         let config = test_daemon_config();
         write_daemon_config(&config).expect("config");
@@ -3139,7 +4487,7 @@ mod tests {
     /// A reply from the wrong chat or user answers nothing.
     #[test]
     fn unauthorised_reply_cannot_answer_anything() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = CommandEnv::new("text-unauthorised");
         let config = test_daemon_config();
         write_daemon_config(&config).expect("config");
@@ -3189,7 +4537,7 @@ mod tests {
 
     #[test]
     fn remote_commands_toggle_away_mode_and_manage_hooks() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = CommandEnv::new("away-repair");
         write_daemon_config(&test_daemon_config()).expect("write daemon config");
         let conn = crate::state::create_state_db_in_memory().expect("db");
@@ -3253,7 +4601,7 @@ mod tests {
 
     #[test]
     fn away_command_failure_is_reported_to_telegram() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let _env = CommandEnv::new("away-failure");
         // Point CLAUDE_BIN at a missing binary so the backend check fails.
         std::env::set_var("CLAUDE_BIN", "/nonexistent/claude-binary");
@@ -3286,7 +4634,7 @@ mod tests {
 
     #[test]
     fn failing_telegram_update_is_acked_and_does_not_block_later_updates() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = config_test_lock();
         let _env = CommandEnv::new("failing-update-batch");
         // Break the backend so routed replies fail.
         std::env::set_var("CLAUDE_BIN", "/nonexistent/claude-binary");
@@ -3556,7 +4904,7 @@ mod tests {
     /// deleted. Drives a real double-tap through the update batch.
     #[test]
     fn every_callback_tap_gets_an_ack_through_the_dispatch() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = config_test_lock();
         let _env = CommandEnv::new("ack-dispatch");
         let config = test_daemon_config();
         write_daemon_config(&config).expect("write daemon config");
@@ -3620,7 +4968,7 @@ mod tests {
     /// and the failure is written into the inbound log next to the update.
     #[test]
     fn failed_ack_is_retried_and_logged_loudly() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = config_test_lock();
         let _env = CommandEnv::new("ack-fail");
         let config = test_daemon_config();
         write_daemon_config(&config).expect("write daemon config");
@@ -3769,15 +5117,18 @@ mod tests {
 
         // Pruning: a settled turn far past retention goes, the running one
         // stays whatever its age.
+        // A pid at registration: a turn that reached `done` in production
+        // always paid its birth cleanup debt off (identity persisted), and
+        // an indebted row is deliberately unprunable.
         crate::state::register_bridge_turn(
             &conn,
             "turn-old",
             "sess-old",
             "/tmp/o.log",
+            Some(4_100),
             None,
             None,
-            None,
-            None,
+            Some(4_100),
             None,
             None,
             500,
@@ -3913,7 +5264,7 @@ mod tests {
     /// buttons answers the very row the blocked hook is polling.
     #[test]
     fn threads_reoffers_an_open_approval_and_its_buttons_answer_it() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = config_test_lock();
         let _env = CommandEnv::new("reoffer-approval");
         let config = test_daemon_config();
         write_daemon_config(&config).expect("write daemon config");
@@ -3992,7 +5343,7 @@ mod tests {
     /// stored multi_select flag is what makes that possible.
     #[test]
     fn threads_reoffers_a_multiselect_question_without_buttons() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = config_test_lock();
         let _env = CommandEnv::new("reoffer-multi");
         let config = test_daemon_config();
         write_daemon_config(&config).expect("write daemon config");
@@ -4084,7 +5435,7 @@ mod tests {
     /// timeout denies whatever the session is doing now.
     #[test]
     fn reoffer_replays_the_persisted_gate_kind() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = config_test_lock();
         let _env = CommandEnv::new("reoffer-kind");
         let config = test_daemon_config();
         write_daemon_config(&config).expect("write daemon config");
@@ -4123,7 +5474,7 @@ mod tests {
     /// silently drop the rest. NULL must render the no-buttons shape.
     #[test]
     fn legacy_questions_without_multiselect_flag_get_no_buttons() {
-        let _guard = config_test_lock().lock().expect("config lock");
+        let _guard = config_test_lock();
         let _env = CommandEnv::new("reoffer-legacy");
         let config = test_daemon_config();
         write_daemon_config(&config).expect("write daemon config");

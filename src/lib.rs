@@ -436,6 +436,9 @@ fn run() -> Result<i32> {
                     }))?
                 );
             } else {
+                // Same rule as `reply`: the shared spawn lock precedes the
+                // database handle.
+                let _spawn_permit = daemon::hold_spawn_lock_shared()?;
                 let now = now_millis()?;
                 let config = load_daemon_config()?;
                 let db_path = state_db_path()?;
@@ -523,6 +526,10 @@ fn run() -> Result<i32> {
                 };
                 println!("{}", serde_json::to_string(&payload)?);
             } else {
+                // The SHARED spawn lock comes BEFORE the database opens: a
+                // teardown that already unlinked state.db must not find us
+                // spawning through a handle to the deleted file.
+                let _spawn_permit = daemon::hold_spawn_lock_shared()?;
                 let config = load_daemon_config()?;
                 let db_path = state_db_path()?;
                 let conn = create_state_db(&db_path)?;
@@ -746,6 +753,10 @@ fn reset_result(dry_run: bool) -> Result<Value> {
     let config_preserved = config_path.exists();
 
     let mut daemon_stopped = false;
+    // Held to the END of this function: the exclusive spawn freeze must
+    // outlive every deletion below, or a spawner could slip in after the
+    // sweep and before (or during) the unlink.
+    let mut _spawn_freeze: Option<std::fs::File> = None;
 
     if !dry_run {
         let status = daemon_service_status(DEFAULT_DAEMON_LABEL)?;
@@ -774,6 +785,58 @@ fn reset_result(dry_run: bool) -> Result<Value> {
                 bail!("daemon is still running; stop it first with `tinyctb daemon stop`");
             }
             std::thread::sleep(Duration::from_millis(200));
+        }
+
+        // ORDER is the point: daemon provably gone (lock free) FIRST, then
+        // the spawn lock held EXCLUSIVELY — no daemon `/new` and no CLI
+        // spawn can mint a turn between the sweep and the deletion — and
+        // only then the sweep. Sweeping before the stop let a live daemon
+        // create an object right after the enumeration, which the ledger
+        // deletion below then orphaned. Any object that cannot be proven
+        // empty AND removed aborts with the ledger untouched.
+        _spawn_freeze = Some(daemon::hold_spawn_lock_exclusive(Duration::from_secs(5))?);
+        let report = crate::claude::turn_cgroup::sweep_all(std::time::Duration::from_secs(5))?;
+        if !report.stubborn.is_empty() {
+            bail!(
+                "refusing to reset: {} turn cgroup(s) could not be proven empty and removed ({});                  stop the work they contain first",
+                report.stubborn.len(),
+                report
+                    .stubborn
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        // Legacy-regime turns (no ownership object) are INVISIBLE to the
+        // sweep, and deleting the ledger under them strands both process
+        // and record. The explicit degraded mode gets an explicit refusal.
+        let db_path = state_db_path()?;
+        if db_path.exists() {
+            match create_state_db(&db_path) {
+                Ok(conn) => {
+                    let legacy_active = crate::state::count_active_legacy_turns(&conn)?;
+                    if legacy_active > 0 {
+                        bail!(
+                            "refusing to reset: {legacy_active} legacy-supervised turn(s) (no \
+                             cgroup) are still active; stop them or let them finish first"
+                        );
+                    }
+                }
+                Err(err) => {
+                    // FAIL CLOSED: an unreadable ledger is not evidence
+                    // that nothing is alive, and with KillMode=process a
+                    // stopped daemon spares legacy descendants. The manual
+                    // exit is explicit: verify no tinyctb-spawned process
+                    // survives (the service cgroup should be empty), then
+                    // remove state.db by hand and reset again.
+                    bail!(
+                        "refusing to reset: state.db exists but is unreadable ({err:#}); \
+                         verify no legacy-supervised process survives, remove the file \
+                         manually, then reset again"
+                    );
+                }
+            }
         }
     }
 
@@ -1071,6 +1134,7 @@ mod tests {
     struct TempStateDir {
         previous_state_dir: Option<String>,
         previous_service_dir: Option<String>,
+        previous_cgroup_root: Option<String>,
         root: PathBuf,
     }
 
@@ -1081,13 +1145,22 @@ mod tests {
             fs::create_dir_all(&root).expect("create temp state dir");
             let previous_state_dir = std::env::var("TINYCTB_STATE_DIR").ok();
             let previous_service_dir = std::env::var("TINYCTB_SERVICE_DIR").ok();
+            let previous_cgroup_root = std::env::var("TINYCTB_CGROUP_ROOT").ok();
             std::env::set_var("TINYCTB_STATE_DIR", &root);
             // Keep service lookups away from the user's real systemd/launchd
             // definitions: `reset` stops a running service if it sees one.
             std::env::set_var("TINYCTB_SERVICE_DIR", root.join("service"));
+            // And keep the teardown SWEEP away from the user's real turn
+            // objects — `reset` kills and removes everything under the
+            // owner root, which in a test must never be the live service
+            // subtree. (The same isolation lesson as TINYCTB_SERVICE_DIR.)
+            let cgroups = root.join("cgroups");
+            fs::create_dir_all(&cgroups).expect("cgroup root");
+            std::env::set_var("TINYCTB_CGROUP_ROOT", cgroups);
             Self {
                 previous_state_dir,
                 previous_service_dir,
+                previous_cgroup_root,
                 root,
             }
         }
@@ -1105,8 +1178,139 @@ mod tests {
             } else {
                 std::env::remove_var("TINYCTB_SERVICE_DIR");
             }
+            if let Some(previous_cgroup_root) = &self.previous_cgroup_root {
+                std::env::set_var("TINYCTB_CGROUP_ROOT", previous_cgroup_root);
+            } else {
+                std::env::remove_var("TINYCTB_CGROUP_ROOT");
+            }
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// Unreadable is not empty: a ledger that cannot be opened is no
+    /// evidence that nothing is alive, and with KillMode=process a stopped
+    /// daemon spares legacy descendants — teardown fail-closes.
+    #[test]
+    fn reset_fail_closes_on_an_unreadable_ledger() {
+        let _guard = crate::state::test_env_lock();
+        let state = TempStateDir::new("reset-unreadable");
+        fs::write(state.root.join("state.db"), "not a database").expect("corrupt ledger");
+
+        let err = reset_result(false).expect_err("an unreadable ledger must refuse");
+        assert!(
+            format!("{err}").contains("unreadable"),
+            "the refusal names the reason: {err}"
+        );
+        assert!(
+            state.root.join("state.db").exists(),
+            "and nothing was deleted"
+        );
+    }
+
+    /// A terminal legacy row still carrying a supervision marker is a
+    /// group nobody proved empty — the sweep cannot see it (no cgroup),
+    /// so the teardown must refuse on it too.
+    #[test]
+    fn reset_refuses_a_terminal_but_supervised_legacy_turn() {
+        let _guard = crate::state::test_env_lock();
+        let _state = TempStateDir::new("reset-legacy-terminal");
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-lt",
+            "sess-lt",
+            "/tmp/t.log",
+            Some(4_500_000),
+            None,
+            None,
+            Some(4_500_000),
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        crate::state::mark_bridge_turn_finished(&conn, "turn-lt", "failed", 2000)
+            .expect("terminal");
+        crate::state::set_failure_cleanup_marker(&conn, "turn-lt").expect("marker");
+        drop(conn);
+
+        let err = reset_result(false).expect_err("an unproven legacy group must refuse");
+        assert!(
+            format!("{err}").contains("legacy-supervised"),
+            "the refusal names the reason: {err}"
+        );
+    }
+
+    /// A held spawn permit (a CLI or daemon mid-spawn) must block the
+    /// teardown's exclusive freeze — through the PRODUCTION lock wiring.
+    #[test]
+    fn reset_waits_out_or_refuses_an_in_flight_spawn() {
+        let _guard = crate::state::test_env_lock();
+        let _state = TempStateDir::new("reset-inflight");
+        let _permit = daemon::hold_spawn_lock_shared().expect("spawner permit");
+
+        let err = reset_result(false).expect_err("an in-flight spawn must block the reset");
+        assert!(
+            format!("{err}").contains("spawn is still in flight"),
+            "the refusal names the reason: {err}"
+        );
+    }
+
+    /// Legacy-regime turns (no ownership object) are invisible to the
+    /// sweep: while one is active the reset must refuse rather than delete
+    /// the only ledger that knows about it.
+    #[test]
+    fn reset_refuses_while_a_legacy_turn_is_active() {
+        let _guard = crate::state::test_env_lock();
+        let _state = TempStateDir::new("reset-legacy");
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        crate::state::register_bridge_turn(
+            &conn,
+            "turn-legacy",
+            "sess-legacy",
+            "/tmp/t.log",
+            Some(4_400_000),
+            None,
+            None,
+            Some(4_400_000),
+            None,
+            None,
+            1000,
+        )
+        .expect("register");
+        drop(conn);
+
+        let err = reset_result(false).expect_err("an active legacy turn must block the reset");
+        assert!(
+            format!("{err}").contains("legacy-supervised"),
+            "the refusal names the reason: {err}"
+        );
+        assert!(
+            state_db_path().expect("path").exists(),
+            "and the ledger survives"
+        );
+    }
+
+    /// `reset` must REFUSE while any turn object cannot be proven empty:
+    /// with KillMode=process the stopped service spares the sub-trees, and
+    /// deleting the ledger under live work would strand it forever.
+    #[test]
+    fn reset_refuses_while_a_turn_object_cannot_be_proven_empty() {
+        let _guard = crate::state::test_env_lock();
+        let state = TempStateDir::new("reset-refuse");
+        let stuck = state.root.join("cgroups/turn-stuck");
+        fs::create_dir_all(&stuck).expect("stuck");
+        fs::write(stuck.join("cgroup.events"), "populated 1\nfrozen 0\n").expect("events");
+
+        let err = reset_result(false).expect_err("a live object must abort the reset");
+        assert!(
+            format!("{err}").contains("refusing to reset"),
+            "the refusal names its reason: {err}"
+        );
+        assert!(
+            state.root.join("cgroups/turn-stuck").exists(),
+            "and the object is left in place"
+        );
     }
 
     #[test]
@@ -1253,7 +1457,7 @@ mod tests {
 
     #[test]
     fn reset_dry_run_reports_runtime_files_and_preserves_config() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let state = TempStateDir::new("reset-dry-run");
         write_daemon_config(&DaemonConfig {
             version: 1,
@@ -1327,7 +1531,7 @@ mod tests {
 
     #[test]
     fn reset_removes_runtime_state_and_preserves_config() {
-        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _guard = crate::state::test_env_lock();
         let state = TempStateDir::new("reset-removes");
         write_daemon_config(&DaemonConfig {
             version: 1,
@@ -1343,7 +1547,6 @@ mod tests {
         })
         .expect("write config");
         for name in [
-            "state.db",
             "state.db-wal",
             "state.db-shm",
             "remote-mode.json",
@@ -1356,6 +1559,9 @@ mod tests {
         ] {
             fs::write(state.root.join(name), "runtime").expect("write runtime file");
         }
+        // A REAL (empty) ledger: reset now fail-closes on an unreadable
+        // one, and that refusal has its own test.
+        drop(create_state_db(&state.root.join("state.db")).expect("real ledger"));
         fs::create_dir_all(state.root.join("events")).expect("events dir");
         fs::write(state.root.join("events/1-1-Stop.json"), "{}").expect("spool file");
         fs::create_dir_all(state.root.join("logs")).expect("logs dir");

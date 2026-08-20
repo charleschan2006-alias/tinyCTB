@@ -162,6 +162,7 @@ pub(crate) fn telegram_bot_commands() -> Vec<Value> {
         json!({ "command": "away", "description": "Start remote Claude mode" }),
         json!({ "command": "back", "description": "Stop remote Claude mode" }),
         json!({ "command": "threads", "description": "Show recent Claude sessions" }),
+        json!({ "command": "stop", "description": "Stop ALL running headless turns (or one by id)" }),
         json!({ "command": "new", "description": "Start a new Claude session" }),
         json!({ "command": "project", "description": "Show or switch the current project" }),
         json!({ "command": "status", "description": "Show remote Claude status" }),
@@ -264,7 +265,10 @@ mod tests {
         );
         assert_eq!(
             names,
-            vec!["away", "back", "threads", "new", "project", "status", "start", "repair", "help",]
+            vec![
+                "away", "back", "threads", "stop", "new", "project", "status", "start", "repair",
+                "help",
+            ]
         );
         for removed in [
             "away_on",

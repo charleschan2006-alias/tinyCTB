@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvidia-smi --query-gpu=* *)",
+      "Bash(nvidia-smi)",
+      "Bash(systemctl --user is-active *)",
+      "Bash(systemctl --user show *)",
+      "Bash(journalctl *)",
+      "Bash(xinput list *)",
+      "Bash(xinput test-xi2 *)",
+      "Bash(getconf *)",
+      "Bash(readelf *)",
+      "Bash(systemctl --user status *)"
+    ]
+  }
+}
