@@ -562,6 +562,19 @@ pub(crate) fn run_headless_approval_gate<R: Read>(reader: &mut R, now: u64) -> V
     }
 }
 
+/// Timestamp for SETTLE stamps. The gate's `now` parameter is frozen at
+/// hook start and reused across the whole window — fine for identifiers and
+/// deadlines, but stamping a settle that happens minutes later with the
+/// START time collapses the two instants: the 2026-08-22 forensics read a
+/// hand-back as "expired the same millisecond it was born". The stamp is
+/// `now` plus the MONOTONIC time this gate has actually been running — the
+/// wall clock never re-enters, so a clock that jumps backwards mid-wait
+/// cannot reorder the stamps — and the floor of 1ms keeps the ordering
+/// strict even for a settle inside the first millisecond.
+fn settle_stamp_ms(gate_started: u64, running_for: Duration) -> u64 {
+    gate_started.saturating_add((running_for.as_millis() as u64).max(1))
+}
+
 fn read_hook_payload<R: Read>(reader: &mut R, event: &str) -> Result<Value> {
     let mut raw = String::new();
     reader
@@ -759,6 +772,8 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
     // no terminal dialog anyone could see.
 
     let mut presence = PresenceProbe::new();
+    // Monotonic gate age for settle stamps — see `settle_stamp_ms`.
+    let gate_clock = std::time::Instant::now();
     // Where the transcript stood when this gate started. Anything written
     // past this point is what happened SINCE the request — the evidence for
     // noticing that the call was already decided without us.
@@ -865,7 +880,7 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
             return match crate::state::settle_expired_and_cancel_push(
                 &conn,
                 crate::state::SettleTarget::Approval(&approval_id),
-                now,
+                settle_stamp_ms(now, gate_clock.elapsed()),
             )? {
                 crate::state::SettleOutcome::Answered(decision) => {
                     apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now)
@@ -874,7 +889,11 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
             };
         }
         if kind == GateKind::Interactive && !windowless && presence.terminal_reclaimed() {
-            return match crate::state::expire_or_take_decision(&conn, &approval_id, now)? {
+            return match crate::state::expire_or_take_decision(
+                &conn,
+                &approval_id,
+                settle_stamp_ms(now, gate_clock.elapsed()),
+            )? {
                 Some(decision) => {
                     apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now)
                 }
@@ -886,7 +905,11 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
     // step: if a tap landed in the instant between the last poll and here,
     // that answer wins and must be honoured — otherwise Telegram would show
     // "已允许" while the session quietly fell back to its own prompt.
-    match crate::state::expire_or_take_decision(&conn, &approval_id, now)? {
+    match crate::state::expire_or_take_decision(
+        &conn,
+        &approval_id,
+        settle_stamp_ms(now, gate_clock.elapsed()),
+    )? {
         Some(decision) => apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now),
         // Nobody answered. Never an approval — but "not an approval" resolves
         // differently depending on what is downstream of this hook.
@@ -1013,6 +1036,8 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     // so it asks remotely either way.
 
     let mut presence = PresenceProbe::new();
+    // Monotonic gate age for settle stamps — see `settle_stamp_ms`.
+    let gate_clock = std::time::Instant::now();
     let conn = create_state_db(&state_db_path()?)?;
     let question_id = format!("q{}", generate_session_uuid()?.replace('-', ""));
     crate::state::create_pending_question(
@@ -1057,58 +1082,274 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         }
     });
     enqueue_outbound_event(&conn, &event, now, "bridge")?;
+    // The push exists; now make the wait VISIBLE where the user's law says
+    // it must be — in the terminal. Claude Code paints nothing for a
+    // question blocked behind this hook, so the banner is the only trace a
+    // person at the screen gets that anything is waiting.
+    let banner = QuestionBanner::for_session(windowless);
+    banner.paint_question(&question_text, &options, multi_select);
+    let phone_answered = |answer: &str| {
+        let resolved = resolve_answer(answer, &options);
+        banner.paint_note(&format!("✔ 已由手机作答：{resolved}"));
+        answered(&questions, &question_raw, &resolved)
+    };
 
     let deadline = std::time::Instant::now() + wait;
     while std::time::Instant::now() < deadline {
         std::thread::sleep(POLL_INTERVAL);
         if let Some(answer) = crate::state::question_answer(&conn, &question_id)? {
             if answer != crate::state::QUESTION_EXPIRED {
-                return Ok(answered(
-                    &questions,
-                    &question_raw,
-                    &resolve_answer(&answer, &options),
-                ));
+                return Ok(phone_answered(&answer));
             }
         }
-        // The user is back (input devices or /back): give them the question
-        // dialog in the terminal, honouring any answer that raced in first.
-        // The AskUserQuestion dialog runs in the terminal alongside this
-        // hook too, so it can be answered there while we poll. Same evidence
-        // rule, same reason: otherwise the gate holds a dead button for the
-        // rest of its window — a full day for a windowless session.
+        // Transcript evidence that the call was decided without us. While
+        // the hook blocks, Claude Code renders no dialog at all (verified
+        // 2026-08-22 — an earlier revision of this comment claimed the
+        // dialog ran alongside the hook, which a pty capture and a blank
+        // production terminal both falsified), so under the current TUI
+        // this arm should never fire before a hand-back. It stays as a
+        // belt-and-braces exit: a future Claude Code that does render
+        // concurrently would otherwise hold a dead button for the rest of
+        // the window — a full day for a windowless session.
         if resolution_watch.decided_elsewhere() {
             return match crate::state::settle_expired_and_cancel_push(
                 &conn,
                 crate::state::SettleTarget::Question(&question_id),
-                now,
+                settle_stamp_ms(now, gate_clock.elapsed()),
             )? {
-                crate::state::SettleOutcome::Answered(answer) => Ok(answered(
-                    &questions,
-                    &question_raw,
-                    &resolve_answer(&answer, &options),
-                )),
+                crate::state::SettleOutcome::Answered(answer) => Ok(phone_answered(&answer)),
                 crate::state::SettleOutcome::Expired => Ok(no_opinion()),
             };
         }
+        // The user is back (keyboard activity or /back): exit with no
+        // opinion so Claude Code renders the real dialog right here,
+        // honouring any answer that raced in first.
         if !windowless && presence.terminal_reclaimed() {
-            return match crate::state::expire_or_take_answer(&conn, &question_id, now)? {
-                Some(answer) => Ok(answered(
-                    &questions,
-                    &question_raw,
-                    &resolve_answer(&answer, &options),
-                )),
-                None => Ok(no_opinion()),
+            return match crate::state::expire_or_take_answer(
+                &conn,
+                &question_id,
+                settle_stamp_ms(now, gate_clock.elapsed()),
+            )? {
+                Some(answer) => Ok(phone_answered(&answer)),
+                None => {
+                    banner.paint_note("↩ 已交还本终端，对话框即将弹出");
+                    Ok(no_opinion())
+                }
             };
         }
     }
-    match crate::state::expire_or_take_answer(&conn, &question_id, now)? {
-        Some(answer) => Ok(answered(
-            &questions,
-            &question_raw,
-            &resolve_answer(&answer, &options),
-        )),
-        None => Ok(no_opinion()),
+    match crate::state::expire_or_take_answer(
+        &conn,
+        &question_id,
+        settle_stamp_ms(now, gate_clock.elapsed()),
+    )? {
+        Some(answer) => Ok(phone_answered(&answer)),
+        None => {
+            banner.paint_note("⌛ 手机未作答，交还本终端对话框");
+            Ok(no_opinion())
+        }
     }
+}
+
+/// Best-effort visibility for the blocked question window, written straight
+/// onto the session's terminal device.
+///
+/// While this gate blocks, Claude Code renders NOTHING for the pending
+/// question — not the dialog, not even the tool name, just a spinner
+/// (verified 2026-08-22 under tmux with a sleeping `PreToolUse` hook; the
+/// blank mahjong-training terminal that prompted this design was the same
+/// observation in production). The TUI only repaints its spinner line in
+/// place during the block, so bytes written to the pts stay on screen for
+/// the whole window; they are not tracked scrollback, and the native dialog
+/// chews them once the hook exits — acceptable, because by then the dialog
+/// itself is the visible thing.
+///
+/// Every write is best-effort and LOUD on failure, but never fatal: the
+/// Telegram window must survive a tty-less world (SSH, redirected fds), and
+/// a paint failure that silently killed the gate would trade a cosmetic gap
+/// for a lost question.
+struct QuestionBanner {
+    tty: Option<std::path::PathBuf>,
+}
+
+impl QuestionBanner {
+    fn for_session(windowless: bool) -> Self {
+        // A windowless session has no terminal anyone watches; painting its
+        // hidden pty would be writing to nobody and the Telegram window is
+        // already the only real dialog.
+        if windowless {
+            return Self { tty: None };
+        }
+        let tty = crate::claude::session_tty_path();
+        if tty.is_none() {
+            eprintln!(
+                "tinyctb question-gate: session tty not found; the terminal stays blank while \
+                 the question waits on Telegram"
+            );
+        }
+        Self { tty }
+    }
+
+    fn write(&self, text: &str) {
+        let Some(tty) = &self.tty else { return };
+        if let Err(err) = write_bounded(tty, text.as_bytes(), BANNER_WRITE_BUDGET) {
+            eprintln!(
+                "tinyctb question-gate: banner write to {} gave up: {err}",
+                tty.display()
+            );
+        }
+    }
+
+    /// The banner proper: what is being asked, the options with the letter
+    /// codes a typed reply may use, and how to summon the real dialog. `\r\n`
+    /// throughout — the TUI may hold the tty in raw mode where a bare `\n`
+    /// staircases. Question and option text is model-authored and passes
+    /// through `terminal_safe` first — see that function for why.
+    fn paint_question(&self, question: &str, options: &[String], multi_select: bool) {
+        let mut lines = format!(
+            "\r\n\x1b[1;36m┃ tinyCTB · 有提问待作答（已推送手机）\x1b[0m\r\n\
+             \x1b[36m┃ {}\x1b[0m\r\n",
+            clip(&terminal_safe(question), 160)
+        );
+        if !options.is_empty() {
+            let listed = options
+                .iter()
+                .enumerate()
+                .map(|(index, label)| {
+                    format!(
+                        "[{}] {}",
+                        (b'A' + (index as u8 % 26)) as char,
+                        clip(&terminal_safe(label), 40)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("  ");
+            lines.push_str(&format!("\x1b[36m┃ {listed}\x1b[0m\r\n"));
+        }
+        if multi_select {
+            lines.push_str("\x1b[36m┃ 多选：手机端以逗号分隔回复\x1b[0m\r\n");
+        }
+        lines.push_str("\x1b[2m┃ 按任意键在本终端唤出对话框作答\x1b[0m\r\n");
+        self.write(&lines);
+    }
+
+    /// One-line epilogue: the phone answered, or the window is being handed
+    /// back. The durable record is the `systemMessage` receipt in the hook's
+    /// reply — this line only keeps the just-painted banner from ending on a
+    /// still-waiting promise. The note may embed a phone-authored answer, so
+    /// the whole line is sanitized; the fixed prefix carries no controls and
+    /// the ANSI wrapper is added AFTER, so it survives untouched.
+    fn paint_note(&self, note: &str) {
+        self.write(&format!(
+            "\x1b[1;36m┃ tinyCTB · {}\x1b[0m\r\n",
+            terminal_safe(note)
+        ));
+    }
+}
+
+/// Total time one banner write may spend before giving up. Generous for a
+/// live terminal (a full banner is a few hundred bytes against a multi-KiB
+/// tty output queue) and small against the gate's real job: even a wedged
+/// tty costs half a second, not the approval window.
+const BANNER_WRITE_BUDGET: Duration = Duration::from_millis(500);
+
+/// Bounded, non-blocking tty write. A plain blocking `write_all` here can
+/// hang FOREVER — ^S/XOFF flow control, a stopped tmux client, or a full
+/// output queue all park the writer in the kernel with no error to catch —
+/// and "best-effort" that never returns would freeze the gate itself: an
+/// initial banner would stall the poll loop before it starts (the phone
+/// answer never consumed), a receipt line would stall the answer's return
+/// (phone shows answered, tool never proceeds). `O_NONBLOCK` turns those
+/// stalls into `WouldBlock`, which is retried only inside `budget`; whatever
+/// does not fit is dropped, reported, and the gate moves on. `O_NOCTTY`
+/// keeps the open from ever adopting the tty as this process's controlling
+/// terminal.
+#[cfg(unix)]
+fn write_bounded(tty: &std::path::Path, bytes: &[u8], budget: Duration) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let device = std::fs::OpenOptions::new()
+        .append(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(tty)?;
+    write_all_within(device, bytes, budget)
+}
+
+/// The budget is STRICT and checked at the top of every lap — not only on
+/// `WouldBlock`. The other two loop states have their own unbounded modes:
+/// an `Interrupted` storm (a signal-happy process) would otherwise spin
+/// forever, and a tty dribbling one byte per write would pass every
+/// per-error check while never finishing. `Ok(0)` is an error, not quiet
+/// success — pretending a zero-length write "worked" silently drops the
+/// rest of the banner.
+fn write_all_within<W: std::io::Write>(
+    mut device: W,
+    bytes: &[u8],
+    budget: Duration,
+) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut written = 0usize;
+    while written < bytes.len() {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("tty not draining; dropped {} bytes", bytes.len() - written),
+            ));
+        }
+        match device.write(&bytes[written..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    format!("tty accepted 0 bytes; dropped {}", bytes.len() - written),
+                ))
+            }
+            Ok(count) => written += count,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_bounded(_tty: &std::path::Path, _bytes: &[u8], _budget: Duration) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Strip everything that could steer a terminal out of model-authored text.
+///
+/// Question and option text comes from the model — which may have absorbed
+/// untrusted repo or web content — and a JSON-legal string carries ESC, BEL,
+/// CR or C1 bytes just fine. Embedded raw, those become CSI screen wipes,
+/// OSC title or clipboard writes, or CR overprints of the surrounding
+/// banner. CR/LF/TAB become a plain space (word boundaries survive); every
+/// other C0 control, DEL, and the C1 range are dropped outright — killing
+/// the ESC that introduces any escape sequence while leaving its printable
+/// tail as harmless visible text. The banner's own fixed ANSI is added
+/// around the sanitized text afterwards, never through it.
+fn terminal_safe(text: &str) -> String {
+    text.chars()
+        .filter_map(|ch| match ch {
+            '\r' | '\n' | '\t' => Some(' '),
+            ch if (ch as u32) < 0x20 || ch == '\u{7F}' => None,
+            ch if ('\u{80}'..='\u{9F}').contains(&ch) => None,
+            ch => Some(ch),
+        })
+        .collect()
+}
+
+/// Truncation for banner display only, on char boundaries — a byte cut
+/// through the middle of the CJK text these banners usually carry would
+/// panic `format!`.
+fn clip(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut clipped: String = text.chars().take(max_chars).collect();
+    clipped.push('…');
+    clipped
 }
 
 /// Hand the user's choice back through the tool's own contract: the question
@@ -1167,6 +1408,15 @@ fn letter_option(part: &str, options: &[String]) -> Option<String> {
 
 fn answered(questions: &[Value], question_text: &str, answer: &str) -> Value {
     json!({
+        // The durable in-terminal receipt: `systemMessage` travels through
+        // Claude Code's own rendering (and the transcript), unlike the tty
+        // banner, which the post-hook repaint chews. Between the two, a
+        // person at the screen can always reconstruct what was asked and
+        // who answered it.
+        // Display copies are sanitized; `updatedInput` below is NOT — the
+        // answers map must reach the tool byte-exact or the question counts
+        // as unanswered.
+        "systemMessage": format!("tinyCTB：已由手机作答「{}」", terminal_safe(answer)),
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
@@ -1662,6 +1912,10 @@ mod tests {
             // Same for the windowless override: every test starts as a
             // session that HAS a terminal window.
             std::env::remove_var("TINYCTB_TEST_SESSION_WINDOWLESS");
+            // And without a fake session tty: banner painting is opt-in per
+            // test, and a leftover path would spray banners into a dead
+            // temp file (or worse, a reused one another test asserts on).
+            std::env::remove_var("TINYCTB_TEST_SESSION_TTY");
             crate::config::write_daemon_config(&DaemonConfig {
                 version: 1,
                 bridge_command: "tinyctb".to_string(),
@@ -3469,6 +3723,420 @@ mod tests {
     fn question_gate(payload: Value) -> Value {
         let mut reader = std::io::Cursor::new(payload.to_string());
         run_question_gate(&mut reader, 1000).expect("question gate")
+    }
+
+    /// The user's law for the blocked window: the terminal must always show
+    /// the question, never phone-only. While the hook blocks, Claude Code
+    /// paints nothing, so the gate itself must paint — the question with its
+    /// options at publish time, and a receipt when the phone answers.
+    #[test]
+    fn a_blocked_question_paints_a_banner_and_a_phone_receipt_on_the_tty() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("question-banner", true, 30);
+        let tty = _env.root.join("fake-tty.txt");
+        fs::write(&tty, "").expect("fake tty");
+        std::env::set_var("TINYCTB_TEST_SESSION_TTY", &tty);
+        let handle = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                let Ok(question_id) = conn.query_row(
+                    "SELECT question_id FROM pending_questions WHERE answer IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) else {
+                    continue;
+                };
+                if matches!(
+                    crate::state::record_question_answer(&conn, &question_id, "SQLite", 2000),
+                    Ok(crate::state::ApprovalAnswer::Recorded)
+                ) {
+                    return;
+                }
+            }
+            panic!("question row never appeared");
+        });
+        let result = question_gate(question_payload());
+        handle.join().expect("answering thread");
+
+        let painted = fs::read_to_string(&tty).expect("painted tty");
+        assert!(painted.contains("有提问待作答"), "{painted}");
+        assert!(painted.contains("这个项目用哪个数据库？"), "{painted}");
+        assert!(
+            painted.contains("[A] Postgres") && painted.contains("[B] SQLite"),
+            "options with their letter codes must be on the banner: {painted}"
+        );
+        assert!(painted.contains("已由手机作答：SQLite"), "{painted}");
+        // The durable receipt rides the hook reply itself — the tty banner
+        // is chewed by the post-hook repaint and never reaches scrollback.
+        assert_eq!(
+            result["systemMessage"], "tinyCTB：已由手机作答「SQLite」",
+            "{result}"
+        );
+    }
+
+    /// A keyboard reclaim hands the window back with no opinion; the banner
+    /// must close on the hand-over rather than a still-waiting promise.
+    #[test]
+    fn a_reclaimed_question_paints_a_handover_note() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("question-handover", true, 30);
+        let tty = _env.root.join("fake-tty.txt");
+        fs::write(&tty, "").expect("fake tty");
+        std::env::set_var("TINYCTB_TEST_SESSION_TTY", &tty);
+        // A keypress just happened: the first poll tick reclaims.
+        std::env::set_var("TINYCTB_TEST_IDLE_MS", "0");
+        let result = question_gate(question_payload());
+        std::env::remove_var("TINYCTB_TEST_IDLE_MS");
+        assert_eq!(result, json!({}), "reclaim must exit with no opinion");
+        let painted = fs::read_to_string(&tty).expect("painted tty");
+        assert!(painted.contains("有提问待作答"), "{painted}");
+        assert!(painted.contains("已交还本终端"), "{painted}");
+        // The settle stamp is wall-clock time, not the gate's start instant:
+        // a stamp equal to `created_at` collapses "born" and "handed back"
+        // into one millisecond and forensics can no longer order them
+        // (exactly how the 2026-08-22 production autopsy went wrong).
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let (created, stamped): (i64, i64) = conn
+            .query_row(
+                "SELECT created_at, answered_at FROM pending_questions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("settled row");
+        assert!(
+            stamped > created,
+            "settle must stamp real time ({stamped} vs created {created})"
+        );
+    }
+
+    /// A windowless session has no terminal anyone watches: its Telegram
+    /// window is the only dialog, and painting its hidden pty would be
+    /// writing to nobody.
+    #[test]
+    fn a_windowless_session_paints_no_banner() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("question-windowless-banner", true, 30);
+        let tty = _env.root.join("fake-tty.txt");
+        fs::write(&tty, "").expect("fake tty");
+        std::env::set_var("TINYCTB_TEST_SESSION_TTY", &tty);
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
+        let handle = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                let Ok(question_id) = conn.query_row(
+                    "SELECT question_id FROM pending_questions WHERE answer IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) else {
+                    continue;
+                };
+                if matches!(
+                    crate::state::record_question_answer(&conn, &question_id, "SQLite", 2000),
+                    Ok(crate::state::ApprovalAnswer::Recorded)
+                ) {
+                    return;
+                }
+            }
+            panic!("question row never appeared");
+        });
+        let result = question_gate(question_payload());
+        handle.join().expect("answering thread");
+        std::env::remove_var("TINYCTB_TEST_SESSION_WINDOWLESS");
+        // The answer still flows — with its receipt — but the tty stays
+        // untouched.
+        assert_eq!(
+            result["hookSpecificOutput"]["updatedInput"]["answers"]["这个项目用哪个数据库？"],
+            "SQLite",
+            "{result}"
+        );
+        assert_eq!(
+            fs::read_to_string(&tty).expect("fake tty"),
+            "",
+            "a windowless session must not paint"
+        );
+    }
+
+    /// A pty whose output queue is already full: nobody reads the master,
+    /// and junk written to the slave up-front leaves no room for more. Any
+    /// further slave write blocks (or `WouldBlock`s) until someone drains
+    /// the master — the shape a ^S/XOFF-paused or wedged terminal presents.
+    /// The returned master must stay alive for the wedge to hold.
+    #[cfg(target_os = "linux")]
+    fn wedged_pty() -> (std::fs::File, std::path::PathBuf) {
+        use std::os::unix::io::FromRawFd as _;
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(master >= 0, "posix_openpt failed");
+            assert_eq!(libc::grantpt(master), 0, "grantpt failed");
+            assert_eq!(libc::unlockpt(master), 0, "unlockpt failed");
+            let mut name = [0 as libc::c_char; 256];
+            assert_eq!(
+                libc::ptsname_r(master, name.as_mut_ptr(), name.len()),
+                0,
+                "ptsname_r failed"
+            );
+            let path = std::ffi::CStr::from_ptr(name.as_ptr())
+                .to_string_lossy()
+                .into_owned();
+            let slave = libc::open(
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY,
+            );
+            assert!(slave >= 0, "slave open failed");
+            let junk = [b'x'; 1024];
+            loop {
+                if libc::write(slave, junk.as_ptr().cast(), junk.len()) <= 0 {
+                    break;
+                }
+            }
+            libc::close(slave);
+            (
+                std::fs::File::from_raw_fd(master),
+                std::path::PathBuf::from(path),
+            )
+        }
+    }
+
+    /// An `Interrupted` storm never touches the `WouldBlock` arm, so a
+    /// budget checked only there would spin forever. The top-of-lap check
+    /// must end it — and the recv here, not a hung test binary, is what
+    /// goes red if that check is lost.
+    #[test]
+    fn an_interrupt_storm_cannot_outlive_the_write_budget() {
+        struct InterruptStorm;
+        impl std::io::Write for InterruptStorm {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::Interrupted.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(write_all_within(
+                InterruptStorm,
+                b"banner",
+                Duration::from_millis(200),
+            ));
+        });
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the budget must bound an Interrupted storm");
+        assert_eq!(
+            outcome.expect_err("storm must time out").kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
+    /// One byte per lap passes every per-error check; only a strict
+    /// top-of-lap budget stops a tty that dribbles without ever finishing.
+    #[test]
+    fn a_dribbling_tty_still_exhausts_the_budget() {
+        struct Dribble;
+        impl std::io::Write for Dribble {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(1)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let outcome = write_all_within(Dribble, &[b'z'; 640], Duration::from_millis(200));
+        assert_eq!(
+            outcome.expect_err("dribble must time out").kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
+    /// `Ok(0)` is a tty accepting nothing, forever — success here would
+    /// silently drop the rest of the banner.
+    #[test]
+    fn a_zero_write_is_an_error_not_quiet_success() {
+        struct Zero;
+        impl std::io::Write for Zero {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let outcome = write_all_within(Zero, b"banner", Duration::from_secs(5));
+        assert_eq!(
+            outcome.expect_err("zero write must fail").kind(),
+            std::io::ErrorKind::WriteZero
+        );
+    }
+
+    /// A blocking write would park the gate in the kernel with no error to
+    /// catch. Against a wedged REAL pty the bounded write must come back
+    /// within its budget and say so.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_wedged_tty_cannot_hang_a_banner_write() {
+        let (_master, slave) = wedged_pty();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target = slave.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(write_bounded(
+                &target,
+                &[b'y'; 4096],
+                Duration::from_millis(300),
+            ));
+        });
+        // This recv IS the red path for a blocking regression: a writer
+        // parked in the kernel never sends, and the assertion below — not a
+        // hung test binary — is what fails.
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("write_bounded must return within its budget");
+        let err = outcome.expect_err("a wedged tty must be reported, not ignored");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+    }
+
+    /// Sol's P1 scenario end-to-end: both banner writes (publish + receipt)
+    /// hit a wedged tty, and the phone answer must still be consumed and
+    /// returned. The banner is cosmetic; the answer is not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_wedged_tty_still_lets_the_phone_answer_land() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("question-wedged-tty", true, 30);
+        let (_master, slave) = wedged_pty();
+        std::env::set_var("TINYCTB_TEST_SESSION_TTY", &slave);
+        let handle = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                let Ok(question_id) = conn.query_row(
+                    "SELECT question_id FROM pending_questions WHERE answer IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) else {
+                    continue;
+                };
+                if matches!(
+                    crate::state::record_question_answer(&conn, &question_id, "SQLite", 2000),
+                    Ok(crate::state::ApprovalAnswer::Recorded)
+                ) {
+                    return;
+                }
+            }
+            panic!("question row never appeared");
+        });
+        // The gate runs on a WORKER thread with a recv_timeout around it: a
+        // blocking-write regression parks the gate in the kernel, and an
+        // elapsed assertion after the call would simply never run. The recv
+        // is what goes red.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(question_gate(question_payload()));
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the gate must return despite a wedged tty");
+        handle.join().expect("answering thread");
+        assert_eq!(
+            result["hookSpecificOutput"]["updatedInput"]["answers"]["这个项目用哪个数据库？"],
+            "SQLite",
+            "{result}"
+        );
+    }
+
+    /// Model-authored text is a terminal attack surface: a JSON-legal
+    /// string can smuggle ESC/OSC/CSI/BEL/CR. Nothing of that may reach the
+    /// tty — only the banner's own fixed ANSI — and the printable tails
+    /// survive as harmless visible text.
+    #[test]
+    fn hostile_control_sequences_never_reach_the_tty() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("question-hostile", true, 30);
+        let tty = _env.root.join("fake-tty.txt");
+        fs::write(&tty, "").expect("fake tty");
+        std::env::set_var("TINYCTB_TEST_SESSION_TTY", &tty);
+        let payload = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "sess-hostile",
+            "tool_name": "AskUserQuestion",
+            "permission_mode": "default",
+            "cwd": "/home/user/project",
+            "tool_input": { "questions": [{
+                "question": "扫\u{1b}]52;c;RXZpbA==\u{7}码",
+                "options": [
+                    {"label": "\u{1b}[2Jwipe", "description": "clears"},
+                    {"label": "B\r\nrow", "description": "splits"}
+                ]
+            }]}
+        });
+        let handle = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                let Ok(question_id) = conn.query_row(
+                    "SELECT question_id FROM pending_questions WHERE answer IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) else {
+                    continue;
+                };
+                if matches!(
+                    crate::state::record_question_answer(
+                        &conn,
+                        &question_id,
+                        "答\u{1b}[2J\u{7}案\r\n完",
+                        2000
+                    ),
+                    Ok(crate::state::ApprovalAnswer::Recorded)
+                ) {
+                    return;
+                }
+            }
+            panic!("question row never appeared");
+        });
+        let result = question_gate(payload);
+        handle.join().expect("answering thread");
+
+        let painted = fs::read_to_string(&tty).expect("painted tty");
+        assert!(
+            !painted.contains("\u{1b}]52"),
+            "OSC 52 injected: {painted:?}"
+        );
+        assert!(
+            !painted.contains("\u{1b}[2J"),
+            "CSI wipe injected: {painted:?}"
+        );
+        assert!(!painted.contains('\u{7}'), "BEL injected: {painted:?}");
+        assert!(
+            painted.contains("]52;c;RXZpbA=="),
+            "printable tail must survive as harmless text: {painted:?}"
+        );
+        assert!(
+            painted.contains("B  row"),
+            "CR/LF must become spaces: {painted:?}"
+        );
+        assert!(
+            painted.contains("答[2J案  完"),
+            "the receipt line must carry the sanitized answer: {painted:?}"
+        );
+        // Only the banner's own fixed ANSI remains: 2 ESCs per painted line
+        // (header, question, options, footer, receipt).
+        assert_eq!(painted.matches('\u{1b}').count(), 10, "{painted:?}");
+        // The display receipt is sanitized; the tool-contract copy is
+        // byte-exact — both, deliberately.
+        assert_eq!(
+            result["systemMessage"],
+            "tinyCTB：已由手机作答「答[2J案  完」"
+        );
+        assert_eq!(
+            result["hookSpecificOutput"]["updatedInput"]["answers"]
+                ["扫\u{1b}]52;c;RXZpbA==\u{7}码"],
+            "答\u{1b}[2J\u{7}案\r\n完",
+            "{result}"
+        );
     }
 
     /// Tapping an option answers the blocked question; the choice reaches the

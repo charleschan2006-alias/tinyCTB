@@ -85,6 +85,15 @@ no terminal to fall back to. `AskUserQuestion` dialogs are likewise answered
 from Telegram (buttons or a text reply), and `/threads` re-offers any prompt
 you missed.
 
+A question blocked on Telegram is never phone-only: Claude Code renders
+nothing while the hook holds the call, so tinyctb paints a banner directly on
+the session's terminal — the question, its options, and how to reclaim it.
+Any keyboard activity (or `/back`) hands the window back within about a
+second and the native dialog opens right there; when the phone answers
+first, the terminal gets a durable "answered from Telegram" receipt via the
+hook's `systemMessage`. Background sessions without a visible terminal skip
+the banner — for them the Telegram window is the dialog.
+
 ## Install
 
 **Prebuilt binary (Linux x86_64, recommended — no Rust toolchain needed):**

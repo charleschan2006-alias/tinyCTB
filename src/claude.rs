@@ -2882,6 +2882,315 @@ fn windowless_probe_seam() {
     }
 }
 
+/// The terminal device of the Claude Code session this hook belongs to, or
+/// `None` when there is no usable one.
+///
+/// The route: `CLAUDE_CODE_MESSAGING_SOCKET` (inherited by every hook
+/// process) is named after the claude process's pid, and that process holds
+/// its pts on the standard fds. Verified 2026-08-22 under tmux: socket stem
+/// -> pid -> `/proc/<pid>/fd/0..2` all resolved to the pane's `/dev/pts/N`.
+/// The hook's own fds are useless here — Claude Code spawns hooks with
+/// socket-backed stdio and no controlling terminal, so the session's tty is
+/// only reachable through the claude process itself.
+///
+/// Where `/proc` does not exist (macOS) or gave nothing (all three fds
+/// redirected), a constrained `ps -o tty=` on the same pid reports the
+/// controlling terminal instead. `None` simply means "nothing to paint on",
+/// never an error.
+pub(crate) fn session_tty_path() -> Option<PathBuf> {
+    // Tests NEVER fall through to the real probe: `cargo test` inherits the
+    // developing session's own messaging socket, and a test without the seam
+    // would resolve that session's pts and paint banners into the terminal
+    // the developer is typing in. Unset seam = no tty, full stop.
+    #[cfg(test)]
+    return match env::var("TINYCTB_TEST_SESSION_TTY") {
+        Ok(raw) if !raw.is_empty() => Some(PathBuf::from(raw)),
+        _ => None,
+    };
+    #[cfg(not(test))]
+    real_session_tty_path()
+}
+
+#[cfg(not(test))]
+fn real_session_tty_path() -> Option<PathBuf> {
+    let socket = env::var("CLAUDE_CODE_MESSAGING_SOCKET").ok()?;
+    let pid = Path::new(&socket)
+        .file_stem()?
+        .to_str()?
+        .parse::<u32>()
+        .ok()?;
+    proc_fd_tty(pid).or_else(|| ps_reported_tty(pid))
+}
+
+/// Linux fast path: fds 0..2 in order, first tty wins — no subprocess.
+#[cfg(all(not(test), target_os = "linux"))]
+fn proc_fd_tty(pid: u32) -> Option<PathBuf> {
+    [0u32, 1, 2].iter().find_map(|fd| {
+        let target = fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
+        target
+            .to_str()
+            .is_some_and(|path| path.starts_with("/dev/pts/") || path.starts_with("/dev/tty"))
+            .then_some(target)
+    })
+}
+
+#[cfg(all(not(test), not(target_os = "linux")))]
+fn proc_fd_tty(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+/// Portable fallback: the controlling terminal as `ps` reports it. macOS has
+/// no `/proc`, so this is the ONLY route there; on Linux it covers a session
+/// whose standard fds were all redirected but whose controlling tty exists.
+/// The binary comes from a fixed trusted list — a PATH lookup could hand the
+/// probe to any wrapper on the user's PATH — and the whole run is bounded by
+/// `within_deadline` wiring `probe_child_line_blocking`: this is the hook's
+/// hot path, and `Command::output()` with no timeout would freeze the gate
+/// before its poll loop ever starts. The parsed path must also BE a
+/// character device before anyone writes to it.
+#[cfg(not(test))]
+fn ps_reported_tty(pid: u32) -> Option<PathBuf> {
+    // EVERY step lives inside the bounded worker — candidate `exists()`,
+    // the spawn, the parse, and the char-device `metadata()`. The first
+    // and last are filesystem touches, and a dead mount can park either
+    // one forever: a bound that only covered the middle would leave the
+    // gate frozen at the edges of the pipeline.
+    within_deadline(PS_PROBE_BUDGET, move |deadline| {
+        let binary = ["/bin/ps", "/usr/bin/ps"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.exists())?;
+        let args = ["-o", "tty=", "-p", &pid.to_string()].map(String::from);
+        let line = probe_child_line_blocking(binary, &args, deadline)?;
+        let path = parse_ps_tty(&line)?;
+        is_char_device(&path).then_some(path)
+    })
+    .flatten()
+}
+
+/// The banner will WRITE to whatever this approves; a regular file (or a
+/// fifo someone parked at a tty-looking path) must not pass.
+#[cfg(not(test))]
+fn is_char_device(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt as _;
+    fs::metadata(path).is_ok_and(|meta| meta.file_type().is_char_device())
+}
+
+/// Total budget for one `ps` probe: spawn, output, exit, all inclusive.
+pub(crate) const PS_PROBE_BUDGET: Duration = Duration::from_millis(500);
+
+/// Run `work` on a detached worker under a STRICT caller-visible deadline.
+///
+/// The point is what stays OFF the caller's thread: everything inside
+/// `work` — filesystem probes included, since a dead mount can park
+/// `exists()`, `metadata()` or `spawn()` forever with no error to catch.
+/// The caller waits out the budget on a channel and walks away; a worker
+/// that wakes late finds its deadline spent, does its own cleanup, and
+/// sends into a dropped channel. Caller-visible time is the budget plus
+/// channel scheduling — never a cleanup tax.
+fn within_deadline<T: Send + 'static>(
+    budget: Duration,
+    work: impl FnOnce(std::time::Instant) -> T + Send + 'static,
+) -> Option<T> {
+    let deadline = std::time::Instant::now() + budget;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work(deadline));
+    });
+    rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .ok()
+}
+
+/// Test-only composition of the two audited pieces — `within_deadline`
+/// around `probe_child_line_blocking` — in exactly the shape
+/// `ps_reported_tty` wires them (which inlines the pipeline so candidate
+/// checks and device validation share the SAME deadline, and is itself
+/// `cfg(not(test))` because tests must never probe the real session).
+#[cfg(test)]
+pub(crate) fn probe_child_line(binary: &Path, args: &[&str], budget: Duration) -> Option<String> {
+    let binary = binary.to_path_buf();
+    let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+    within_deadline(budget, move |deadline| {
+        probe_child_line_blocking(&binary, &args, deadline)
+    })
+    .flatten()
+}
+
+/// Run a child expected to print one short line, with every step
+/// deadline-checked — each has a real hang mode: the child may never exit
+/// (budget → group kill + bounded reap, so no zombie is left behind), and
+/// its stdout pipe may never reach EOF even after the child dies — a
+/// wrapper that forked a grandchild leaves the write end open, which is why
+/// the pipe is switched to `O_NONBLOCK` and read in the same deadline loop
+/// instead of a blocking `read_to_string`. Output beyond 1 KiB is not "one
+/// short line" and fails the probe outright.
+fn probe_child_line_blocking(
+    binary: &Path,
+    args: &[String],
+    deadline: std::time::Instant,
+) -> Option<String> {
+    // Test seam: a hung `spawn()` (binary on a dead filesystem) parks this
+    // thread before any deadline check can run — unreachable from a real
+    // test without a broken mount, so the stall is injected here. The
+    // caller's recv_timeout, not this thread, is what stays bounded.
+    #[cfg(test)]
+    if let Ok(raw) = env::var("TINYCTB_TEST_PROBE_STALL_MS") {
+        if let Ok(ms) = raw.parse::<u64>() {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    }
+    use std::io::Read as _;
+    use std::os::unix::io::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+    let mut child = Command::new(binary)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        // Its own process group, so the timeout cleanup can kill the GROUP:
+        // killing only the direct child orphans whatever it forked — and a
+        // forked grandchild is exactly the thing that inherits our pipe and
+        // holds EOF hostage. (Observed for real: the fake-ps test's `sh`
+        // died while its `sleep 1000` lived on, three of them.)
+        .process_group(0)
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    // A failed fcntl means the next read() may block FOREVER — that is not
+    // "degraded", it is the exact hang this function exists to prevent, so
+    // it aborts the probe. Both calls are checked.
+    let nonblocking = unsafe {
+        let fd = stdout.as_raw_fd();
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        flags != -1 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) != -1
+    };
+    if !nonblocking {
+        abandon_probe(child);
+        return None;
+    }
+    let mut collected = Vec::new();
+    let mut reached_eof = false;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            abandon_probe(child);
+            return None;
+        }
+        if !reached_eof {
+            let mut buf = [0u8; 256];
+            match stdout.read(&mut buf) {
+                Ok(0) => reached_eof = true,
+                Ok(count) => {
+                    collected.extend_from_slice(&buf[..count]);
+                    if collected.len() > 1024 {
+                        abandon_probe(child);
+                        return None;
+                    }
+                    continue;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    abandon_probe(child);
+                    return None;
+                }
+            }
+            // DELIBERATELY no try_wait() before EOF. Reaping an
+            // already-exited leader here would free its PID — and with it
+            // the process-GROUP anchor — while a descendant still holds
+            // the pipe; a recycled pgid would aim the eventual group kill
+            // at strangers. Left unreaped, the zombie pins the pgid until
+            // `abandon_probe` sweeps the group or EOF makes reaping safe.
+            continue;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                return String::from_utf8(collected).ok();
+            }
+            // EOF but still running: wait for the exit status the answer
+            // deserves, or let the deadline end it.
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(_) => {
+                abandon_probe(child);
+                return None;
+            }
+        }
+    }
+}
+
+/// End an overdue probe without ever waiting unbounded on the gate thread.
+///
+/// SIGKILL goes to the child's whole PROCESS GROUP (it is its own leader —
+/// see the spawn), falling back to the pid if the group kill fails. The
+/// reap is a short bounded `try_wait` loop: that covers every ordinary
+/// death, and a child the kernel refuses to release (uninterruptible
+/// sleep) is handed to a detached reaper thread instead — the thread can
+/// block forever harmlessly, the GATE thread cannot. If the hook process
+/// exits before the reaper collects, init inherits and reaps: the thread
+/// is the belt, process exit is the braces. Either way no zombie survives
+/// the hook.
+fn abandon_probe(mut child: std::process::Child) {
+    let pid = child.id() as i32;
+    unsafe {
+        if libc::kill(-pid, libc::SIGKILL) != 0 {
+            let _ = child.kill();
+        }
+    }
+    let grace = std::time::Instant::now() + Duration::from_millis(200);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {
+                if std::time::Instant::now() >= grace {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
+
+/// `ps -o tty=` output -> a device path, or `None` for "no terminal".
+/// Linux prints `pts/17`, macOS prints `ttys001`, a daemon prints `?`/`??`/
+/// `-`.
+///
+/// Constrained on purpose — this string names a device the banner will
+/// WRITE to, so parsing is a gate: one token, and the result is anchored
+/// under `/dev` by CONSTRUCTION, component by component. (`PathBuf::join`
+/// famously discards the base for an absolute right-hand side, so
+/// `/tmp/victim` would have sailed straight through a join-based "anchor".)
+/// An absolute token must itself start with `/dev/`; every remaining
+/// component must be a plain name — no empties (`//`), no `.`, no `..`.
+pub(crate) fn parse_ps_tty(raw: &str) -> Option<PathBuf> {
+    let token = raw.trim();
+    if token.is_empty() || token == "?" || token == "??" || token == "-" {
+        return None;
+    }
+    if token.contains(char::is_whitespace) {
+        return None;
+    }
+    let relative = match token.strip_prefix("/dev/") {
+        Some(stripped) => stripped,
+        None if token.starts_with('/') => return None,
+        None => token,
+    };
+    let mut path = PathBuf::from("/dev");
+    for component in relative.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return None;
+        }
+        path.push(component);
+    }
+    Some(path)
+}
+
 /// Does the session running THIS hook lack a terminal window? Hooks are
 /// children of the session process and inherit its messaging socket, whose
 /// file name is the session pid — so a gate can classify itself without any
@@ -3328,6 +3637,258 @@ mod tests {
     use super::*;
     use crate::state::create_state_db_in_memory;
     use std::io::Write;
+
+    /// `ps -o tty=` output is about to name a device the banner WRITES to,
+    /// so parsing is a gate, not a convenience: only a single clean token
+    /// becomes a path, and only ever under `/dev`.
+    #[test]
+    fn ps_tty_output_parses_only_clean_device_tokens() {
+        assert_eq!(
+            parse_ps_tty("pts/17\n"),
+            Some(PathBuf::from("/dev/pts/17")),
+            "Linux form"
+        );
+        assert_eq!(
+            parse_ps_tty("ttys001\n"),
+            Some(PathBuf::from("/dev/ttys001")),
+            "macOS form"
+        );
+        assert_eq!(
+            parse_ps_tty("/dev/pts/9"),
+            Some(PathBuf::from("/dev/pts/9")),
+            "already-absolute form stays under /dev"
+        );
+        for no_terminal in ["?", "??", "-", "", "   \n"] {
+            assert_eq!(parse_ps_tty(no_terminal), None, "{no_terminal:?}");
+        }
+        assert_eq!(parse_ps_tty("pts/3 extra"), None, "one token only");
+        assert_eq!(parse_ps_tty("../etc/passwd"), None, "no escaping /dev");
+        // `PathBuf::join` discards the base for an absolute right-hand side,
+        // so an anchor built on join once let these straight through. The
+        // anchor is by construction now — these must all die at the parser.
+        assert_eq!(parse_ps_tty("/tmp/victim"), None, "absolute escape");
+        assert_eq!(parse_ps_tty("/etc/passwd"), None, "absolute escape");
+        assert_eq!(parse_ps_tty("/dev//pts/3"), None, "empty component");
+        assert_eq!(parse_ps_tty("pts//3"), None, "empty component");
+        assert_eq!(parse_ps_tty("pts/./3"), None, "dot component");
+        assert_eq!(parse_ps_tty("pts/../3"), None, "dot-dot component");
+        assert_eq!(parse_ps_tty("/dev/../etc/passwd"), None, "dot-dot escape");
+    }
+
+    /// Sol's pgid-recycling scenario: the LEADER exits at once while its
+    /// forked grandchild (same group, holding our stdout pipe) lives on.
+    /// Before EOF the leader must stay UNREAPED — the zombie pins the
+    /// PID/PGID anchor — so the timeout's group kill still lands on the
+    /// right group and sweeps the grandchild. A revision that reaps the
+    /// leader early frees the anchor, the group kill dies with ESRCH, and
+    /// the grandchild leaks: this test is what goes red then.
+    // target_os = "linux", not just unix: the zombie-anchor assertion
+    // reads /proc/<pid>/stat, which macOS does not have.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dead_leader_keeps_its_group_anchor_until_the_sweep() {
+        let _guard = crate::state::test_env_lock();
+        std::env::remove_var("TINYCTB_TEST_PROBE_STALL_MS");
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("tinyctb-deadleader-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let grandchild_file = dir.join("grandchild.pid");
+        let shell_file = dir.join("shell.pid");
+        let script = dir.join("ps");
+        // No `wait`: the shell exits immediately, leaving only the
+        // grandchild — which inherited our pipe, so EOF never comes.
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 1000 &\necho $! > {}\necho $$ > {}\nexit 0\n",
+                grandchild_file.display(),
+                shell_file.display()
+            ),
+        )
+        .expect("script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_script = script.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe_child_line(&probe_script, &[], PS_PROBE_BUDGET));
+        });
+
+        let read_pid = |path: &std::path::Path| -> i32 {
+            fs::read_to_string(path)
+                .expect("pid recorded")
+                .trim()
+                .parse()
+                .expect("pid parses")
+        };
+        // Mid-probe, after the shell has exited (a handful of ms) but well
+        // before the 500ms deadline: the leader must still be visible as a
+        // ZOMBIE — the unreaped corpse IS the PID/PGID anchor. An early
+        // `try_wait` regression reaps it here and the /proc entry is gone
+        // long before the deadline, which is exactly what this catches.
+        std::thread::sleep(Duration::from_millis(150));
+        let shell = read_pid(&shell_file);
+        let grandchild = read_pid(&grandchild_file);
+        let stat = fs::read_to_string(format!("/proc/{shell}/stat"))
+            .expect("the exited leader must remain visible (unreaped) before EOF");
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, tail)| tail.split_whitespace().next())
+            .expect("stat state field");
+        assert_eq!(
+            state, "Z",
+            "the pre-EOF leader must be an unreaped zombie holding the group anchor"
+        );
+
+        let line = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the probe must give up within its budget");
+        assert_eq!(line, None, "no EOF, no answer");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let fully_gone = |pid: i32| {
+                let outcome = unsafe { libc::kill(pid, 0) };
+                outcome == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            };
+            if fully_gone(shell) && fully_gone(grandchild) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "group sweep missed: shell {shell} and/or grandchild {grandchild} \
+                 still alive 3s after the probe gave up"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A `spawn()` parked on a hung filesystem never reaches any deadline
+    /// check — bounding it is the CALLER's recv, not the worker. The stall
+    /// seam injects that park; with the probe back on the caller's thread
+    /// this takes the full stall and goes red on the elapsed bound.
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_spawn_cannot_freeze_the_probe_caller() {
+        let _guard = crate::state::test_env_lock();
+        std::env::set_var("TINYCTB_TEST_PROBE_STALL_MS", "3000");
+        let started = std::time::Instant::now();
+        let line = probe_child_line(Path::new("/bin/sh"), &["-c", "echo pts/1"], PS_PROBE_BUDGET);
+        let took = started.elapsed();
+        std::env::remove_var("TINYCTB_TEST_PROBE_STALL_MS");
+        assert_eq!(
+            line, None,
+            "a probe that cannot spawn in time has no answer"
+        );
+        assert!(
+            took <= PS_PROBE_BUDGET + Duration::from_millis(180),
+            "caller froze for {took:?} behind a hung spawn"
+        );
+    }
+
+    /// The bounded probe against a happy child: output collected to EOF,
+    /// exit observed, line returned.
+    #[cfg(unix)]
+    #[test]
+    fn the_ps_probe_returns_a_fast_child_output() {
+        let _guard = crate::state::test_env_lock();
+        std::env::remove_var("TINYCTB_TEST_PROBE_STALL_MS");
+        let line = probe_child_line(
+            Path::new("/bin/sh"),
+            &["-c", "echo pts/5"],
+            Duration::from_secs(5),
+        );
+        assert_eq!(line.as_deref().map(str::trim), Some("pts/5"));
+    }
+
+    /// Sol's P1 scenario: `ps` (or whatever wrapper answered to that name)
+    /// never exits. The probe must give up within its budget, and the child
+    /// must be KILLED AND REAPED — a gate that leaves a zombie per question
+    /// is trading one leak for another.
+    #[cfg(unix)]
+    #[test]
+    fn a_never_exiting_ps_cannot_hang_tty_discovery() {
+        let _guard = crate::state::test_env_lock();
+        std::env::remove_var("TINYCTB_TEST_PROBE_STALL_MS");
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("tinyctb-fakeps-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("fake ps dir");
+        let pid_file = dir.join("child.pid");
+        let grandchild_file = dir.join("grandchild.pid");
+        let script = dir.join("ps");
+        // The shell FORKS a sleeping grandchild that inherits our stdout
+        // pipe — the exact "grandchild holds EOF hostage" shape — then
+        // waits on it. An earlier revision killed only the shell and
+        // leaked the sleep (three of them observed on the host); both pids
+        // are recorded so both deaths can be ASSERTED, not assumed.
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 1000 &\necho $! > {}\necho $$ > {}\nwait\n",
+                grandchild_file.display(),
+                pid_file.display()
+            ),
+        )
+        .expect("fake ps");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        // Worker + recv_timeout: an unbounded-probe regression never
+        // returns, so an elapsed assertion after the call would never run —
+        // this recv is what goes red instead of a hung test binary.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_script = script.clone();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let line = probe_child_line(&probe_script, &[], PS_PROBE_BUDGET);
+            let _ = tx.send((line, started.elapsed()));
+        });
+        let (line, took) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the probe must give up within its budget");
+        assert_eq!(line, None, "a wedged probe must fail, not pretend");
+        // The budget is the CALLER-VISIBLE total: cleanup runs past the
+        // caller's return on the worker thread. The margin (180ms) is
+        // deliberately smaller than the 200ms reap grace, so a regression
+        // that pays the cleanup tax on the caller's clock (~700ms) fails
+        // here — while honest channel/scheduling jitter does not.
+        assert!(
+            took <= PS_PROBE_BUDGET + Duration::from_millis(180),
+            "probe took {took:?}; the budget must be a strict caller-visible total"
+        );
+        // Both processes must be GONE: kill(pid, 0) refusing with ESRCH is
+        // the kernel saying the pid no longer exists — killed and reaped (a
+        // zombie still answers signal 0). The grandchild's reap runs
+        // through init after the group kill, which is asynchronous, so the
+        // check polls briefly instead of racing it.
+        let read_pid = |path: &std::path::Path| -> i32 {
+            fs::read_to_string(path)
+                .expect("pid recorded")
+                .trim()
+                .parse()
+                .expect("pid parses")
+        };
+        let shell = read_pid(&pid_file);
+        let grandchild = read_pid(&grandchild_file);
+        let both_gone_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let fully_gone = |pid: i32| {
+                let outcome = unsafe { libc::kill(pid, 0) };
+                outcome == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            };
+            if fully_gone(shell) && fully_gone(grandchild) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < both_gone_deadline,
+                "leaked process: shell {shell} and/or grandchild {grandchild} still alive \
+                 3s after the probe gave up"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// The live registry hands a child back by TURN ID, never by pid. A
     /// stale `stopping` row can carry a pid the kernel recycled onto a newer
