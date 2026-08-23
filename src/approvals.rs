@@ -609,8 +609,12 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
     // which a terminal answer can land, and anything that lands before the
     // stat is inside the boundary where the watcher can never see it.
     let resolution_watch = ResolutionWatch::new(payload, now);
-    let windowless =
-        kind == GateKind::Interactive && crate::claude::current_session_lacks_terminal_window();
+    // A headless turn never runs the probe: it has no terminal AT ALL, which
+    // its own `headless` flag already says, and claiming a measurement it
+    // never took would put a fabricated fact in the ledger.
+    let session_window =
+        (kind == GateKind::Interactive).then(crate::claude::current_session_window);
+    let windowless = session_window == Some(crate::claude::SessionWindow::Background);
     if kind == GateKind::Interactive && !windowless && !away_mode_active() {
         return Ok(no_opinion());
     }
@@ -798,6 +802,7 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
         &tool_name,
         &summary,
         kind == GateKind::Headless,
+        session_window,
         owning_turn.as_deref(),
         payload.get("cwd").and_then(Value::as_str),
         now,
@@ -955,7 +960,8 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     // covered by the away shortcut (its terminal dialog is invisible), and
     // the transcript boundary must predate any chance of an answer.
     let resolution_watch = ResolutionWatch::new(&payload, now);
-    let windowless = crate::claude::current_session_lacks_terminal_window();
+    let session_window = crate::claude::current_session_window();
+    let windowless = session_window == crate::claude::SessionWindow::Background;
     if !windowless && !away_mode_active() {
         return Ok(no_opinion());
     }
@@ -1074,6 +1080,12 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         "eventKey": format!("question:{question_id}"),
         "lastPreview": body,
         "buttons": buttons,
+        // Measured here, first-hand, and carried to the phone: a background
+        // session's terminal cannot show this question, so the message must
+        // not let the reader assume a dialog is waiting for them at home.
+        // A failed probe says so rather than defaulting to "window" — the
+        // wait still follows the old policy, but the wording must not.
+        "terminalVisibility": terminal_visibility(session_window),
         "thread": {
             "threadId": thread_id,
             "cwd": cwd,
@@ -1535,7 +1547,11 @@ fn apply_decision(
 /// decision is handed back to be honoured, never re-asked.
 ///
 /// `headless` doubles as the event's blocking flag: whether silence will
-/// deny is part of the request, not a footnote.
+/// deny is part of the request, not a footnote. `session_window` is the same
+/// kind of fact for an INTERACTIVE gate: its terminal fallback may exist but
+/// be invisible, so the message must not promise one. `None` = a headless
+/// turn, which never probes; the field is then OMITTED rather than guessed,
+/// because `headless` already says there is no terminal behind this at all.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn publish_approval_request(
     conn: &rusqlite::Connection,
@@ -1545,6 +1561,7 @@ pub(crate) fn publish_approval_request(
     tool_name: &str,
     summary: &str,
     headless: bool,
+    session_window: Option<crate::claude::SessionWindow>,
     owning_turn: Option<&str>,
     cwd: Option<&str>,
     now: u64,
@@ -1593,7 +1610,7 @@ pub(crate) fn publish_approval_request(
     // Buttons register their callback routes as rows, which is exactly why
     // they must share this transaction.
     let buttons = approval_answer_buttons(&tx, chat_id, thread_id, approval_id, now)?;
-    let event = json!({
+    let mut event = json!({
         "type": "approval_request",
         "threadId": thread_id,
         "approvalId": approval_id,
@@ -1610,11 +1627,29 @@ pub(crate) fn publish_approval_request(
             "lastPreview": summary
         }
     });
+    if let Some(window) = session_window {
+        event["terminalVisibility"] = json!(terminal_visibility(window));
+    }
     // origin "bridge": an approval request is something the user asked for
     // by going away, and it must survive /back's away-backlog cleanup.
     enqueue_outbound_event(&tx, &event, now, "bridge")?;
     tx.commit()?;
     Ok(Publication::Published)
+}
+
+/// A gate's own reading of its session, in the vocabulary the renderer
+/// speaks. Straight through — including the shrug: the probe walks /proc and
+/// can fail, and "could not tell" must not be rounded to "has a window".
+fn terminal_visibility(window: crate::claude::SessionWindow) -> &'static str {
+    match window {
+        crate::claude::SessionWindow::Background => {
+            crate::telegram::render::TERMINAL_VISIBILITY_BACKGROUND
+        }
+        crate::claude::SessionWindow::Window => crate::telegram::render::TERMINAL_VISIBILITY_WINDOW,
+        crate::claude::SessionWindow::Unverified => {
+            crate::telegram::render::TERMINAL_VISIBILITY_UNVERIFIED
+        }
+    }
 }
 
 /// What publishing an approval request actually did.
@@ -1884,7 +1919,9 @@ mod tests {
 
     struct GateEnv {
         root: PathBuf,
-        previous_state_dir: Option<String>,
+        /// Held, not read: dropping these restores the environment.
+        #[allow(dead_code)]
+        env: Vec<crate::state::EnvVarGuard>,
     }
 
     impl GateEnv {
@@ -1902,20 +1939,30 @@ mod tests {
                 std::env::temp_dir().join(format!("tinyctb-gate-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(&root).expect("gate dir");
-            let previous_state_dir = std::env::var("TINYCTB_STATE_DIR").ok();
-            std::env::set_var("TINYCTB_STATE_DIR", &root);
-            // A leftover turn token from a previous test would make this one
-            // look like a bridge process; every test starts tokenless.
-            std::env::remove_var(crate::claude::BRIDGE_TURN_ENV);
-            // And no leftover fake idle: presence must be opt-in per test.
-            std::env::remove_var("TINYCTB_TEST_IDLE_MS");
-            // Same for the windowless override: every test starts as a
-            // session that HAS a terminal window.
-            std::env::remove_var("TINYCTB_TEST_SESSION_WINDOWLESS");
-            // And without a fake session tty: banner painting is opt-in per
-            // test, and a leftover path would spray banners into a dead
-            // temp file (or worse, a reused one another test asserts on).
-            std::env::remove_var("TINYCTB_TEST_SESSION_TTY");
+            // EVERY environment variable this fixture touches is held by a
+            // guard, so a panicking assertion cannot leak one into the next
+            // test — the manual save/restore this replaced only covered the
+            // state dir, and the seams it merely cleared were left cleared.
+            let env = vec![
+                crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root),
+                // A leftover turn token from a previous test would make this
+                // one look like a bridge process; every test starts tokenless.
+                crate::state::EnvVarGuard::clear(crate::claude::BRIDGE_TURN_ENV),
+                // No leftover fake idle: presence is opt-in per test.
+                crate::state::EnvVarGuard::clear("TINYCTB_TEST_IDLE_MS"),
+                // The window probe is PINNED, never left to the host: a test
+                // process inherits the developer's own CLAUDE_CODE_MESSAGING_
+                // SOCKET, so an unset seam reads whatever session happens to
+                // be running the suite — "window" on my machine, "unverified"
+                // in a clean CI shell. Every gate test starts as a session
+                // that HAS a terminal window, and says so explicitly.
+                crate::state::EnvVarGuard::set("TINYCTB_TEST_SESSION_WINDOWLESS", "0"),
+                // And without a fake session tty: banner painting is opt-in
+                // per test, and a leftover path would spray banners into a
+                // dead temp file (or worse, a reused one another test
+                // asserts on).
+                crate::state::EnvVarGuard::clear("TINYCTB_TEST_SESSION_TTY"),
+            ];
             crate::config::write_daemon_config(&DaemonConfig {
                 version: 1,
                 bridge_command: "tinyctb".to_string(),
@@ -1934,20 +1981,13 @@ mod tests {
             })
             .expect("config");
             write_away_marker_for_test(away).expect("away marker");
-            Self {
-                root,
-                previous_state_dir,
-            }
+            Self { root, env }
         }
     }
 
     impl Drop for GateEnv {
         fn drop(&mut self) {
-            if let Some(previous) = &self.previous_state_dir {
-                std::env::set_var("TINYCTB_STATE_DIR", previous);
-            } else {
-                std::env::remove_var("TINYCTB_STATE_DIR");
-            }
+            // `env` restores itself; only the directory needs sweeping.
             let _ = fs::remove_dir_all(&self.root);
         }
     }
@@ -3161,7 +3201,7 @@ mod tests {
                 row.get(0)
             })
             .expect("count");
-        std::env::remove_var("TINYCTB_TEST_SESSION_WINDOWLESS");
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "0");
         assert_eq!(question, json!({}));
         assert_eq!(
             asked, 1,
@@ -3230,7 +3270,7 @@ mod tests {
         let started = std::time::Instant::now();
         let result = question_gate(payload);
         writer.join().expect("writer");
-        std::env::remove_var("TINYCTB_TEST_SESSION_WINDOWLESS");
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "0");
         let _ = fs::remove_file(&transcript);
 
         assert_eq!(result, json!({}));
@@ -3282,7 +3322,7 @@ mod tests {
         let result = gate(bash_payload());
         answerer.join().expect("answerer");
         std::env::remove_var("TINYCTB_TEST_IDLE_MS");
-        std::env::remove_var("TINYCTB_TEST_SESSION_WINDOWLESS");
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "0");
 
         assert_eq!(
             result["hookSpecificOutput"]["decision"]["behavior"], "allow",
@@ -3333,7 +3373,7 @@ mod tests {
         let result = gate(bash_payload());
         script.join().expect("script");
         std::env::remove_var("TINYCTB_TEST_IDLE_MS");
-        std::env::remove_var("TINYCTB_TEST_SESSION_WINDOWLESS");
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "0");
 
         assert_eq!(
             result["hookSpecificOutput"]["decision"]["behavior"], "deny",
@@ -3725,6 +3765,46 @@ mod tests {
         run_question_gate(&mut reader, 1000).expect("question gate")
     }
 
+    /// The fixture's isolation is itself a contract: every variable it
+    /// touches must come back, panic or not. A leaked seam does not fail the
+    /// test that leaked it — it silently rewrites what a LATER test measures
+    /// (a window seam left unset once made two tests read the developer's own
+    /// session and pass only on this machine).
+    #[test]
+    fn the_gate_fixture_restores_every_variable_it_touches() {
+        let _guard = crate::state::test_env_lock();
+        let watched = [
+            "TINYCTB_STATE_DIR",
+            crate::claude::BRIDGE_TURN_ENV,
+            "TINYCTB_TEST_IDLE_MS",
+            "TINYCTB_TEST_SESSION_WINDOWLESS",
+            "TINYCTB_TEST_SESSION_TTY",
+        ];
+        let sentinels: Vec<_> = watched
+            .iter()
+            .map(|key| crate::state::EnvVarGuard::set(key, format!("sentinel-for-{key}")))
+            .collect();
+        {
+            let _env = GateEnv::new("fixture-raii", true, 5);
+            // Inside, the fixture's own values are in force.
+            assert_eq!(
+                std::env::var("TINYCTB_TEST_SESSION_WINDOWLESS").ok(),
+                Some("0".to_string()),
+                "the window probe must be pinned, never inherited"
+            );
+            assert!(std::env::var(crate::claude::BRIDGE_TURN_ENV).is_err());
+            assert!(std::env::var("TINYCTB_TEST_SESSION_TTY").is_err());
+        }
+        for key in watched {
+            assert_eq!(
+                std::env::var(key).ok(),
+                Some(format!("sentinel-for-{key}")),
+                "{key} must be restored when the fixture drops"
+            );
+        }
+        drop(sentinels);
+    }
+
     /// The user's law for the blocked window: the terminal must always show
     /// the question, never phone-only. While the hook blocks, Claude Code
     /// paints nothing, so the gate itself must paint — the question with its
@@ -3843,7 +3923,7 @@ mod tests {
         });
         let result = question_gate(question_payload());
         handle.join().expect("answering thread");
-        std::env::remove_var("TINYCTB_TEST_SESSION_WINDOWLESS");
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "0");
         // The answer still flows — with its receipt — but the tty stays
         // untouched.
         assert_eq!(
@@ -3855,6 +3935,278 @@ mod tests {
             fs::read_to_string(&tty).expect("fake tty"),
             "",
             "a windowless session must not paint"
+        );
+    }
+
+    /// Not painting is only half of it: the phone must be TOLD that no
+    /// terminal can show this question, or the reader assumes a dialog is
+    /// waiting for them at the desk. Production 2026-08-23 — an M3d launch
+    /// question from a background session read as "the terminal skipped it".
+    /// The windowed case must keep saying the opposite, so the flag is a
+    /// measurement rather than a decoration.
+    #[test]
+    fn a_question_push_carries_whether_any_terminal_can_show_it() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("question-windowless-flag", true, 30);
+        let answer_from_phone = || {
+            std::thread::spawn(|| {
+                let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+                for _ in 0..100 {
+                    std::thread::sleep(Duration::from_millis(100));
+                    let Ok(question_id) = conn.query_row(
+                        "SELECT question_id FROM pending_questions WHERE answer IS NULL",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    ) else {
+                        continue;
+                    };
+                    if matches!(
+                        crate::state::record_question_answer(&conn, &question_id, "SQLite", 2000),
+                        Ok(crate::state::ApprovalAnswer::Recorded)
+                    ) {
+                        return;
+                    }
+                }
+                panic!("question row never appeared");
+            })
+        };
+        let pushed_flag = || -> Value {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            let payload: String = conn
+                .query_row(
+                    "SELECT payload_json FROM outbound_events WHERE event_type = 'question_request'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("pushed question event");
+            serde_json::from_str::<Value>(&payload).expect("event json")["terminalVisibility"]
+                .clone()
+        };
+
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
+        let handle = answer_from_phone();
+        question_gate(question_payload());
+        handle.join().expect("answering thread");
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "0");
+        assert_eq!(
+            pushed_flag(),
+            json!("background"),
+            "a background session's push must say its terminal cannot show the question"
+        );
+
+        // Same gate, same phone, a session that DOES have a window: the
+        // single-row query above is the assertion that the first push is
+        // gone, so clear both tables before the second half.
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        conn.execute("DELETE FROM outbound_events", [])
+            .expect("clear pushes");
+        conn.execute("DELETE FROM pending_questions", [])
+            .expect("clear questions");
+        drop(conn);
+        let handle = answer_from_phone();
+        question_gate(question_payload());
+        handle.join().expect("answering thread");
+        assert_eq!(
+            pushed_flag(),
+            json!("window"),
+            "a windowed session's push must not claim to be terminal-less"
+        );
+    }
+
+    /// The approval push needs the same fact for a sharper reason: the
+    /// interactive hint promises "超时后回落到终端里的权限弹窗", and for a
+    /// background session that fallback is a dialog nobody can see (measured
+    /// 2026-08-17: 7h09m blocked behind exactly one of those).
+    #[test]
+    fn an_approval_push_carries_whether_any_terminal_can_show_it() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("approval-windowless-flag", true, 30);
+        let answer_from_phone = || {
+            std::thread::spawn(|| {
+                let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+                for _ in 0..100 {
+                    std::thread::sleep(Duration::from_millis(100));
+                    let Ok(approval_id) = conn.query_row(
+                        "SELECT approval_id FROM pending_approvals WHERE decision IS NULL",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    ) else {
+                        continue;
+                    };
+                    if matches!(
+                        record_approval_decision(&conn, &approval_id, "allow", 2000),
+                        Ok(crate::state::ApprovalAnswer::Recorded)
+                    ) {
+                        return;
+                    }
+                }
+                panic!("approval row never appeared");
+            })
+        };
+        let gate = || {
+            let mut reader = std::io::Cursor::new(bash_payload().to_string());
+            run_approval_gate(&mut reader, 1000).expect("gate")
+        };
+        let pushed_flag = || -> Value {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            let payload: String = conn
+                .query_row(
+                    "SELECT payload_json FROM outbound_events WHERE event_type = 'approval_request'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("pushed approval event");
+            serde_json::from_str::<Value>(&payload).expect("event json")["terminalVisibility"]
+                .clone()
+        };
+
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
+        let handle = answer_from_phone();
+        gate();
+        handle.join().expect("answering thread");
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "0");
+        assert_eq!(
+            pushed_flag(),
+            json!("background"),
+            "a background session's approval must not promise a terminal fallback"
+        );
+
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        conn.execute("DELETE FROM outbound_events", [])
+            .expect("clear pushes");
+        conn.execute("DELETE FROM pending_approvals", [])
+            .expect("clear approvals");
+        drop(conn);
+        let handle = answer_from_phone();
+        gate();
+        handle.join().expect("answering thread");
+        assert_eq!(
+            pushed_flag(),
+            json!("window"),
+            "a windowed session's approval keeps its terminal-fallback hint"
+        );
+    }
+
+    /// The probe can fail — no socket variable, unreadable /proc, a platform
+    /// without one. The WAIT still follows the old policy (treat it like a
+    /// session with a window: paint the banner, keep the configured window),
+    /// but the message must publish the shrug rather than a fact nobody
+    /// measured.
+    #[test]
+    fn an_unprobeable_session_publishes_the_shrug_but_keeps_the_old_policy() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("question-unverified", true, 30);
+        let tty = _env.root.join("fake-tty.txt");
+        fs::write(&tty, "").expect("fake tty");
+        std::env::set_var("TINYCTB_TEST_SESSION_TTY", &tty);
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "unverified");
+        let handle = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                let Ok(question_id) = conn.query_row(
+                    "SELECT question_id FROM pending_questions WHERE answer IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) else {
+                    continue;
+                };
+                if matches!(
+                    crate::state::record_question_answer(&conn, &question_id, "SQLite", 2000),
+                    Ok(crate::state::ApprovalAnswer::Recorded)
+                ) {
+                    return;
+                }
+            }
+            panic!("question row never appeared");
+        });
+        question_gate(question_payload());
+        handle.join().expect("answering thread");
+        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "0");
+
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let payload: String = conn
+            .query_row(
+                "SELECT payload_json FROM outbound_events WHERE event_type = 'question_request'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pushed question event");
+        let (expires_at, created_at): (i64, i64) = conn
+            .query_row(
+                "SELECT expires_at, created_at FROM pending_questions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("question row");
+        drop(conn);
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).expect("event json")["terminalVisibility"],
+            json!("unverified"),
+            "a failed probe must not be published as a measured window"
+        );
+        // Policy unchanged: the configured 30s window (not the day a
+        // confirmed background session gets) and the banner still painted.
+        assert_eq!(
+            expires_at - created_at,
+            30_000,
+            "an unverified session keeps the configured window"
+        );
+        assert!(
+            fs::read_to_string(&tty)
+                .expect("fake tty")
+                .contains("有提问待作答"),
+            "and still gets its banner"
+        );
+    }
+
+    /// A headless turn never runs the probe: it has no terminal at all, and
+    /// its own `headless` flag says so. The event must therefore CARRY NO
+    /// window claim — an omitted field, not a fabricated "window".
+    #[test]
+    fn a_headless_approval_publishes_no_window_claim() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("headless-no-window-claim", false, 30);
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        enter_bridge_turn(&conn, "sess-headless");
+        drop(conn);
+        let handle = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                let Ok(approval_id) = conn.query_row(
+                    "SELECT approval_id FROM pending_approvals WHERE decision IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) else {
+                    continue;
+                };
+                if matches!(
+                    record_approval_decision(&conn, &approval_id, "allow", 2000),
+                    Ok(crate::state::ApprovalAnswer::Recorded)
+                ) {
+                    return;
+                }
+            }
+            panic!("approval row never appeared");
+        });
+        headless_gate(headless_payload());
+        handle.join().expect("answering thread");
+
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let payload: String = conn
+            .query_row(
+                "SELECT payload_json FROM outbound_events WHERE event_type = 'approval_request'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pushed approval event");
+        drop(conn);
+        let event = serde_json::from_str::<Value>(&payload).expect("event json");
+        assert_eq!(event["headless"], json!(true), "{event}");
+        assert!(
+            event.get("terminalVisibility").is_none(),
+            "a gate that never probed must claim nothing: {event}"
         );
     }
 

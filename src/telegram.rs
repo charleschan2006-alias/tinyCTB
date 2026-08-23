@@ -207,13 +207,39 @@ fn send_telegram_command_text(
     telegram_send_text(telegram, text, timeout)
 }
 
+/// The test transport RECORDS what it was asked to send.
+///
+/// It used to only echo the text back, so a command could stop sending a
+/// message entirely and every assertion about the returned numbers stayed
+/// green (Sol proved exactly that by deleting the shortfall send). Tests can
+/// now read the message history — in order — and see what a user would have
+/// received.
 #[cfg(test)]
+pub(crate) mod test_transport {
+    thread_local! {
+        // Thread-local, not a global: the suite runs tests in parallel, and
+        // a shared log would let one test's messages appear in another's
+        // history. Every send happens on the thread that drove it.
+        static SENT: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record(text: &str) {
+        SENT.with(|sent| sent.borrow_mut().push(text.to_string()));
+    }
+
+    /// Everything sent on this thread since the last call, oldest first.
+    pub(crate) fn take() -> Vec<String> {
+        SENT.with(|sent| std::mem::take(&mut *sent.borrow_mut()))
+    }
+}
+
 #[cfg(test)]
 fn send_telegram_command_text(
     _telegram: &TelegramConfig,
     text: &str,
     _timeout: Duration,
 ) -> Result<Value> {
+    test_transport::record(text);
     Ok(json!({
         "ok": true,
         "result": {
@@ -1157,6 +1183,23 @@ fn reoffer_prompt_event(
         "project": crate::projects::derive_project_label(snapshot.cwd.as_deref()),
         "cwd": snapshot.cwd,
     });
+    // Re-measured here rather than replayed from the gate: a session can be
+    // backgrounded (or attached) after it asked, and the hint this drives —
+    // whether a terminal dialog is a real fallback — must describe the
+    // session as it is NOW. Three states, not two: a read failure or a dead
+    // socket confirms nothing, and claiming a window there would contradict
+    // the ❓/💤 status line printed right above it.
+    let visibility = if liveness.unknown {
+        render::TERMINAL_VISIBILITY_UNVERIFIED
+    } else {
+        match liveness.presence {
+            crate::claude::TerminalPresence::Background => render::TERMINAL_VISIBILITY_BACKGROUND,
+            crate::claude::TerminalPresence::Window => render::TERMINAL_VISIBILITY_WINDOW,
+            crate::claude::TerminalPresence::Unverified | crate::claude::TerminalPresence::Gone => {
+                render::TERMINAL_VISIBILITY_UNVERIFIED
+            }
+        }
+    };
     match prompt {
         crate::state::OpenPrompt::Approval {
             approval_id,
@@ -1182,7 +1225,8 @@ fn reoffer_prompt_event(
                 // current look: what a timeout does was fixed when the hook
                 // started waiting, and the hint must not lie about it.
                 "headless": headless,
-                "statusLine": liveness.status_line(),
+                "terminalVisibility": visibility,
+                "statusLine": liveness.prompt_status_line(),
                 "thread": thread
             }))
         }
@@ -1213,7 +1257,8 @@ fn reoffer_prompt_event(
                 "eventKey": format!("question-reoffer:{question_id}:{now}"),
                 "lastPreview": body,
                 "buttons": buttons,
-                "statusLine": liveness.status_line(),
+                "terminalVisibility": visibility,
+                "statusLine": liveness.prompt_status_line(),
                 "thread": thread
             }))
         }
@@ -1895,6 +1940,72 @@ fn enqueue_stop_summary(
     Ok(())
 }
 
+/// The one-line census that heads a `/threads` listing, so the grouping
+/// reads as intentional. The window/background split is its whole point: the
+/// window count must match what the user can actually see on screen.
+///
+/// Counted by primary CLASS — the same named classification the ordering
+/// uses, never a raw rank number. The two shared a bare `u8` for one
+/// release, and inserting a state into the middle of that scale silently
+/// relabelled every bucket below it: `Unverified` sessions were counted as
+/// headless, headless as idle, idle as unknown, and plain unknown fell out
+/// of the line entirely while the buckets stopped summing to the total.
+fn threads_census(snapshots: &[ClassifiedThread]) -> String {
+    let count = |wanted: render::LivenessClass| {
+        snapshots
+            .iter()
+            .filter(|(_, liveness, _)| liveness.class() == wanted)
+            .count()
+    };
+    let buckets = render::LivenessClass::ALL
+        .iter()
+        // The four familiar ones always appear, even at zero, so the line
+        // keeps its shape between calls; the rarer states show up only when
+        // someone is actually in them.
+        .filter(|class| render::LivenessClass::ALWAYS_SHOWN.contains(class) || count(**class) > 0)
+        .map(|class| format!("{} {}", class.census_label(), count(*class)))
+        .collect::<Vec<_>>();
+    let mut census = format!("🧵 {} 个会话：{}", snapshots.len(), buckets.join(" · "));
+    let terminal_waiting = snapshots
+        .iter()
+        .filter(|(snapshot, liveness, prompt)| {
+            waiting_rank(snapshot, *liveness, prompt.as_ref()) == 1
+        })
+        .count();
+    if terminal_waiting > 0 {
+        census = format!("🔐 {terminal_waiting} 个会话在终端等你作答\n{census}");
+    }
+    let waiting = snapshots
+        .iter()
+        .filter(|(_, _, prompt)| prompt.is_some())
+        .count();
+    if waiting > 0 {
+        census = format!("⏳ {waiting} 个会话在等你作答！\n{census}");
+    }
+    census
+}
+
+/// What to tell the user when the listing stopped short of its own census.
+///
+/// The census counts what EXISTS and is sent first; the rows follow one by
+/// one under a time budget that syncing, classification and the census have
+/// already been spending. When that budget runs out mid-listing, "共 N 个
+/// 会话" is left standing over a partial — or empty — listing, so say so.
+///
+/// It deliberately does NOT promise the rest: the command has no cursor and
+/// re-runs from the top after re-classifying, so a retry under a stable
+/// budget would re-send the same first rows and never reach the tail.
+/// "Try again later" is what this code can actually keep — paging is a
+/// separate feature, tracked as such.
+fn threads_shortfall_notice(total: usize, listed: usize) -> Option<String> {
+    if listed >= total {
+        return None;
+    }
+    Some(format!(
+        "⚠️ 本轮只列出 {listed}/{total} 个会话（时间预算用完了）。稍后可以再试 /threads。"
+    ))
+}
+
 fn execute_threads_command(
     conn: &Connection,
     telegram: &TelegramConfig,
@@ -1940,46 +2051,8 @@ fn execute_threads_command(
         }));
     }
 
-    // A one-line census up front, so the grouping reads as intentional. The
-    // window/background split is the census's whole point: the window count
-    // must match what the user can actually see on screen. Counted by
-    // primary class (the same key the ordering uses), so the numbers add up
-    // to the total even for a live session that also runs a headless turn.
-    let count = |wanted: u8| {
-        snapshots
-            .iter()
-            .filter(|(_, liveness, _)| liveness.order() == wanted)
-            .count()
-    };
-    let waiting = snapshots
-        .iter()
-        .filter(|(_, _, prompt)| prompt.is_some())
-        .count();
-    let terminal_waiting = snapshots
-        .iter()
-        .filter(|(snapshot, liveness, prompt)| {
-            waiting_rank(snapshot, *liveness, prompt.as_ref()) == 1
-        })
-        .count();
-    let mut census = format!(
-        "🧵 {} 个会话：🖥 终端 {} · 🫥 后台 {} · ⚙️ 无头 {} · 💤 空闲 {}",
-        snapshots.len(),
-        count(0),
-        count(1),
-        count(2),
-        count(3)
-    );
-    let unknown = count(4);
-    if unknown > 0 {
-        census.push_str(&format!(" · ❓ 未知 {unknown}"));
-    }
-    if terminal_waiting > 0 {
-        census = format!("🔐 {terminal_waiting} 个会话在终端等你作答\n{census}");
-    }
-    if waiting > 0 {
-        census = format!("⏳ {waiting} 个会话在等你作答！\n{census}");
-    }
-    telegram_send_text(telegram, &census, timeout)?;
+    let census = threads_census(&snapshots);
+    let census_sent = send_telegram_command_text(telegram, &census, timeout)?;
 
     let mut sent = Vec::with_capacity(snapshots.len());
     let mut render_failed = 0usize;
@@ -2036,14 +2109,57 @@ fn execute_threads_command(
         )?);
     }
 
+    // The census counted what EXISTS; `sent` is what the user actually got.
+    // A budget that runs out mid-listing (sync, classification and the census
+    // itself all spend it) used to leave "共 N 个会话" standing over a
+    // partial — or empty — listing, while the result still claimed all N and
+    // the update was acked as fully handled.
+    let listed = sent.len();
+    let missing = snapshots.len().saturating_sub(listed);
+    // EVERY message this command sent is reported, not just the per-session
+    // rows: the census and the shortfall notice are messages the user
+    // received and message ids an audit may need, and dropping their results
+    // also meant a test could delete the shortfall send without a single
+    // assertion noticing.
+    let shortfall_sent = match threads_shortfall_notice(snapshots.len(), listed) {
+        Some(notice) => Some(send_telegram_command_text(telegram, &notice, timeout)?),
+        None => None,
+    };
     Ok(json!({
-        "ok": render_failed == 0,
+        "ok": render_failed == 0 && missing == 0,
         "action": "telegram_threads",
         "limit": limit,
-        "count": snapshots.len(),
+        // What the user received, not what the census counted.
+        "count": listed,
+        "total": snapshots.len(),
+        "missing": missing,
         "renderFailed": render_failed,
-        "sent": sent
+        "censusSent": census_sent,
+        "shortfallSent": shortfall_sent,
+        // `sent` is what this command has always returned for the per-session
+        // rows; `sentRows` is the same list under the name the other two
+        // receipts made necessary. Both are emitted so a CLI reader, an
+        // archived `telegram_inbound_log.result_json` or an external script
+        // keeps working.
+        "sent": sent.clone(),
+        "sentRows": sent
     }))
+}
+
+/// The coarse `update_kind` for a dialog reply, taken from the dialog KIND
+/// the handler already looked up — not guessed from the action string.
+///
+/// Both columns land in the inbound log; hard-coding one of them was how
+/// four kinds of APPROVAL reply came to be recorded as questions, and
+/// pattern-matching the action instead would fail OPEN: any unknown or
+/// future action would quietly file itself as a question. An unrecognised
+/// kind gets its own generic value and stays visible as such.
+fn telegram_dialog_reply_update_kind(result: &Value) -> &'static str {
+    match result.get("dialogKind").and_then(Value::as_str) {
+        Some("approval") => "telegram_approval_reply",
+        Some("question") => "telegram_question_reply",
+        _ => "telegram_dialog_reply",
+    }
 }
 
 fn execute_telegram_command(
@@ -2387,7 +2503,9 @@ fn record_callback_answer(
         let toast = match outcome {
             ApprovalAnswer::Recorded => format!("已作答：{answer}"),
             ApprovalAnswer::AlreadyAnswered => "这个问题已经回答过了。".to_string(),
-            ApprovalAnswer::Expired => "这个问题已超时，会话已回到终端等待作答。".to_string(),
+            ApprovalAnswer::Expired => {
+                "这个问题的手机答复窗口已关闭。用 /threads 看这个会话现在停在哪里。".to_string()
+            }
             ApprovalAnswer::Unknown => "这个按钮已经失效了。".to_string(),
         };
         return Ok(json!({
@@ -2427,8 +2545,9 @@ fn record_callback_answer(
         .map(|(_, tool_name, _)| tool_name)
         .unwrap_or_else(|| "该工具".to_string());
     // The toast must not claim success for an answer that can no longer take
-    // effect: once the waiting hook has given up, the session has already
-    // fallen back to its own permission prompt.
+    // effect. It must not describe where the session went either: a
+    // background session has no visible prompt to "fall back" to, and this
+    // very message may have told the reader so minutes earlier.
     let toast = match outcome {
         ApprovalAnswer::Recorded => match route.action {
             TelegramCallbackAction::Approve => "已允许。".to_string(),
@@ -2440,7 +2559,9 @@ fn record_callback_answer(
             }
         },
         ApprovalAnswer::AlreadyAnswered => "这条请求已经处理过了。".to_string(),
-        ApprovalAnswer::Expired => "这条请求已超时，会话已回到终端等待处理。".to_string(),
+        ApprovalAnswer::Expired => {
+            "这条请求的手机答复窗口已关闭。用 /threads 看这个会话现在停在哪里。".to_string()
+        }
         ApprovalAnswer::Unknown => "这个按钮已经失效了。".to_string(),
     };
     Ok(json!({
@@ -2496,22 +2617,68 @@ fn answer_pending_question_from_reply(
         return Ok(None);
     };
 
+    // The kind comes out of the database as free text — no CHECK constraint,
+    // and the writer accepts any string — so an unknown value must not fall
+    // through to the question path, where it would try to record an answer,
+    // read as a question to the user, and file itself as one in the audit.
+    // It still CONSUMES the reply: a dialog message's reply is never
+    // ordinary chat, whatever the row says.
+    if kind != "approval" && kind != "question" {
+        let notice =
+            "这条消息挂在一个我认不出来的对话上，没有作答。用 /threads 看这个会话现在停在哪里。";
+        let sent = send_telegram_command_text(telegram, notice, timeout)?;
+        eprintln!("tinyctb: dialog message {reply_to} has unknown kind {kind:?}");
+        return Ok(Some(json!({
+            "ok": false,
+            "action": "telegram_dialog_unknown_kind",
+            "dialogKind": kind,
+            "refId": ref_id,
+            "sent": sent
+        })));
+    }
+
     if kind == "approval" {
         // Granting permission must stay a deliberate, unambiguous act: a
         // button. Free text can mean anything ("ok", "算了", "不要删"), and
         // mis-reading it as consent is exactly the mistake this feature must
         // never make.
-        let notice = match crate::state::approval_decision(conn, &ref_id)? {
-            None => "这条是审批请求，文字回复不算授权。请点消息下面的按钮作答（允许 / 本会话都允许 / 拒绝）。",
-            Some(decision) if decision == "expired" => {
-                "这条审批已超时，会话已回到终端等待处理。文字回复不算授权。"
-            }
-            Some(_) => "这条审批已经处理过了。文字回复不算授权。",
+        //
+        // Classified by decision AND deadline, exactly as a tap is: between
+        // the deadline passing and the gate stamping "expired" this used to
+        // tell the user to press buttons that would have answered "已超时".
+        // The audit action follows the ANSWER, not the message kind: only
+        // the open case is "go press the buttons", and an action name that
+        // says otherwise lands in the inbound log contradicting the text the
+        // user was actually sent.
+        let standing = crate::state::approval_standing(conn, &ref_id, now)?;
+        let (notice, action) = match standing {
+            Some(crate::state::ApprovalStanding::Open) => (
+                "这条是审批请求，文字回复不算授权。请点消息下面的按钮作答（允许 / 本会话都允许 / 拒绝）。",
+                "telegram_approval_needs_button",
+            ),
+            // No row at all: a stale dialog mapping, or a database that lost
+            // the request. Pointing at buttons that cannot record anything
+            // is worse than saying the request is gone.
+            None => (
+                "找不到这条审批了（可能已经结算并清理）。文字回复不算授权。",
+                "telegram_approval_missing",
+            ),
+            Some(crate::state::ApprovalStanding::Expired) => (
+                "这条审批的手机答复窗口已关闭，文字回复不算授权。用 /threads 看这个会话现在停在哪里。",
+                "telegram_approval_window_closed",
+            ),
+            Some(crate::state::ApprovalStanding::Decided) => (
+                "这条审批已经处理过了。文字回复不算授权。",
+                "telegram_approval_already_settled",
+            ),
         };
         let sent = send_telegram_command_text(telegram, notice, timeout)?;
         return Ok(Some(json!({
             "ok": true,
-            "action": "telegram_approval_needs_button",
+            "action": action,
+            // The dialog kind the lookup ALREADY established, carried so the
+            // audit's coarse column never has to guess from the action.
+            "dialogKind": "approval",
             "approvalId": ref_id,
             "sent": sent
         })));
@@ -2522,13 +2689,16 @@ fn answer_pending_question_from_reply(
     let notice = match outcome {
         ApprovalAnswer::Recorded => format!("已作答：{text}"),
         ApprovalAnswer::AlreadyAnswered => "这个问题已经回答过了。".to_string(),
-        ApprovalAnswer::Expired => "这个问题已超时，会话已回到终端等待作答。".to_string(),
+        ApprovalAnswer::Expired => {
+            "这个问题的手机答复窗口已关闭。用 /threads 看这个会话现在停在哪里。".to_string()
+        }
         ApprovalAnswer::Unknown => "这个问题已经失效了。".to_string(),
     };
     let sent = send_telegram_command_text(telegram, &notice, timeout)?;
     Ok(Some(json!({
         "ok": true,
         "action": "telegram_question_reply",
+        "dialogKind": "question",
         "questionId": question_id,
         "answer": text,
         "outcome": format!("{outcome:?}"),
@@ -2739,11 +2909,16 @@ fn process_telegram_update_batch(
                     answer_pending_question_from_reply(conn, message, telegram, now, timeout)?
                 {
                     if let Some(update_id) = update_id {
+                        // The coarse kind must not contradict the fine one:
+                        // an approval reply logged as `telegram_question_reply`
+                        // reads, in the audit table's own column, as a
+                        // question that was answered.
+                        let update_kind = telegram_dialog_reply_update_kind(&result);
                         record_telegram_inbound_processed(
                             conn,
                             bot_id,
                             update_id,
-                            "telegram_question_reply",
+                            update_kind,
                             &result,
                             TelegramInboundLogContext {
                                 route_message_id,
@@ -4218,9 +4393,16 @@ mod tests {
         )
         .expect("late tap");
         assert_eq!(late["outcome"], "Expired");
+        let late_toast = late["toast"].as_str().expect("toast");
         assert!(
-            late["toast"].as_str().expect("toast").contains("超时"),
+            late_toast.contains("窗口已关闭"),
             "a timed-out request must say so: {late}"
+        );
+        // And must not say where the session went: a background session has
+        // no visible prompt waiting for anyone.
+        assert!(
+            !late_toast.contains("终端"),
+            "the toast must not assume a terminal: {late}"
         );
         assert_eq!(late["recorded"], false);
 
@@ -4386,7 +4568,9 @@ mod tests {
         crate::state::record_question_answer(&conn, "q-done", "SQLite", 2000).expect("answer");
 
         for (message_id, expected, needle) in [
-            (10, "telegram_approval_needs_button", "超时"),
+            // The action names the ANSWER: this approval timed out, so it is
+            // not a "press the buttons" case any more.
+            (10, "telegram_approval_window_closed", "窗口已关闭"),
             (20, "telegram_question_reply", ""),
         ] {
             let reply = json!({
@@ -4425,6 +4609,773 @@ mod tests {
             crate::claude::test_spawn::take().is_empty(),
             "no reply to a dialog may be injected into the session"
         );
+    }
+
+    /// What a LATE answer is told. The four paths (question button, approval
+    /// button, question reply, approval reply) all used to say the session
+    /// had "gone back to the terminal" — which for a background session is
+    /// the very dialog this version tells the user nobody can see. The
+    /// feedback must state what is true for every session shape: the phone's
+    /// window closed, look at the session to find out where it stands.
+    #[test]
+    fn a_late_answer_is_never_sent_to_a_terminal() {
+        let _guard = crate::state::test_env_lock();
+        let _env = CommandEnv::new("late-answer-wording");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("config");
+        let telegram = config.telegram.clone().expect("telegram");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_spawn::take();
+
+        crate::state::create_pending_approval(
+            &conn, "ap-late", "sess-bg", "Bash", "Bash: ls", false, 1000, 5000,
+        )
+        .expect("approval");
+        crate::state::record_dialog_message(&conn, "456", 10, "approval", "ap-late", 1000)
+            .expect("dialog");
+        crate::state::insert_telegram_message_route(&conn, "456", 10, "sess-bg", "e", 1000)
+            .expect("route");
+        crate::state::expire_or_take_decision(&conn, "ap-late", 6000).expect("expire");
+        crate::state::create_pending_question(
+            &conn,
+            "q-late",
+            "sess-bg",
+            "哪个?",
+            &[],
+            false,
+            1000,
+            5000,
+        )
+        .expect("question");
+        crate::state::record_dialog_message(&conn, "456", 20, "question", "q-late", 1000)
+            .expect("dialog");
+        crate::state::insert_telegram_message_route(&conn, "456", 20, "sess-bg", "e", 1000)
+            .expect("route");
+        crate::state::expire_or_take_answer(&conn, "q-late", 6000).expect("expire");
+
+        let mut said = Vec::new();
+        // Both buttons, tapped after the window closed.
+        for (action, approval_id, question_id, answer) in [
+            (TelegramCallbackAction::Approve, Some("ap-late"), None, None),
+            (
+                TelegramCallbackAction::AnswerQuestion,
+                None,
+                Some("q-late"),
+                Some("甲"),
+            ),
+        ] {
+            let route = RoutedTelegramCallback {
+                callback_query_id: "cq".to_string(),
+                callback_id: "cb".to_string(),
+                thread_id: "sess-bg".to_string(),
+                action,
+                approval_id: approval_id.map(str::to_string),
+                question_id: question_id.map(str::to_string),
+                answer: answer.map(str::to_string),
+            };
+            let result = record_callback_answer(&conn, &route, 9000).expect("late tap");
+            assert_eq!(result["outcome"], "Expired", "{result}");
+            said.push(result["toast"].as_str().expect("toast").to_string());
+        }
+        // Both text replies, sent after the window closed.
+        for message_id in [10, 20] {
+            let reply = json!({
+                "message_id": message_id + 1,
+                "chat": { "id": "456" },
+                "from": { "id": "789" },
+                "reply_to_message": { "message_id": message_id },
+                "text": "甲"
+            });
+            let result = answer_pending_question_from_reply(
+                &conn,
+                &reply,
+                &telegram,
+                9000,
+                Duration::from_secs(1),
+            )
+            .expect("handled")
+            .expect("a settled dialog must still be recognised");
+            said.push(
+                result["sent"]["result"]["text"]
+                    .as_str()
+                    .expect("notice")
+                    .to_string(),
+            );
+        }
+
+        assert_eq!(said.len(), 4, "all four late paths must answer: {said:?}");
+        for text in &said {
+            assert!(
+                text.contains("窗口已关闭"),
+                "a late answer must say the phone window closed: {text}"
+            );
+            assert!(
+                !text.contains("终端"),
+                "and must not send a windowless session's user to a terminal: {text}"
+            );
+        }
+        assert!(
+            crate::claude::test_spawn::take().is_empty(),
+            "no late answer may be injected into the session"
+        );
+    }
+
+    /// The gap between a deadline passing and the gate stamping "expired":
+    /// a tap in that gap is correctly told the window is closed, while a
+    /// text reply used to be told to press buttons that could no longer
+    /// record anything. Both paths must read the same clock.
+    #[test]
+    fn a_text_reply_and_a_tap_agree_once_the_deadline_has_passed() {
+        let _guard = crate::state::test_env_lock();
+        let _env = CommandEnv::new("deadline-race");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("config");
+        let telegram = config.telegram.clone().expect("telegram");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_spawn::take();
+
+        // Past its deadline and NOT settled: exactly the state a gate leaves
+        // behind between giving up and writing the stamp.
+        crate::state::create_pending_approval(
+            &conn, "ap-gap", "sess-gap", "Bash", "Bash: ls", false, 1000, 5000,
+        )
+        .expect("approval");
+        crate::state::record_dialog_message(&conn, "456", 30, "approval", "ap-gap", 1000)
+            .expect("dialog");
+        crate::state::insert_telegram_message_route(&conn, "456", 30, "sess-gap", "e", 1000)
+            .expect("route");
+        assert_eq!(
+            crate::state::approval_decision(&conn, "ap-gap").expect("decision"),
+            None,
+            "the fixture must be UNSETTLED, or the gap is not under test"
+        );
+
+        let reply = json!({
+            "message_id": 31,
+            "chat": { "id": "456" },
+            "from": { "id": "789" },
+            "reply_to_message": { "message_id": 30 },
+            "text": "允许吧"
+        });
+        let result = answer_pending_question_from_reply(
+            &conn,
+            &reply,
+            &telegram,
+            9000,
+            Duration::from_secs(1),
+        )
+        .expect("handled")
+        .expect("a dialog reply must be consumed");
+        let notice = result["sent"]["result"]["text"]
+            .as_str()
+            .expect("notice")
+            .to_string();
+        assert!(
+            notice.contains("窗口已关闭"),
+            "a reply past the deadline must not be told to press buttons: {notice}"
+        );
+        // The audit trail must agree with the text the user was sent.
+        assert_eq!(
+            result["action"], "telegram_approval_window_closed",
+            "the inbound log must not record this as a press-the-buttons case: {result}"
+        );
+
+        // The tap says the same thing, in the same state.
+        let route = RoutedTelegramCallback {
+            callback_query_id: "cq".to_string(),
+            callback_id: "cb".to_string(),
+            thread_id: "sess-gap".to_string(),
+            action: TelegramCallbackAction::Approve,
+            approval_id: Some("ap-gap".to_string()),
+            question_id: None,
+            answer: None,
+        };
+        let tapped = record_callback_answer(&conn, &route, 9000).expect("tap");
+        assert_eq!(tapped["outcome"], "Expired", "{tapped}");
+        assert!(
+            crate::claude::test_spawn::take().is_empty(),
+            "nothing may be injected into the session"
+        );
+
+        // A dialog mapping whose approval row is GONE (settled and pruned,
+        // or a database that lost it): pointing at buttons that cannot
+        // record anything is worse than saying the request is gone.
+        crate::state::record_dialog_message(&conn, "456", 40, "approval", "ap-vanished", 1000)
+            .expect("dialog");
+        crate::state::insert_telegram_message_route(&conn, "456", 40, "sess-gap", "e", 1000)
+            .expect("route");
+        let orphan = json!({
+            "message_id": 41,
+            "chat": { "id": "456" },
+            "from": { "id": "789" },
+            "reply_to_message": { "message_id": 40 },
+            "text": "允许吧"
+        });
+        let result = answer_pending_question_from_reply(
+            &conn,
+            &orphan,
+            &telegram,
+            9000,
+            Duration::from_secs(1),
+        )
+        .expect("handled")
+        .expect("an orphaned dialog reply must still be consumed");
+        let notice = result["sent"]["result"]["text"]
+            .as_str()
+            .expect("notice")
+            .to_string();
+        assert!(
+            notice.contains("找不到这条审批"),
+            "an unknown approval must not be presented as answerable: {notice}"
+        );
+        assert!(
+            !notice.contains("请点消息下面的按钮"),
+            "those buttons cannot record anything: {notice}"
+        );
+        assert_eq!(
+            result["action"], "telegram_approval_missing",
+            "and the log must say the request is gone, not that buttons remain: {result}"
+        );
+    }
+
+    /// A listing that ran out of budget must not be reported as complete.
+    /// The census goes out first and counts what EXISTS; if the rows then
+    /// stop early (sync, classification and the census all spend the same
+    /// budget), "共 N 个会话" is left standing over a partial listing while
+    /// the result claims all N and the update is acked as fully handled.
+    #[test]
+    fn a_threads_listing_that_runs_out_of_budget_says_so() {
+        let _guard = crate::state::test_env_lock();
+        let _env = CommandEnv::new("threads-budget");
+        let projects = std::env::temp_dir().join(format!(
+            "tinyctb-threads-budget-projects-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&projects);
+        fs::create_dir_all(&projects).expect("projects dir");
+        // An empty projects dir keeps the sync from reading the developer's
+        // real transcripts — the cache rows below are the whole input.
+        let _projects_seam =
+            crate::state::EnvVarGuard::set("TINYCTB_CLAUDE_PROJECTS_DIR", &projects);
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("config");
+        let telegram = config.telegram.clone().expect("telegram");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        for index in 0..3 {
+            conn.execute(
+                "INSERT INTO threads_cache(thread_id, updated_at, last_seen_at, status_type, status_flags_json)
+                 VALUES (?1, ?2, ?2, 'active', '[]')",
+                rusqlite::params![format!("sess-budget-{index}"), 1000 + index],
+            )
+            .expect("cache row");
+        }
+
+        // A deadline that is already in the past: the row loop breaks on its
+        // first check, so nothing is listed at all.
+        let spent = Instant::now() - Duration::from_secs(1);
+        let result = execute_threads_command(
+            &conn,
+            &telegram,
+            None,
+            2000,
+            Duration::from_secs(1),
+            Some(spent),
+        )
+        .expect("threads");
+        assert_eq!(result["count"], 0, "nothing was listed: {result}");
+        assert_eq!(result["total"], 3, "{result}");
+        assert_eq!(result["missing"], 3, "{result}");
+        assert_eq!(
+            result["ok"], false,
+            "a truncated listing must not report success: {result}"
+        );
+        // What the USER received, in order — the numbers above could all be
+        // right while the shortfall message was never sent (deleting that
+        // send left every count assertion green).
+        let messages = test_transport::take();
+        assert_eq!(
+            messages.len(),
+            2,
+            "a census and a shortfall notice, nothing else: {messages:?}"
+        );
+        assert!(messages[0].contains("🧵 3 个会话"), "{messages:?}");
+        assert!(
+            messages[1].contains("0/3") && messages[1].contains("/threads"),
+            "the notice must name the shortfall and the retry: {messages:?}"
+        );
+        assert!(
+            !messages[1].contains("其余"),
+            "the command has no cursor, so it must not promise the rest: {messages:?}"
+        );
+        // And the result reports those messages rather than dropping them.
+        assert_eq!(result["censusSent"]["ok"], true, "{result}");
+        assert_eq!(result["shortfallSent"]["ok"], true, "{result}");
+        assert_eq!(
+            result["sentRows"].as_array().expect("rows").len(),
+            0,
+            "{result}"
+        );
+        // `sent` is the name this command has always returned for the row
+        // list; it stays as an alias so an archived result_json or an
+        // external reader keeps working.
+        assert_eq!(result["sent"], result["sentRows"], "{result}");
+        let _ = fs::remove_dir_all(&projects);
+    }
+
+    /// The wording that goes with it, in isolation: only a short listing
+    /// gets a notice, and the notice names both halves of the fraction.
+    #[test]
+    fn the_shortfall_notice_appears_only_when_rows_are_missing() {
+        assert_eq!(threads_shortfall_notice(3, 3), None);
+        assert_eq!(threads_shortfall_notice(0, 0), None);
+        let notice = threads_shortfall_notice(7, 2).expect("a short listing must say so");
+        assert!(notice.contains("2/7"), "{notice}");
+        assert!(
+            notice.contains("/threads"),
+            "the retry must be named: {notice}"
+        );
+        // No cursor exists, so no continuation may be promised: a retry
+        // re-classifies and starts from the top.
+        assert!(!notice.contains("其余"), "{notice}");
+    }
+
+    /// Both audit columns describe the same event, checked where they are
+    /// actually WRITTEN: through the production update batch and out of
+    /// `telegram_inbound_log`. The previous version of this test called the
+    /// handler and the classifier directly, so re-hard-coding the coarse
+    /// column at the production entry left it green.
+    #[test]
+    fn an_approval_reply_is_not_filed_as_a_question() {
+        let _guard = crate::state::test_env_lock();
+        let _env = CommandEnv::new("audit-kind");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("config");
+        let telegram = config.telegram.clone().expect("telegram");
+        let bot_id = telegram_bot_id(&telegram.bot_token);
+        let key = format!("telegram_offset:{bot_id}");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_spawn::take();
+        let _ = test_transport::take();
+
+        // One dialog per approval standing, plus a question for contrast.
+        crate::state::create_pending_approval(
+            &conn,
+            "ap-open",
+            "sess-audit",
+            "Bash",
+            "Bash: ls",
+            false,
+            1000,
+            900_000,
+        )
+        .expect("open");
+        crate::state::create_pending_approval(
+            &conn,
+            "ap-done",
+            "sess-audit",
+            "Bash",
+            "Bash: ls",
+            false,
+            1000,
+            900_000,
+        )
+        .expect("decided");
+        crate::state::record_approval_decision(&conn, "ap-done", "deny", 1500).expect("decide");
+        crate::state::create_pending_approval(
+            &conn,
+            "ap-old",
+            "sess-audit",
+            "Bash",
+            "Bash: ls",
+            false,
+            1000,
+            5000,
+        )
+        .expect("expired");
+        crate::state::create_pending_question(
+            &conn,
+            "q-audit",
+            "sess-audit",
+            "哪个?",
+            &[],
+            false,
+            1000,
+            900_000,
+        )
+        .expect("question");
+        for (message_id, kind, ref_id) in [
+            (50, "approval", "ap-open"),
+            (52, "approval", "ap-done"),
+            (54, "approval", "ap-old"),
+            (56, "approval", "ap-missing"),
+            (58, "question", "q-audit"),
+        ] {
+            crate::state::record_dialog_message(&conn, "456", message_id, kind, ref_id, 1000)
+                .expect("dialog");
+            crate::state::insert_telegram_message_route(
+                &conn,
+                "456",
+                message_id,
+                "sess-audit",
+                "e",
+                1000,
+            )
+            .expect("route");
+        }
+
+        let updates: Vec<Value> = [50i64, 52, 54, 56, 58]
+            .iter()
+            .enumerate()
+            .map(|(index, message_id)| {
+                json!({
+                    "update_id": index as i64 + 1,
+                    "message": {
+                        "message_id": message_id + 1,
+                        "chat": { "id": "456" },
+                        "from": { "id": "789" },
+                        "reply_to_message": { "message_id": message_id },
+                        "text": "随便说点什么"
+                    }
+                })
+            })
+            .collect();
+        process_telegram_update_batch(
+            &conn,
+            &config,
+            &telegram,
+            &bot_id,
+            &key,
+            &updates,
+            9000,
+            Duration::from_secs(1),
+            None,
+        )
+        .expect("batch");
+
+        // Straight out of the audit table, both columns together.
+        let mut rows = conn
+            .prepare("SELECT update_id, update_kind, result_action FROM telegram_inbound_log ORDER BY update_id")
+            .expect("query")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .expect("rows")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect");
+        rows.sort_by_key(|(update_id, _, _)| *update_id);
+        let expected = [
+            (
+                1,
+                "telegram_approval_reply",
+                "telegram_approval_needs_button",
+            ),
+            (
+                2,
+                "telegram_approval_reply",
+                "telegram_approval_already_settled",
+            ),
+            (
+                3,
+                "telegram_approval_reply",
+                "telegram_approval_window_closed",
+            ),
+            (4, "telegram_approval_reply", "telegram_approval_missing"),
+            (5, "telegram_question_reply", "telegram_question_reply"),
+        ];
+        assert_eq!(rows.len(), expected.len(), "{rows:?}");
+        for ((update_id, kind, action), (want_id, want_kind, want_action)) in
+            rows.iter().zip(expected)
+        {
+            assert_eq!(*update_id, want_id, "{rows:?}");
+            assert_eq!(kind, want_kind, "update {update_id}: {rows:?}");
+            assert_eq!(
+                action.as_deref(),
+                Some(want_action),
+                "update {update_id}: {rows:?}"
+            );
+        }
+        assert!(
+            crate::claude::test_spawn::take().is_empty(),
+            "no dialog reply may be injected into the session"
+        );
+    }
+
+    /// The same fail-closed rule at its SOURCE, through the production
+    /// batch: `dialog_messages.kind` is free text (no CHECK, and the writer
+    /// takes any string), so a corrupt or future value must not slide into
+    /// the question path — recording an answer, reading as a question, and
+    /// filing itself as one in the audit.
+    #[test]
+    fn an_unknown_dialog_kind_answers_nothing_and_is_audited_as_neither() {
+        let _guard = crate::state::test_env_lock();
+        let _env = CommandEnv::new("dialog-unknown-kind");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("config");
+        let telegram = config.telegram.clone().expect("telegram");
+        let bot_id = telegram_bot_id(&telegram.bot_token);
+        let key = format!("telegram_offset:{bot_id}");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_spawn::take();
+        let _ = test_transport::take();
+
+        // A real question row exists behind the id — so "did not answer it"
+        // is a fact this test can check, not an absence.
+        crate::state::create_pending_question(
+            &conn,
+            "q-weird",
+            "sess-weird",
+            "哪个?",
+            &[],
+            false,
+            1000,
+            900_000,
+        )
+        .expect("question");
+        crate::state::record_dialog_message(&conn, "456", 70, "teleported", "q-weird", 1000)
+            .expect("dialog");
+        crate::state::insert_telegram_message_route(&conn, "456", 70, "sess-weird", "e", 1000)
+            .expect("route");
+
+        let updates = vec![json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 71,
+                "chat": { "id": "456" },
+                "from": { "id": "789" },
+                "reply_to_message": { "message_id": 70 },
+                "text": "甲"
+            }
+        })];
+        process_telegram_update_batch(
+            &conn,
+            &config,
+            &telegram,
+            &bot_id,
+            &key,
+            &updates,
+            9000,
+            Duration::from_secs(1),
+            None,
+        )
+        .expect("batch");
+
+        let (update_kind, action): (String, Option<String>) = conn
+            .query_row(
+                "SELECT update_kind, result_action FROM telegram_inbound_log",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("audit row");
+        assert_eq!(
+            update_kind, "telegram_dialog_reply",
+            "an unknown kind is not evidence of a question"
+        );
+        assert_eq!(action.as_deref(), Some("telegram_dialog_unknown_kind"));
+        assert_eq!(
+            crate::state::question_answer(&conn, "q-weird").expect("answer"),
+            None,
+            "an unrecognised dialog must not record an answer"
+        );
+        assert!(
+            crate::claude::test_spawn::take().is_empty(),
+            "and must not inject the text into the session either"
+        );
+        let messages = test_transport::take();
+        assert_eq!(
+            messages.len(),
+            1,
+            "the reply is still consumed: {messages:?}"
+        );
+        assert!(messages[0].contains("认不出来"), "{messages:?}");
+    }
+
+    /// An unrecognised dialog kind must not file itself as a question: the
+    /// classifier is fail-CLOSED, so a future handler that forgets the field
+    /// shows up as generic in the audit rather than as a wrong fact.
+    #[test]
+    fn an_unclassifiable_dialog_reply_is_filed_as_neither() {
+        assert_eq!(
+            telegram_dialog_reply_update_kind(&json!({"action": "telegram_something_new"})),
+            "telegram_dialog_reply",
+            "a missing dialogKind is not evidence of a question"
+        );
+        assert_eq!(
+            telegram_dialog_reply_update_kind(&json!({"dialogKind": "teleported"})),
+            "telegram_dialog_reply"
+        );
+        assert_eq!(
+            telegram_dialog_reply_update_kind(&json!({"dialogKind": "approval"})),
+            "telegram_approval_reply"
+        );
+        assert_eq!(
+            telegram_dialog_reply_update_kind(&json!({"dialogKind": "question"})),
+            "telegram_question_reply"
+        );
+    }
+
+    /// The census labels must follow the CLASS, not a rank number. When
+    /// `Unverified` was inserted into the middle of the old numeric scale,
+    /// every bucket below it silently took its neighbour's name — and the
+    /// last one fell off the line, so the parts stopped summing to the
+    /// whole. This pins each class to its own label and the sum to the total.
+    #[test]
+    fn the_threads_census_labels_every_class_it_counts() {
+        use crate::claude::TerminalPresence::*;
+        let row = |thread_id: &str, presence, headless, unknown| {
+            (
+                crate::state::BridgeThreadSnapshot {
+                    thread_id: thread_id.to_string(),
+                    name: None,
+                    cwd: None,
+                    updated_at: Some(1000),
+                    status_type: "active".to_string(),
+                    status_flags: Vec::new(),
+                    last_turn_status: None,
+                    last_preview: None,
+                    pending_prompt: None,
+                    event_uid: None,
+                },
+                render::ThreadLiveness {
+                    presence,
+                    headless,
+                    unknown,
+                },
+                None,
+            )
+        };
+        let all = vec![
+            row("a", Window, false, false),
+            row("b", Background, false, false),
+            row("c", Unverified, false, false),
+            row("d", Gone, true, false),
+            row("e", Gone, false, false),
+            row("f", Gone, false, true),
+        ];
+        let census = threads_census(&all);
+        for (label, expected) in [
+            ("🖥 终端", 1),
+            ("🫥 后台", 1),
+            ("🔌 在线", 1),
+            ("⚙️ 无头", 1),
+            ("💤 空闲", 1),
+            ("❓ 未知", 1),
+        ] {
+            assert!(
+                census.contains(&format!("{label} {expected}")),
+                "{label} must be counted as itself: {census}"
+            );
+        }
+        assert!(census.contains("🧵 6 个会话"), "{census}");
+
+        // The four familiar buckets stay on the line at zero; the two rarer
+        // ones appear only when someone is in them.
+        let quiet = vec![row("a", Window, false, false)];
+        let census = threads_census(&quiet);
+        assert!(census.contains("🖥 终端 1"), "{census}");
+        assert!(census.contains("🫥 后台 0"), "{census}");
+        assert!(census.contains("⚙️ 无头 0"), "{census}");
+        assert!(census.contains("💤 空闲 0"), "{census}");
+        assert!(!census.contains("🔌 在线"), "{census}");
+        assert!(!census.contains("❓ 未知"), "{census}");
+
+        // And whatever the mix, the buckets sum to the session count: no
+        // class may be silently absent.
+        let mixed = vec![
+            row("a", Unverified, false, false),
+            row("b", Unverified, true, false),
+            row("c", Gone, false, true),
+            row("d", Window, true, false),
+        ];
+        let census = threads_census(&mixed);
+        let total: usize = census
+            .split('·')
+            .filter_map(|part| part.trim().rsplit_once(' '))
+            .filter_map(|(_, number)| number.trim().parse::<usize>().ok())
+            .sum();
+        assert_eq!(
+            total,
+            mixed.len(),
+            "buckets must sum to the total: {census}"
+        );
+    }
+
+    /// A re-offered prompt must not describe where a plain Reply lands: the
+    /// dialog handler takes it. The generic line does exactly that, so the
+    /// re-offer has to use the prompt-aware one.
+    #[test]
+    fn a_reoffer_status_line_does_not_route_replies() {
+        let _guard = config_test_lock();
+        let _env = CommandEnv::new("reoffer-status-line");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("write daemon config");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let telegram = config.telegram.clone().expect("telegram");
+        crate::state::create_pending_question(
+            &conn,
+            "q-line",
+            "sess-q-line",
+            "现在发车？",
+            &["发车".to_string()],
+            false,
+            1000,
+            9_000,
+        )
+        .expect("question");
+        // BOTH arms build their own event json: covering one would let a
+        // revert of the other stay green (it did, once).
+        crate::state::create_pending_approval(
+            &conn,
+            "ap-line",
+            "sess-ap-line",
+            "Bash",
+            "Bash: x",
+            false,
+            1000,
+            9_000,
+        )
+        .expect("approval");
+        let classified = classify_recent_threads(&conn, 50, 2000).expect("classify");
+        for thread_id in ["sess-q-line", "sess-ap-line"] {
+            let (snapshot, _, prompt) = classified
+                .iter()
+                .find(|(snapshot, _, _)| snapshot.thread_id == thread_id)
+                .expect("listed");
+            for (presence, unknown) in [
+                (crate::claude::TerminalPresence::Gone, false),
+                (crate::claude::TerminalPresence::Window, true),
+            ] {
+                let liveness = render::ThreadLiveness {
+                    presence,
+                    headless: false,
+                    unknown,
+                };
+                let event = reoffer_prompt_event(
+                    &conn,
+                    &telegram,
+                    snapshot,
+                    liveness,
+                    prompt.as_ref().expect("prompt"),
+                    2000,
+                )
+                .expect("event");
+                let status = event["statusLine"].as_str().expect("status line");
+                assert_eq!(
+                    status,
+                    liveness.prompt_status_line(),
+                    "{thread_id}: the re-offer must carry the prompt-aware line"
+                );
+                for claim in ["续跑", "送达"] {
+                    assert!(
+                        !status.contains(claim),
+                        "{thread_id}: a waiting prompt's reply is taken by the dialog handler: {status}"
+                    );
+                }
+            }
+        }
     }
 
     /// A long question is split across several Telegram messages; replying to
@@ -5466,6 +6417,83 @@ mod tests {
             event["headless"], true,
             "the hint must describe the approval, not today's session: {event}"
         );
+    }
+
+    /// The window state is the opposite kind of fact: it is about where the
+    /// user must answer RIGHT NOW, so a session backgrounded (or attached)
+    /// after it asked must be described as it is today — both prompt kinds.
+    #[test]
+    fn reoffer_reports_todays_window_state() {
+        let _guard = config_test_lock();
+        let _env = CommandEnv::new("reoffer-window-state");
+        let config = test_daemon_config();
+        write_daemon_config(&config).expect("write daemon config");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let telegram = config.telegram.clone().expect("telegram");
+        crate::state::create_pending_approval(
+            &conn, "ap-w", "sess-ap", "Bash", "Bash: x", false, 1000, 9_000,
+        )
+        .expect("approval");
+        crate::state::create_pending_question(
+            &conn,
+            "q-w",
+            "sess-q",
+            "现在发车？",
+            &["发车".to_string()],
+            false,
+            1000,
+            9_000,
+        )
+        .expect("question");
+        let classified = classify_recent_threads(&conn, 50, 2000).expect("classify");
+        let flag =
+            |thread_id: &str, presence: crate::claude::TerminalPresence, unknown: bool| -> Value {
+                let (snapshot, _, prompt) = classified
+                    .iter()
+                    .find(|(snapshot, _, _)| snapshot.thread_id == thread_id)
+                    .expect("listed");
+                let liveness = render::ThreadLiveness {
+                    presence,
+                    headless: false,
+                    unknown,
+                };
+                reoffer_prompt_event(
+                    &conn,
+                    &telegram,
+                    snapshot,
+                    liveness,
+                    prompt.as_ref().expect("prompt"),
+                    2000,
+                )
+                .expect("event")["terminalVisibility"]
+                    .clone()
+            };
+        use crate::claude::TerminalPresence::{Background, Gone, Window};
+        for thread_id in ["sess-ap", "sess-q"] {
+            assert_eq!(
+                flag(thread_id, Background, false),
+                json!("background"),
+                "{thread_id}: a backgrounded session has no terminal to answer at"
+            );
+            assert_eq!(
+                flag(thread_id, Window, false),
+                json!("window"),
+                "{thread_id}: a session with a window keeps its terminal hints"
+            );
+            // Three states, not two. A dead socket and an unreadable one
+            // both fail to CONFIRM a terminal, and flattening them into
+            // "window" is what put a terminal promise under a 💤/❓ line.
+            assert_eq!(
+                flag(thread_id, Gone, false),
+                json!("unverified"),
+                "{thread_id}: no live socket confirms no terminal"
+            );
+            assert_eq!(
+                flag(thread_id, Window, true),
+                json!("unverified"),
+                "{thread_id}: a failed liveness read confirms nothing either"
+            );
+        }
     }
 
     /// Rows from before the `multi_select` column existed have NULL there.

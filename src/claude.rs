@@ -2812,6 +2812,12 @@ pub(crate) enum TerminalPresence {
     Window,
     /// Alive under Claude Code's background pty host — no visible window.
     Background,
+    /// Verified live socket, but WHICH of the two could not be read: no
+    /// /proc entry for the owning pid, or a platform without /proc. A
+    /// verified socket proves the session is alive and reachable; it proves
+    /// nothing about a window, and this state exists so nothing downstream
+    /// can quietly upgrade "unreadable" into "the user is looking at it".
+    Unverified,
     /// No verified live socket at all.
     Gone,
 }
@@ -2843,19 +2849,23 @@ pub(crate) fn session_terminal_presence(
         return Ok(TerminalPresence::Gone);
     }
     // The socket name carries the owning pid; a session whose parent is the
-    // background pty host has no window. Unreadable /proc degrades to
-    // Window — the pid was just verified alive, and guessing "background"
-    // would recreate the missing-window confusion in the other direction.
-    let hosted = Path::new(&socket.path)
+    // background pty host has no window. An unreadable /proc (or a platform
+    // without one) is NOT a window: the identity check just proved the
+    // socket was not swapped, which says nothing about what the user can
+    // see, and publishing it as "🖥 终端活跃" put a terminal-fallback promise
+    // on sessions nobody had looked at.
+    let pid = Path::new(&socket.path)
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .and_then(|stem| stem.parse::<u32>().ok())
-        .is_some_and(parent_is_bg_pty_host);
-    if hosted {
-        Ok(TerminalPresence::Background)
-    } else {
-        Ok(TerminalPresence::Window)
-    }
+        .and_then(|stem| stem.parse::<u32>().ok());
+    let Some(pid) = pid else {
+        return Ok(TerminalPresence::Unverified);
+    };
+    Ok(match parent_is_bg_pty_host(pid) {
+        Some(true) => TerminalPresence::Background,
+        Some(false) => TerminalPresence::Window,
+        None => TerminalPresence::Unverified,
+    })
 }
 
 /// Signalled the instant the windowless probe starts, then stalls it. Lets a
@@ -3202,10 +3212,28 @@ pub(crate) fn parse_ps_tty(raw: &str) -> Option<PathBuf> {
 /// cchess background session sat blocked for 7h09m that way, and the only
 /// person who could clear it had to walk to the machine.
 ///
-/// Every uncertainty answers `false` (assume a window): that keeps the
-/// established behaviour and never invents an unbounded wait out of a
-/// missing /proc entry. Non-Linux has no /proc at all and lands there too.
-pub(crate) fn current_session_lacks_terminal_window() -> bool {
+/// The probe answers in THREE states, because it can genuinely fail: a
+/// missing or malformed socket variable, an unreadable /proc entry, a
+/// platform with no /proc at all. Those are `Unverified` — not "has a
+/// window".
+///
+/// Callers split the two questions themselves. POLICY (how long to wait,
+/// whether to paint a banner, whether a keyboard reclaim may take the
+/// prompt) keys on `== Background` only, so an unreadable /proc keeps the
+/// established behaviour and never invents a day-long wait. What the MESSAGE
+/// says keys on all three, because telling the user their terminal is fine
+/// must require having measured it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionWindow {
+    /// A terminal window: an ordinary `claude` in a terminal emulator.
+    Window,
+    /// Alive under Claude Code's background pty host — no visible window.
+    Background,
+    /// The probe could not tell. Never claim either way from here.
+    Unverified,
+}
+
+pub(crate) fn current_session_window() -> SessionWindow {
     // Test seam: this probe walks /proc and takes real time, which is
     // exactly why the transcript boundary must be frozen BEFORE it. A test
     // signals here and stalls, so an answer landing inside this window is
@@ -3214,19 +3242,32 @@ pub(crate) fn current_session_lacks_terminal_window() -> bool {
     windowless_probe_seam();
     #[cfg(test)]
     if let Ok(raw) = env::var("TINYCTB_TEST_SESSION_WINDOWLESS") {
-        return raw == "1";
+        return match raw.as_str() {
+            "1" => SessionWindow::Background,
+            "unverified" => SessionWindow::Unverified,
+            _ => SessionWindow::Window,
+        };
     }
     let Ok(socket) = env::var("CLAUDE_CODE_MESSAGING_SOCKET") else {
-        return false;
+        return SessionWindow::Unverified;
     };
-    Path::new(&socket)
+    let pid = Path::new(&socket)
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .and_then(|stem| stem.parse::<u32>().ok())
-        .is_some_and(parent_is_bg_pty_host)
+        .and_then(|stem| stem.parse::<u32>().ok());
+    let Some(pid) = pid else {
+        return SessionWindow::Unverified;
+    };
+    match parent_is_bg_pty_host(pid) {
+        Some(true) => SessionWindow::Background,
+        Some(false) => SessionWindow::Window,
+        None => SessionWindow::Unverified,
+    }
 }
 
-fn parent_is_bg_pty_host(pid: u32) -> bool {
+/// `None` means the question could not be answered — /proc unreadable, or a
+/// platform without it — as opposed to a confirmed "no, an ordinary parent".
+fn parent_is_bg_pty_host(pid: u32) -> Option<bool> {
     let ppid = fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
         .and_then(|stat| {
@@ -3236,13 +3277,10 @@ fn parent_is_bg_pty_host(pid: u32) -> bool {
                 .nth(1)?
                 .parse::<u32>()
                 .ok()
-        });
-    let Some(ppid) = ppid else {
-        return false;
-    };
+        })?;
     fs::read_to_string(format!("/proc/{ppid}/cmdline"))
+        .ok()
         .map(|cmdline| cmdline.contains("bg-pty-host"))
-        .unwrap_or(false)
 }
 
 const INJECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -3637,6 +3675,72 @@ mod tests {
     use super::*;
     use crate::state::create_state_db_in_memory;
     use std::io::Write;
+
+    /// The probe itself, with the test seam OUT of the way — otherwise a
+    /// test only proves the wiring downstream of it (which is exactly how an
+    /// early revert of this mapping stayed green). Every way of not knowing
+    /// must answer `Unverified`; only a readable parent may answer `Window`.
+    #[test]
+    fn the_window_probe_answers_unverified_for_everything_it_cannot_read() {
+        let _guard = crate::state::test_env_lock();
+        // Guards, one per case and scoped: an assertion failing below must
+        // not leak a rewritten socket variable into every later test. (They
+        // are also NOT reassigned into one binding — dropping the old guard
+        // after the new one is created would restore the old value on top.)
+        let _seam = crate::state::EnvVarGuard::clear("TINYCTB_TEST_SESSION_WINDOWLESS");
+
+        {
+            let _socket = crate::state::EnvVarGuard::clear("CLAUDE_CODE_MESSAGING_SOCKET");
+            assert_eq!(
+                current_session_window(),
+                SessionWindow::Unverified,
+                "no socket variable: nothing was measured"
+            );
+        }
+        {
+            let _socket = crate::state::EnvVarGuard::set(
+                "CLAUDE_CODE_MESSAGING_SOCKET",
+                "/run/cc-socks/not-a-pid.sock",
+            );
+            assert_eq!(
+                current_session_window(),
+                SessionWindow::Unverified,
+                "a socket name that carries no pid measures nothing either"
+            );
+        }
+        {
+            // A pid whose /proc entry cannot be read (and every pid at all,
+            // on a system without /proc) is the same shrug.
+            let _socket = crate::state::EnvVarGuard::set(
+                "CLAUDE_CODE_MESSAGING_SOCKET",
+                "/run/cc-socks/4294967294.sock",
+            );
+            assert_eq!(
+                current_session_window(),
+                SessionWindow::Unverified,
+                "an unreadable process is not a terminal window"
+            );
+        }
+        // The one case that may claim a window: our own live pid, whose
+        // parent is the test runner rather than the background pty host.
+        #[cfg(target_os = "linux")]
+        {
+            let _socket = crate::state::EnvVarGuard::set(
+                "CLAUDE_CODE_MESSAGING_SOCKET",
+                format!("/run/cc-socks/{}.sock", std::process::id()),
+            );
+            assert_eq!(
+                current_session_window(),
+                SessionWindow::Window,
+                "a readable, ordinary parent is a real measurement"
+            );
+            assert_ne!(
+                current_session_window(),
+                SessionWindow::Background,
+                "and the policy view (== Background) agrees"
+            );
+        }
+    }
 
     /// `ps -o tty=` output is about to name a device the banner WRITES to,
     /// so parsing is a gate, not a convenience: only a single clean token
@@ -5631,6 +5735,76 @@ mod tests {
             TerminalPresence::Gone,
             "no recorded socket must never read as a live terminal"
         );
+    }
+
+    /// A verified socket proves the session is ALIVE and reachable. It does
+    /// not prove anyone can see it: the window question is answered by
+    /// reading the owner's parent, and that read can fail (a parent owned by
+    /// another user, a parent that just exited, a platform with no /proc).
+    /// Publishing those as "🖥 终端活跃" is what put a terminal-fallback
+    /// promise on sessions nobody had looked at.
+    ///
+    /// pid 1 is the reliable shape of that failure: its own stat is
+    /// readable (so identity verifies), while its parent is pid 0, which has
+    /// no /proc entry at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_session_whose_parent_cannot_be_read_is_not_published_as_a_window() {
+        let _guard = crate::state::test_env_lock();
+        let conn = test_state_conn("presence-unverified");
+        let dir = std::env::temp_dir().join(format!("tinyctb-presence-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        // A plain file stands in for the socket: presence only stats it (an
+        // AF_UNIX bind would fail in sandboxes that forbid it).
+        let unreadable_parent = dir.join("1.sock");
+        fs::write(&unreadable_parent, "").expect("socket stand-in");
+        let path = unreadable_parent.display().to_string();
+        let (inode, boot_id) = socket_identity(&path);
+        assert!(
+            inode.is_some() && boot_id.is_some(),
+            "the fixture must present a VERIFIABLE identity, or the test \
+             proves nothing about the window question"
+        );
+        crate::state::record_session_messaging_socket(
+            &conn,
+            "sess-unverified",
+            &SessionSocket {
+                path,
+                inode,
+                boot_id,
+            },
+            1000,
+        )
+        .expect("record");
+        assert_eq!(
+            session_terminal_presence(&conn, "sess-unverified").expect("presence"),
+            TerminalPresence::Unverified,
+            "an unreadable parent is not a terminal window"
+        );
+
+        // The mirror: our own pid, whose parent is the test runner.
+        let readable_parent = dir.join(format!("{}.sock", std::process::id()));
+        fs::write(&readable_parent, "").expect("socket stand-in");
+        let path = readable_parent.display().to_string();
+        let (inode, boot_id) = socket_identity(&path);
+        crate::state::record_session_messaging_socket(
+            &conn,
+            "sess-window",
+            &SessionSocket {
+                path,
+                inode,
+                boot_id,
+            },
+            1000,
+        )
+        .expect("record");
+        assert_eq!(
+            session_terminal_presence(&conn, "sess-window").expect("presence"),
+            TerminalPresence::Window,
+            "a readable, ordinary parent is a real measurement"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The daemon-preemption interleaving: a slow spawn can outlive the 10s

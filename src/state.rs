@@ -2744,6 +2744,55 @@ pub(crate) fn approval_decision(conn: &Connection, approval_id: &str) -> Result<
     Ok(decision.flatten())
 }
 
+/// Where an approval stands for someone who is answering it NOW.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovalStanding {
+    /// Inside its window and undecided: a button press would be recorded.
+    Open,
+    /// Past its deadline (whether or not the gate has stamped it yet).
+    Expired,
+    /// Already answered.
+    Decided,
+}
+
+/// The same three-way split `record_approval_decision` applies to a tap,
+/// computed without writing anything.
+///
+/// Reading `decision` alone misses the gap between the deadline passing and
+/// the gate stamping `"expired"`: in that gap a tap is correctly told the
+/// window is closed while a text reply used to be told to "press the
+/// buttons" on a dialog that could no longer accept one.
+pub(crate) fn approval_standing(
+    conn: &Connection,
+    approval_id: &str,
+    now: u64,
+) -> Result<Option<ApprovalStanding>> {
+    let row: Option<(Option<String>, i64)> = conn
+        .query_row(
+            "SELECT decision, expires_at FROM pending_approvals WHERE approval_id = ?1",
+            params![approval_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((decision, expires_at)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(match decision.as_deref() {
+        Some("expired") => ApprovalStanding::Expired,
+        Some(_) => ApprovalStanding::Decided,
+        // Same deadline arithmetic as the recording path, so a tap and a
+        // reply landing in the same millisecond cannot disagree.
+        None => {
+            let expires_at = from_sql_i64(expires_at)?;
+            if expires_at > 0 && timestamp_to_millis(now) > timestamp_to_millis(expires_at) {
+                ApprovalStanding::Expired
+            } else {
+                ApprovalStanding::Open
+            }
+        }
+    }))
+}
+
 /// The outcome of tapping a button, so the toast can tell the truth instead
 /// of claiming success for an answer that arrived too late.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5061,6 +5110,7 @@ mod tests {
             "Bash",
             "x",
             true,
+            None,
             Some("turn-1"),
             None,
             2000,
@@ -5100,6 +5150,7 @@ mod tests {
             "Bash",
             "x",
             true,
+            None,
             Some("turn-1"),
             None,
             1200,
@@ -5173,6 +5224,7 @@ mod tests {
                 "Bash",
                 "x",
                 true,
+                None,
                 Some("turn-1"),
                 None,
                 now,
@@ -5734,6 +5786,7 @@ mod tests {
             "Bash",
             "x",
             true,
+            None,
             Some("turn-1"),
             None,
             1000,
@@ -5829,6 +5882,7 @@ mod tests {
                 "Bash",
                 "x",
                 true,
+                None,
                 Some("turn-1"),
                 None,
                 1000,

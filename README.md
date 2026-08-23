@@ -92,7 +92,19 @@ Any keyboard activity (or `/back`) hands the window back within about a
 second and the native dialog opens right there; when the phone answers
 first, the terminal gets a durable "answered from Telegram" receipt via the
 hook's `systemMessage`. Background sessions without a visible terminal skip
-the banner — for them the Telegram window is the dialog.
+the banner — for them the Telegram window is the dialog, and the Telegram
+message says so: it carries a 🫥 "后台会话（无终端窗口）" line instead of a
+liveness line, and its hint stops promising a terminal fallback that nobody
+could see. Every message describes the terminal as one of three states —
+window, background, or not verifiable — a dead socket, a probe that could
+not read the owning process, or a headless turn that never had a terminal
+all get neutral wording rather than a promise. The gate measures its own
+session; `/threads` measures again at list time, so a session backgrounded
+after it asked is described as it is now. No hint names a
+deadline: the wait was fixed when the gate published, which is not what a
+re-offer is looking at. A late tap or reply is told its phone window closed,
+never that "the session went back to the terminal" — that terminal may not
+exist.
 
 ## Install
 
