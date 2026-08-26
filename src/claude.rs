@@ -372,6 +372,21 @@ pub(crate) struct TranscriptSummary {
     /// hook payload itself only carries a one-line message without the tool
     /// arguments.
     pub(crate) pending_tool_use: Option<String>,
+    /// When the session last actually said something, from the stamp on the
+    /// transcript's own last record.
+    ///
+    /// The file's mtime is not that. A transcript can be touched by anything
+    /// — a backup, a copy, an editor — and the row then claimed the session
+    /// had just spoken: a thread that went quiet on 08-12 sat at the top of
+    /// `/threads` showing today's time, and nothing cleared it. `None` means
+    /// the records carried no readable stamp, and only then is mtime used.
+    pub(crate) last_record_at: Option<u64>,
+    /// The earliest stamp this parse REFUSED for being ahead of the clock.
+    ///
+    /// Kept so the cache can tell when its own answer has expired: the file
+    /// has not changed, but a stamp that was unbelievable at parse time
+    /// becomes ordinary once the clock reaches it.
+    pub(crate) earliest_refused_future_at: Option<u64>,
 }
 
 const MAX_TOOL_DETAIL_CHARS: usize = 500;
@@ -470,13 +485,30 @@ fn text_from_message_content(content: &Value) -> Option<String> {
 /// a stable API: unknown record types are skipped, sidechain (subagent) and
 /// meta records are ignored.
 /// Process-wide cache for transcript summaries, keyed by path and validated
-/// by (mtime_ms, len). The daemon's full sync re-summarises up to 50 session
-/// transcripts every ~1.5s, and an active session's transcript runs to tens
-/// of megabytes — re-parsing unchanged files burned ~10% of a core, growing
-/// with conversation length (measured 2026-08-16). A (mtime, size) match
-/// reuses the previous parse; any append or rewrite changes at least one of
-/// the two. CLI one-shot invocations simply run with a cold cache.
-type TranscriptSummaryCache = std::collections::HashMap<PathBuf, (u64, u64, TranscriptSummary)>;
+/// by the FULL fingerprint below — generation, size, inode and change time.
+///
+/// The daemon's full sync re-summarises up to 50 session transcripts every
+/// ~1.5s, and an active session's transcript runs to tens of megabytes;
+/// re-parsing unchanged files burned ~10% of a core, growing with
+/// conversation length (measured 2026-08-16). CLI one-shot invocations
+/// simply run with a cold cache.
+///
+/// It was once keyed by (mtime_ms, len), on the belief that any rewrite
+/// changes one of the two. It does not: a same-length rewrite inside one
+/// millisecond matches, and so does a rewrite whose mtime is put back
+/// afterwards — which is what a backup or a restore does.
+/// What makes one reading of a file different from another: modification
+/// generation (nanoseconds), size, inode, and the inode's own change time.
+///
+/// The last one is why a restore cannot hide. Content written and the mtime
+/// then put back leaves the first three identical — that is what a backup
+/// tool does — and the stale summary was served forever. `ctime` is bumped
+/// by the write and cannot be set back by `set_modified`, so it is the one
+/// piece of evidence a restore does not control.
+type FileFingerprint = (u128, u64, u64, i64);
+
+type TranscriptSummaryCache =
+    std::collections::HashMap<PathBuf, (FileFingerprint, TranscriptSummary)>;
 static TRANSCRIPT_SUMMARY_CACHE: std::sync::Mutex<Option<TranscriptSummaryCache>> =
     std::sync::Mutex::new(None);
 
@@ -484,31 +516,226 @@ static TRANSCRIPT_SUMMARY_CACHE: std::sync::Mutex<Option<TranscriptSummaryCache>
 /// enough that a clear-and-rebuild (one sync's worth of parsing) is cheap.
 const TRANSCRIPT_SUMMARY_CACHE_MAX: usize = 128;
 
-pub(crate) fn parse_transcript_summary(path: &Path) -> Result<TranscriptSummary> {
-    let fingerprint = fs::metadata(path).ok().and_then(|meta| {
-        let mtime_ms = meta
-            .modified()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_millis() as u64;
-        Some((mtime_ms, meta.len()))
-    });
-    if let Some((mtime_ms, len)) = fingerprint {
+/// Epoch milliseconds from the stamp Claude Code writes on every transcript
+/// record: `2026-08-12T13:32:34.162Z`.
+///
+/// Strict and UTC-only on purpose. One known producer writes these, and a
+/// lenient parser that guessed at other shapes would put a WRONG time into
+/// the ordering — worse than the `None` that falls back to the file mtime.
+fn transcript_timestamp_ms(raw: &str) -> Option<u64> {
+    fn fixed_width_number(raw: &str, width: usize) -> Option<i64> {
+        // Fixed width and digits only: `2026-8-2T1:2:3Z` is not the shape
+        // this claims to read, and a `-` slipping into a component would
+        // otherwise parse as a negative hour.
+        if raw.len() != width || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        raw.parse().ok()
+    }
+    fn days_in_month(year: i64, month: i64) -> i64 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+            2 => 28,
+            _ => 0,
+        }
+    }
+
+    let raw = raw.strip_suffix('Z')?;
+    let (date, time) = raw.split_once('T')?;
+    let (year, rest) = date.split_at(date.find('-')?);
+    let year = fixed_width_number(year, 4)?;
+    let mut date_parts = rest.strip_prefix('-')?.split('-');
+    let month = fixed_width_number(date_parts.next()?, 2)?;
+    let day = fixed_width_number(date_parts.next()?, 2)?;
+    if date_parts.next().is_some() || !(1..=12).contains(&month) {
+        return None;
+    }
+    // A full calendar check, not a 1..=31 wave-through: 2026-02-31 and a
+    // non-leap 02-29 are not days, and a stamp that names one is not a time.
+    if day < 1 || day > days_in_month(year, month) {
+        return None;
+    }
+    let (clock, fraction) = match time.split_once('.') {
+        Some((clock, fraction)) => (clock, Some(fraction)),
+        None => (time, None),
+    };
+    let mut clock_parts = clock.split(':');
+    let hour = fixed_width_number(clock_parts.next()?, 2)?;
+    let minute = fixed_width_number(clock_parts.next()?, 2)?;
+    let second = fixed_width_number(clock_parts.next()?, 2)?;
+    // No leap second: this producer does not write them, and 23:59:60 would
+    // land a millisecond ahead of the next day's first record.
+    if clock_parts.next().is_some() || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let millis: i64 = match fraction {
+        // Three digits is what Claude Code writes; anything else is a shape
+        // this parser does not claim to understand.
+        Some(fraction) => fixed_width_number(fraction, 3)?,
+        None => 0,
+    };
+    // Days from the civil calendar (Howard Hinnant's algorithm), which needs
+    // no dependency and no leap-year special cases. Every step is checked:
+    // a stamp from the year 999999 must return None, not wrap (or panic in a
+    // debug build).
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era
+        .checked_mul(146_097)?
+        .checked_add(day_of_era)?
+        .checked_sub(719_468)?;
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(hour.checked_mul(3_600)?)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)?;
+    let millis = seconds.checked_mul(1_000)?.checked_add(millis)?;
+    u64::try_from(millis).ok()
+}
+
+/// A summary AND the identity of the file it was read from, or `None` for
+/// that identity when the file changed underneath the read.
+///
+/// stat → read → stat. Taking the identity afterwards, separately, was not
+/// the same thing: a reader could parse one file, stall, and then stamp its
+/// answer with the identity of the file that replaced it — writing an old
+/// reading under a new generation, where nothing downstream could tell.
+/// When the two stats disagree the reading is simply dropped; the next cycle
+/// reads again, microseconds later.
+pub(crate) fn read_transcript_summary(
+    path: &Path,
+    now: u64,
+) -> Result<(TranscriptSummary, Option<FileFingerprint>)> {
+    let before = file_fingerprint(path);
+    let summary = parse_transcript_summary(path, now)?;
+    // Signalled between the read and the second stat, so a test can change
+    // the file exactly inside the window this guards instead of racing it
+    // with a sleep. Thread-local with an RAII guard: a process-wide seam
+    // would couple every test in the suite to every other.
+    #[cfg(test)]
+    transcript_read_seam::signal();
+    let after = file_fingerprint(path);
+    let stable = match (before, after) {
+        (Some(before), Some(after)) if before == after => Some(after),
+        _ => None,
+    };
+    Ok((summary, stable))
+}
+
+/// Is the file still exactly the one a reading came from?
+///
+/// The last question before a reading is written down. Ordering two readings
+/// inside the write could not answer it: two inodes have no order between
+/// them, so a rule of always-accept-a-different-inode let a reading of the
+/// REPLACED file beat the reading of the file that replaced it, purely by
+/// committing second. There is no total order to be had in SQL — but there
+/// is a fact on disk, and this asks it as late as it can.
+fn file_unchanged_since(path: &Path, read_from: FileFingerprint) -> bool {
+    // The same seam as the read, fired in the OTHER window this guards: the
+    // gap between a reading that held still and the write it is about. That
+    // gap has no other test hook -- everywhere else the reading and its
+    // fingerprint are taken together, so they cannot disagree -- and a test
+    // that tried to race it with a thread would be the flake it was meant to
+    // catch. Thread-local and opt-in, so an unarmed test sees nothing.
+    #[cfg(test)]
+    transcript_read_seam::signal();
+    file_fingerprint(path) == Some(read_from)
+}
+
+/// Signalled inside `read_transcript_summary`, between the read and the
+/// second stat, so a test can act in exactly that window.
+#[cfg(test)]
+pub(crate) mod transcript_read_seam {
+    thread_local! {
+        static SEAM: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) struct Armed;
+
+    pub(crate) fn arm(action: impl Fn() + 'static) -> Armed {
+        SEAM.with(|seam| seam.borrow_mut().replace(Box::new(action)));
+        Armed
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            SEAM.with(|seam| seam.borrow_mut().take());
+        }
+    }
+
+    pub(crate) fn signal() {
+        // Taken out for the call so a seam that reads the file itself cannot
+        // re-enter this borrow.
+        let action = SEAM.with(|seam| seam.borrow_mut().take());
+        if let Some(action) = action {
+            action();
+            SEAM.with(|seam| seam.borrow_mut().replace(action));
+        }
+    }
+}
+
+fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let meta = fs::metadata(path).ok()?;
+    let generation_ns = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    #[cfg(unix)]
+    let (inode, changed_ns) = {
+        use std::os::unix::fs::MetadataExt as _;
+        (meta.ino(), meta.ctime_nsec() + meta.ctime() * 1_000_000_000)
+    };
+    #[cfg(not(unix))]
+    let (inode, changed_ns) = (0u64, 0i64);
+    Some((generation_ns, meta.len(), inode, changed_ns))
+}
+
+pub(crate) fn parse_transcript_summary(path: &Path, now: u64) -> Result<TranscriptSummary> {
+    // NANOSECONDS and the inode, not milliseconds alone. A rewrite of the
+    // same length inside one millisecond — which is what an append-and-
+    // truncate or a restore looks like — matched the old key exactly, and
+    // the stale summary was served forever: the row could never be corrected
+    // downward again, however the file changed.
+    let fingerprint = file_fingerprint(path);
+    if let Some(fingerprint) = fingerprint {
         let mut guard = TRANSCRIPT_SUMMARY_CACHE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((cached_mtime, cached_len, summary)) = guard
+        if let Some((cached, summary)) = guard
             .get_or_insert_with(std::collections::HashMap::new)
             .get(path)
         {
-            if *cached_mtime == mtime_ms && *cached_len == len {
-                return Ok(summary.clone());
+            if *cached == fingerprint {
+                // The FILE is unchanged — but this summary was built against
+                // a clock, and the clock is not part of the key. Two ways it
+                // goes stale on its own:
+                //
+                //   * a record refused for being ahead of the clock is
+                //     legitimate once the clock reaches it;
+                //   * a record accepted before a clock rollback is now in
+                //     the future, and would be reported as fact.
+                //
+                // Either way the cached answer is no longer the answer.
+                let refusal_now_believable = summary
+                    .earliest_refused_future_at
+                    .is_some_and(|refused| now >= refused);
+                let accepted_now_in_future = summary.last_record_at.is_some_and(|at| at > now);
+                if !refusal_now_believable && !accepted_now_in_future {
+                    return Ok(summary.clone());
+                }
             }
         }
     }
-    let summary = parse_transcript_summary_uncached(path)?;
-    if let Some((mtime_ms, len)) = fingerprint {
+    let summary = parse_transcript_summary_uncached(path, now)?;
+    if let Some(fingerprint) = fingerprint {
         let mut guard = TRANSCRIPT_SUMMARY_CACHE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -516,12 +743,12 @@ pub(crate) fn parse_transcript_summary(path: &Path) -> Result<TranscriptSummary>
         if cache.len() >= TRANSCRIPT_SUMMARY_CACHE_MAX {
             cache.clear();
         }
-        cache.insert(path.to_path_buf(), (mtime_ms, len, summary.clone()));
+        cache.insert(path.to_path_buf(), (fingerprint, summary.clone()));
     }
     Ok(summary)
 }
 
-fn parse_transcript_summary_uncached(path: &Path) -> Result<TranscriptSummary> {
+fn parse_transcript_summary_uncached(path: &Path, now: u64) -> Result<TranscriptSummary> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read session transcript at {}", path.display()))?;
     let mut summary = TranscriptSummary::default();
@@ -536,6 +763,33 @@ fn parse_transcript_summary_uncached(path: &Path) -> Result<TranscriptSummary> {
         let record_type = record.get("type").and_then(Value::as_str).unwrap_or("");
         if record.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             continue;
+        }
+        // WHEN this record was written, taken from the record itself. Every
+        // record counts, not just the ones that change the summary: the
+        // question is when the session last did anything at all.
+        // Filtered PER RECORD, not clamped at the end. Taking the maximum
+        // first and clamping afterwards let a single stamp from 2099 hide
+        // every legitimate record behind it and read as "now" on every scan
+        // for good.
+        if let Some(at) = record
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(transcript_timestamp_ms)
+        {
+            if at <= now {
+                summary.last_record_at = Some(match summary.last_record_at {
+                    Some(previous) => previous.max(at),
+                    None => at,
+                });
+            } else {
+                // Remembered, not discarded: the cache needs to know when
+                // this answer stops being the answer.
+                summary.earliest_refused_future_at =
+                    Some(match summary.earliest_refused_future_at {
+                        Some(previous) => previous.min(at),
+                        None => at,
+                    });
+            }
         }
         match record_type {
             "ai-title" => {
@@ -618,24 +872,55 @@ pub(crate) fn parse_transcript_messages(path: &Path, limit: usize) -> Result<Vec
 /// Metadata-only snapshot from a transcript scan. Never carries a completion
 /// status or pending prompt of its own: those are owned by hook events, and the
 /// caller preserves any existing DB state (see `sync_state_from_sessions`).
-fn scan_snapshot(info: &SessionFileInfo) -> BridgeThreadSnapshot {
-    let summary = parse_transcript_summary(&info.path).unwrap_or_default();
+/// A scan snapshot, and the evidence behind its recency.
+///
+/// `None` for the evidence means the file changed while it was being read:
+/// the answer belongs to no particular generation of it, so it is not filed
+/// at all and the next cycle reads again.
+fn scan_snapshot(
+    info: &SessionFileInfo,
+    now: u64,
+) -> (
+    BridgeThreadSnapshot,
+    Option<(crate::state::UpdatedAt, FileFingerprint)>,
+) {
+    let (summary, fingerprint) = read_transcript_summary(&info.path, now).unwrap_or_default();
+    let measured_at = summary.last_record_at;
     let status_type = match summary.last_record_type.as_deref() {
         Some("user") => "active",
         _ => "idle",
     };
-    BridgeThreadSnapshot {
+    let snapshot = BridgeThreadSnapshot {
         thread_id: info.session_id.clone(),
         name: summary.name,
         cwd: summary.cwd,
-        updated_at: Some(info.mtime_ms),
+        // MEASURED first, guessed second. The file's mtime says when the
+        // file was touched, which is not when the session spoke — a stale
+        // thread whose transcript was copied or backed up claimed today's
+        // time and sat at the top of `/threads` for good.
+        updated_at: Some(measured_at.unwrap_or(info.mtime_ms)),
         status_type: status_type.to_string(),
         status_flags: Vec::new(),
         last_turn_status: None,
         last_preview: summary.last_assistant_text,
         pending_prompt: None,
         event_uid: None,
-    }
+    };
+    // The whole answer for THIS generation, committed as one: a reading with
+    // a stamp sets the measurement, a reading without one CLEARS the last
+    // measurement and falls back to the mtime. Leaving the old measurement
+    // in place meant "measured first, guessed second" only ever held for a
+    // row's first write — a transcript truncated or rewritten to carry no
+    // stamps kept reporting a time that was no longer in the file.
+    let source = fingerprint.map(|fingerprint| {
+        let kind = if measured_at.is_some() {
+            crate::state::UpdatedAt::Measured
+        } else {
+            crate::state::UpdatedAt::Guessed
+        };
+        (kind, fingerprint)
+    });
+    (snapshot, source)
 }
 
 // ---------------------------------------------------------------------------
@@ -876,23 +1161,252 @@ fn pending_prompt_from_notification(
 /// skipping partial writes and non-events.
 fn spool_event_files() -> Result<Vec<PathBuf>> {
     let spool = events_spool_dir()?;
-    let Ok(entries) = fs::read_dir(&spool) else {
-        return Ok(Vec::new());
+    // A directory that does not exist yet is genuinely empty -- no hook has
+    // ever fired. Anything else is NOT emptiness, it is ignorance, and the
+    // two were reported identically: one transient EMFILE or permissions
+    // blip made the queue look drained, and a caller acting on "no sockets"
+    // routes a reply into a headless `--resume` that forks the session.
+    let entries = match fs::read_dir(&spool) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("failed to list hook spool at {}", spool.display())))
+        }
     };
-    let mut files = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension().and_then(|ext| ext.to_str()) == Some("json")
-                && !path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("")
-                    .starts_with('.')
-        })
-        .collect::<Vec<_>>();
+    let mut files = spool_entry_paths(entries)
+        .with_context(|| format!("failed to list hook spool at {}", spool.display()))?;
     files.sort();
     Ok(files)
+}
+
+/// The half of the listing that can be handed a failing iterator, so the rule
+/// below can be tested without arranging a directory that breaks halfway
+/// through — which no test can do reliably.
+///
+/// `read_dir` SUCCEEDING says only that the directory opened. Each step of the
+/// walk can still fail on its own, and `filter_map(Result::ok)` dropped those
+/// silently: the caller received a SHORTER list and could not tell it from a
+/// complete one. That is the same fail-open as before, one level in — a
+/// partial spool still reads as "this session has no socket".
+fn spool_entry_paths<I>(entries: I) -> std::io::Result<Vec<PathBuf>>
+where
+    I: IntoIterator<Item = std::io::Result<fs::DirEntry>>,
+{
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        let is_spool_entry = path.extension().and_then(|ext| ext.to_str()) == Some("json")
+            && !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .starts_with('.');
+        if is_spool_entry {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+/// WHEN a hook was received, or nothing.
+///
+/// Two answers are refused, and neither may fall back to the processing
+/// clock. `now` is the NEWEST time there is, so handing it to an entry means
+/// handing that entry authority over the session's status, its prompt and
+/// its reply route — the strongest claim in the system, given away to the
+/// entry that made the weakest case for it.
+///
+///   * AHEAD OF THE CLOCK. The stamp is written by the hook process and read
+///     by the daemon a cycle later, and the two need not agree — a step
+///     between them, or a machine that is simply wrong. A time that has not
+///     happened is not a time. The file name is checked first, since it
+///     carries the same instant written independently.
+///   * MISSING, NULL, OR NOT A NUMBER. An entry that does not follow the
+///     protocol has said nothing about when it arrived, and "said nothing"
+///     is not "said now".
+///
+/// `None` means the entry cannot be placed in time. Callers keep it rather
+/// than delete it, and refuse to answer socket questions while it is there:
+/// its own hook may be the one that matters.
+fn normalized_received_at(envelope: &Value, now: u64, path: &Path) -> Placement {
+    let claimed = envelope.get("receivedAt").and_then(Value::as_u64);
+    if let Some(claimed) = claimed.filter(|claimed| *claimed <= now) {
+        return Placement::At(claimed);
+    }
+    // The SAME second chance for every unusable body, not just an impossible
+    // one. Missing, null, a string, or a time that has not happened all mean
+    // the same thing here — the body cannot say when this arrived — and the
+    // name was written from that instant by the same process, in a form
+    // nothing since has had a chance to edit.
+    let from_name = received_at_from_spool_name(path);
+    if let Some(from_name) = from_name.filter(|from_name| *from_name <= now) {
+        eprintln!(
+            "tinyctb: hook spool entry {} does not carry a usable `receivedAt` ({}); using \
+             {from_name} from its name instead",
+            path.display(),
+            envelope
+                .get("receivedAt")
+                .map_or_else(|| "absent".to_string(), |value| value.to_string())
+        );
+        return Placement::At(from_name);
+    }
+    // BOTH stamps are structurally fine and both are ahead of the clock.
+    // That is not an entry nobody can place — it is an entry nobody can
+    // place YET, and the two were treated alike: a single clock correction
+    // sent real hooks to the dead letter box for good, taking their
+    // notifications and their socket with them. It waits instead.
+    match claimed.or(from_name) {
+        Some(due) => Placement::NotYet(due),
+        None => {
+            eprintln!(
+                "tinyctb: hook spool entry {} cannot be placed in time by its body or its name",
+                path.display()
+            );
+            Placement::Never
+        }
+    }
+}
+
+/// What could be learned about WHEN an entry arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// A time the clock has already reached.
+    At(u64),
+    /// A well-formed time that has not arrived yet. The entry is real and
+    /// will be ordinary as soon as the clock gets there — a rolled-back
+    /// clock is the usual reason, and it rolls forward again.
+    NotYet(u64),
+    /// Neither the body nor the name says anything usable. No amount of
+    /// waiting changes that.
+    Never,
+}
+
+/// Where entries that are merely EARLY wait for the clock to reach them.
+/// Out of the queue so they cannot hold its window, and checked at the top of
+/// every cycle so nothing waits longer than it has to.
+pub(crate) fn spool_future_dir() -> Result<PathBuf> {
+    Ok(events_spool_dir()?.join("future"))
+}
+
+/// Where entries that cannot be placed in time go to stop being in the way.
+///
+/// LEAVING them was a slow poison. Each cycle reads the oldest bounded number
+/// of entries, and an entry that is never placed is never released — so a
+/// few hundred of them fill that window permanently, and every real hook
+/// behind them waits forever while the cycle reports the same files consumed
+/// over and over.
+pub(crate) fn spool_dead_letter_dir() -> Result<PathBuf> {
+    Ok(events_spool_dir()?.join("unplaceable"))
+}
+
+/// Bring back every entry whose time the clock has now reached.
+pub(crate) fn requeue_due_future_entries(now: u64) -> Result<usize> {
+    let dir = spool_future_dir()?;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("failed to list parked hooks at {}", dir.display())))
+        }
+    };
+    let spool = events_spool_dir()?;
+    let mut returned = 0usize;
+    for path in spool_entry_paths(entries)? {
+        let due = received_at_from_spool_name(&path);
+        // The name is the only stamp out here that can be trusted to sort,
+        // and a parked entry keeps the name it came in with. One that cannot
+        // be read at all is not going to become readable: it belongs with
+        // the entries nothing can place.
+        match due {
+            Some(due) if due > now => continue,
+            Some(_) => {}
+            None => {
+                set_aside_unplaceable_entry(&path)?;
+                continue;
+            }
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        fs::rename(&path, spool.join(name)).with_context(|| {
+            format!(
+                "failed to return parked hook {} to the queue",
+                path.display()
+            )
+        })?;
+        returned += 1;
+    }
+    if returned > 0 {
+        eprintln!(
+            "tinyctb: returned {returned} parked hook(s) to the queue; the clock reached them"
+        );
+    }
+    Ok(returned)
+}
+
+/// Park an entry that is only EARLY. It keeps its name, which is what says
+/// when it is due.
+fn park_future_entry(path: &Path, due: u64) -> Result<()> {
+    let dir = spool_future_dir()?;
+    fs::create_dir_all(&dir)?;
+    let name = path
+        .file_name()
+        .map(|name| name.to_owned())
+        .unwrap_or_else(|| std::ffi::OsString::from("entry.json"));
+    let target = dir.join(name);
+    fs::rename(path, &target).with_context(|| {
+        format!(
+            "failed to park early hook spool entry {} until {due}",
+            path.display()
+        )
+    })?;
+    eprintln!(
+        "tinyctb: hook spool entry {} is stamped {due}, ahead of the clock; parked until the \
+         clock reaches it",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Move an entry out of the queue without destroying it: it is a real hook,
+/// it is simply not one anything here can order. It stays on disk, under a
+/// name that says why, for whoever comes looking.
+fn set_aside_unplaceable_entry(path: &Path) -> Result<()> {
+    let dir = spool_dead_letter_dir()?;
+    fs::create_dir_all(&dir)?;
+    let name = path
+        .file_name()
+        .map(|name| name.to_owned())
+        .unwrap_or_else(|| std::ffi::OsString::from("entry.json"));
+    let target = dir.join(name);
+    // Same filesystem, so a rename is atomic: the entry is never in both
+    // places and never in neither.
+    fs::rename(path, &target).with_context(|| {
+        format!(
+            "failed to set aside unplaceable hook spool entry {}",
+            path.display()
+        )
+    })?;
+    eprintln!(
+        "tinyctb: moved unplaceable hook spool entry to {}; it is out of the queue and still on \
+         disk",
+        target.display()
+    );
+    Ok(())
+}
+
+/// The leading field of `{received_at:015}-{pid}-{event}.json`, and only when
+/// it is exactly that: fifteen digits, nothing else. A loose parse would let
+/// any file name in the spool dictate an ordering.
+fn received_at_from_spool_name(path: &Path) -> Option<u64> {
+    let stem = path.file_name().and_then(|name| name.to_str())?;
+    let (digits, _) = stem.split_once('-')?;
+    if digits.len() != 15 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 #[derive(Debug, Clone)]
@@ -923,6 +1437,53 @@ fn session_socket_from_envelope(envelope: &Value) -> Option<SessionSocket> {
 /// reply that arrives in the same cycle as the session's first hook event
 /// must already see the mapping, otherwise it would fall back to a headless
 /// `--resume` and fork the very session we can now deliver into.
+/// Settle every route whose doubt can be settled from the filesystem, and
+/// report how many are left in question.
+///
+/// Waiting for "the next hook" to vouch for a route was a DEADLOCK, and it
+/// closed on precisely the session that needed the reply most: one stopped
+/// at a prompt produces no further hook until it is answered, its answer was
+/// being held until a hook arrived, and holding was global — so one waiting
+/// session stopped every reply in the bridge. A leftover socket file did the
+/// same thing with nobody behind it at all.
+///
+/// The way out was already on the row. A recorded inode and boot id are what
+/// was seen at the time; if the path still answers to both, this IS that
+/// socket — the only thing that was ever in doubt was the timestamp beside
+/// it. That settles it without anyone having to speak first. A path that is
+/// gone, or that now answers to a different identity, settles it the other
+/// way: the route is dropped and a reply falls back honestly.
+///
+/// What is left over is a route with no identity recorded to check against —
+/// rows from before that was stored. Those stay in question, and the reply
+/// path deals with each one where it is: it may try the socket, and it may
+/// not fall back to spawning a second session if that fails.
+pub(crate) fn clear_resolved_socket_quarantines(conn: &Connection) -> Result<usize> {
+    let mut unresolved = 0usize;
+    for (thread_id, socket) in crate::state::unverified_socket_routes(conn)? {
+        let (Some(inode), Some(boot)) = (socket.inode, socket.boot_id.as_deref()) else {
+            // Nothing recorded to check against. Presence alone proves only
+            // that A socket is there, not that it is this one.
+            if Path::new(&socket.path).exists() {
+                unresolved += 1;
+            } else {
+                crate::state::forget_unverified_socket_route(conn, &thread_id)?;
+            }
+            continue;
+        };
+        let (current_inode, current_boot) = socket_identity(&socket.path);
+        if Path::new(&socket.path).exists()
+            && current_inode == Some(inode)
+            && current_boot.as_deref() == Some(boot)
+        {
+            crate::state::vouch_for_socket_route(conn, &thread_id)?;
+        } else {
+            crate::state::forget_unverified_socket_route(conn, &thread_id)?;
+        }
+    }
+    Ok(unresolved)
+}
+
 pub(crate) fn peek_session_sockets(conn: &Connection, now: u64) -> Result<usize> {
     // Same file selection as ingestion (sorted, .json only, no temp files,
     // bounded per cycle) so a large backlog cannot make this unbounded. The
@@ -933,12 +1494,27 @@ pub(crate) fn peek_session_sockets(conn: &Connection, now: u64) -> Result<usize>
     if files.len() > MAX_SPOOL_EVENTS_PER_CYCLE {
         files = files.split_off(files.len() - MAX_SPOOL_EVENTS_PER_CYCLE);
     }
-    let mut latest: BTreeMap<String, SessionSocket> = BTreeMap::new();
+    let mut latest: BTreeMap<String, (SessionSocket, u64)> = BTreeMap::new();
     for path in files {
-        let Some(envelope) = fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        else {
+        // The same distinction ingestion makes, and for the same reason: a
+        // read that failed may well succeed next cycle and says nothing
+        // about the queue, while malformed JSON is a fact about that one
+        // file. Collapsing them into `.ok()` turned a transient error into
+        // the confident claim that a session has no socket.
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "failed to read hook spool entry {} while looking for session sockets",
+                    path.display()
+                )))
+            }
+        };
+        let Ok(envelope) = serde_json::from_str::<Value>(&raw) else {
+            eprintln!(
+                "tinyctb: hook spool entry {} is not valid JSON; ignoring it for socket lookup",
+                path.display()
+            );
             continue;
         };
         let session_id = envelope
@@ -948,33 +1524,68 @@ pub(crate) fn peek_session_sockets(conn: &Connection, now: u64) -> Result<usize>
         if session_id.is_empty() || session_id == "unknown" {
             continue;
         }
+        // Fail CLOSED. This entry may be the one that moved the session's
+        // socket, and an answer that silently leaves it out is the confident
+        // "no mapping" that sends a reply into a headless fork. An entry that
+        // is merely early is no different here: it is in the spool, it is
+        // real, and nothing about it is known yet.
+        let Placement::At(received_at) = normalized_received_at(&envelope, now, &path) else {
+            return Err(anyhow::anyhow!(
+                "hook spool entry {} cannot be placed in time; the socket picture is incomplete",
+                path.display()
+            ));
+        };
         if let Some(socket) = session_socket_from_envelope(&envelope) {
-            latest.insert(session_id.to_string(), socket);
+            latest.insert(session_id.to_string(), (socket, received_at));
         }
     }
-    for (session_id, socket) in &latest {
-        crate::state::record_session_messaging_socket(conn, session_id, socket, now)?;
+    for (session_id, (socket, received_at)) in &latest {
+        crate::state::record_session_messaging_socket(conn, session_id, socket, *received_at, now)?;
     }
     Ok(latest.len())
 }
 
-pub(crate) fn ingest_spool_events(
-    now: u64,
-) -> Result<(
+/// Hook events read out of the spool, plus the FILES they came from.
+///
+/// The files are handed back rather than deleted here. A spool entry is the
+/// only copy of a hook until everything it causes is durable — the row, the
+/// derived events, and the outbound queue that turns them into a phone
+/// notification. Deleting it at parse time made the delivery marker's
+/// rollback pointless: the marker went back, and the input it would have
+/// been re-derived from was already gone.
+type SpoolIngest = (
     Vec<BridgeThreadSnapshot>,
-    BTreeMap<String, SessionSocket>,
+    // The socket each session was last seen listening on, WITH the time that
+    // sighting was made: the mapping is only as current as its observation.
+    BTreeMap<String, (SessionSocket, u64)>,
     usize,
-)> {
+    // The entries this cycle is holding, to be released once its effects are
+    // durable.
+    Vec<PathBuf>,
+);
+
+pub(crate) fn ingest_spool_events(now: u64) -> Result<SpoolIngest> {
+    // Whatever was only EARLY last time may be due now. The daemon does this
+    // before its socket peek as well — an entry that comes due this cycle may
+    // be a session's FIRST hook, and the reply lane runs first — but doing it
+    // again here costs a `read_dir` and keeps every other caller correct.
+    requeue_due_future_entries(now)?;
     let mut files = spool_event_files()?;
     files.truncate(MAX_SPOOL_EVENTS_PER_CYCLE);
 
     let mut consumed = 0usize;
-    let mut sockets: BTreeMap<String, SessionSocket> = BTreeMap::new();
-    // Snapshots that already carry a completed answer and were about to be
-    // overwritten by a later event in the same batch. Flushing them keeps
-    // every answer: two concurrent replies can both finish within one poll
-    // cycle, and a new turn can start right after an answer.
-    let mut completed: Vec<BridgeThreadSnapshot> = Vec::new();
+    let mut set_aside = 0usize;
+    let mut parked = 0usize;
+    // Held until the cycle's effects are durable, then unlinked by the caller.
+    let mut held: Vec<PathBuf> = Vec::new();
+    let mut sockets: BTreeMap<String, (SessionSocket, u64)> = BTreeMap::new();
+    // Snapshots about to be overwritten by a later event in the same batch,
+    // whose EFFECT must survive the overwrite even though their state does
+    // not. Two of them: an answer that already completed (two concurrent
+    // replies can both finish within one poll cycle, and a new turn can
+    // start right after an answer), and a question the replacing hook cannot
+    // be shown to postdate.
+    let mut carried: Vec<BridgeThreadSnapshot> = Vec::new();
     let mut by_session: BTreeMap<String, BridgeThreadSnapshot> = BTreeMap::new();
     for path in files {
         // The spool file name ({receivedAt}-{pid}-{event}) is unique even for
@@ -983,20 +1594,44 @@ pub(crate) fn ingest_spool_events(
             .file_stem()
             .and_then(|stem| stem.to_str())
             .map(str::to_string);
-        let parsed: Option<Value> = fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok());
-        // Consume the file regardless: a malformed spool entry must not wedge
-        // the loop forever. This is loud in the daemon log via consumed count.
-        let _ = fs::remove_file(&path);
+        // An I/O failure and a parse failure are NOT the same thing. A
+        // malformed entry can never succeed and must go, or it wedges the
+        // loop forever; a read that failed — EMFILE, a permissions blip, a
+        // mount going away — may well succeed next cycle, and deleting it
+        // loses a real hook. Merging them meant one transient error was
+        // enough to destroy the only copy.
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                eprintln!(
+                    "tinyctb: could not read hook spool entry {} ({error}); keeping it for the \
+                     next cycle",
+                    path.display()
+                );
+                continue;
+            }
+        };
         consumed += 1;
-        let Some(envelope) = parsed else {
-            eprintln!(
-                "tinyctb: discarded malformed hook spool entry {}",
-                path.display()
-            );
+        let Ok(envelope) = serde_json::from_str::<Value>(&raw) else {
+            // Malformed: delete it NOW. It can never succeed, and re-reading
+            // it every cycle would wedge the loop forever. A failure to
+            // delete is loud — it means this entry will be parsed again.
+            match fs::remove_file(&path) {
+                Ok(()) => eprintln!(
+                    "tinyctb: discarded malformed hook spool entry {}",
+                    path.display()
+                ),
+                Err(error) => eprintln!(
+                    "tinyctb: could not discard malformed hook spool entry {} ({error}); it will \
+                     be parsed again next cycle",
+                    path.display()
+                ),
+            }
             continue;
         };
+        // Readable: this cycle is now responsible for it, and the file stays
+        // until everything it causes has been committed.
+        held.push(path.clone());
         let event_name = envelope
             .get("hookEventName")
             .and_then(Value::as_str)
@@ -1010,13 +1645,43 @@ pub(crate) fn ingest_spool_events(
         if session_id.is_empty() || session_id == "unknown" {
             continue;
         }
+        // Kept, not consumed: the entry is real, and a later cycle — or a
+        // human reading the log — may still be able to place it. Taking its
+        // socket or its state on `now` would give the weakest evidence in
+        // the spool the strongest authority in the system.
+        let received_at = match normalized_received_at(&envelope, now, &path) {
+            Placement::At(received_at) => received_at,
+            // Off the release list — releasing means deleting — and out of
+            // the queue, which is the part that matters: left where it was,
+            // either of these would hold its place in the oldest-first
+            // window and starve every real hook behind it.
+            //
+            // Read, but not CONSUMED either: nothing was taken from it, and
+            // counting it reported the same files as processed cycle after
+            // cycle while the queue behind them never moved. Counted only
+            // once the move has actually happened — a failed move leaves the
+            // entry exactly where it was doing the starving, which is not a
+            // thing to report as success.
+            placement => {
+                let released = held.pop();
+                debug_assert_eq!(released.as_ref(), Some(&path));
+                consumed -= 1;
+                match placement {
+                    Placement::NotYet(due) => {
+                        park_future_entry(&path, due)?;
+                        parked += 1;
+                    }
+                    _ => {
+                        set_aside_unplaceable_entry(&path)?;
+                        set_aside += 1;
+                    }
+                }
+                continue;
+            }
+        };
         if let Some(socket) = session_socket_from_envelope(&envelope) {
-            sockets.insert(session_id.clone(), socket);
+            sockets.insert(session_id.clone(), (socket, received_at));
         }
-        let received_at = envelope
-            .get("receivedAt")
-            .and_then(Value::as_u64)
-            .unwrap_or(now);
         let payload = envelope.get("payload").cloned().unwrap_or(Value::Null);
         let transcript_path = payload
             .get("transcript_path")
@@ -1031,7 +1696,7 @@ pub(crate) fn ingest_spool_events(
             });
         let summary = transcript_path
             .as_deref()
-            .and_then(|path| parse_transcript_summary(path).ok())
+            .and_then(|path| parse_transcript_summary(path, now).ok())
             .unwrap_or_default();
         let payload_cwd = payload
             .get("cwd")
@@ -1051,10 +1716,26 @@ pub(crate) fn ingest_spool_events(
             event_name.as_str(),
             "Stop" | "Notification" | "SessionStart"
         ) {
-            if let Some(previous) =
-                base.take_if(|previous| previous.last_turn_status.as_deref() == Some("completed"))
-            {
-                completed.push(previous);
+            // What survives being replaced within one batch. A finished turn
+            // always did: its completion happened and is still owed.
+            //
+            // A PENDING QUESTION now does too, when the hook about to replace
+            // it is not strictly newer. The tie rule upstream decides which
+            // snapshot the ROW ends up as; it never got a say here, because
+            // this collapse ran first and simply dropped the question — so a
+            // Stop and a Notification stamped the same millisecond came out
+            // as the Stop alone, whichever of them actually came first. The
+            // spool cannot break that tie (its file names carry a pid, not a
+            // sequence), and of the two mistakes only one is unrecoverable:
+            // an extra notification can be ignored, a question that was never
+            // announced is never announced. So the question keeps its effect,
+            // and the later snapshot still decides what the row says.
+            if let Some(previous) = base.take_if(|previous| {
+                previous.last_turn_status.as_deref() == Some("completed")
+                    || (previous.pending_prompt.is_some()
+                        && previous.updated_at.is_some_and(|at| at >= received_at))
+            }) {
+                carried.push(previous);
             }
         }
         let snapshot = match event_name.as_str() {
@@ -1132,19 +1813,33 @@ pub(crate) fn ingest_spool_events(
         };
         by_session.insert(session_id, snapshot);
     }
-    // Flushed completed snapshots first (chronologically earlier), then the
+    // Carried snapshots first (chronologically earlier), then the
     // final per-session state, so later upserts win in the DB.
-    completed.extend(by_session.into_values());
-    Ok((completed, sockets, consumed))
+    carried.extend(by_session.into_values());
+    if set_aside > 0 {
+        eprintln!(
+            "tinyctb: {set_aside} hook spool entr(ies) could not be placed in time and were set \
+             aside; they are not counted as consumed"
+        );
+    }
+    if parked > 0 {
+        eprintln!(
+            "tinyctb: {parked} hook spool entr(ies) are stamped ahead of the clock and are \
+             waiting for it; they are not counted as consumed"
+        );
+    }
+    Ok((carried, sockets, consumed, held))
 }
 
 // ---------------------------------------------------------------------------
 // Sync
 
-fn existing_thread_state(
-    conn: &Connection,
-    thread_id: &str,
-) -> Result<(Option<String>, Option<PendingPrompt>)> {
+/// The row's hook-owned state as the scan finds it: the turn status it will
+/// echo back into its result, and the prompt row with the INSTANCE identity a
+/// resolution has to name.
+type ExistingThreadState = (Option<String>, Option<(PendingPrompt, i64)>);
+
+fn existing_thread_state(conn: &Connection, thread_id: &str) -> Result<ExistingThreadState> {
     use rusqlite::OptionalExtension;
     let last_turn_status: Option<String> = conn
         .query_row(
@@ -1154,13 +1849,14 @@ fn existing_thread_state(
         )
         .optional()?
         .flatten();
-    let pending: Option<PendingPrompt> = conn
+    let pending: Option<(PendingPrompt, i64)> = conn
         .query_row(
-            "SELECT prompt_id, prompt_kind, prompt_status, question, transcript_bytes, notification_type
+            "SELECT prompt_id, prompt_kind, prompt_status, question, transcript_bytes, notification_type, revision
              FROM pending_prompts WHERE thread_id = ?1",
             params![thread_id],
             |row| {
-                Ok(PendingPrompt {
+                Ok((
+                    PendingPrompt {
                     prompt_id: row.get(0)?,
                     kind: row.get(1)?,
                     status: row.get(2)?,
@@ -1174,7 +1870,9 @@ fn existing_thread_state(
                     },
                     transcript_bytes: row.get::<_, Option<i64>>(4)?.map(|bytes| bytes as u64),
                     notification_type: row.get(5)?,
-                })
+                    },
+                    row.get(6)?,
+                ))
             },
         )
         .optional()?;
@@ -1197,9 +1895,9 @@ pub(crate) fn sync_state_from_sessions(
     limit: u64,
     record_deliveries: bool,
 ) -> Result<Value> {
-    let (hook_snapshots, sockets, consumed) = ingest_spool_events(now)?;
-    for (session_id, socket) in &sockets {
-        crate::state::record_session_messaging_socket(conn, session_id, socket, now)?;
+    let (hook_snapshots, sockets, consumed, held_spool_entries) = ingest_spool_events(now)?;
+    for (session_id, (socket, received_at)) in &sockets {
+        crate::state::record_session_messaging_socket(conn, session_id, socket, *received_at, now)?;
     }
     let hook_thread_ids = hook_snapshots
         .iter()
@@ -1222,17 +1920,53 @@ pub(crate) fn sync_state_from_sessions(
         if hook_thread_ids.contains(&info.session_id) {
             continue;
         }
-        let mut snapshot = scan_snapshot(&info);
+        let (mut snapshot, source) = scan_snapshot(&info, now);
+        let Some((source, read_from)) = source else {
+            // The file changed while it was being read, so this answer
+            // belongs to no state of it. Filing it would put a reading of
+            // one file under the identity of another.
+            continue;
+        };
         let (last_turn_status, pending) = existing_thread_state(conn, &info.session_id)?;
         snapshot.last_turn_status = last_turn_status;
         // Without this check an answered dialog stayed "pending" until the
         // turn's Stop — for a long agentic turn that meant /threads pinning
         // a phantom "waiting on you" for hours (measured live 2026-08-15:
         // it talked a user into killing an active session).
-        snapshot.pending_prompt =
-            pending.filter(|prompt| !prompt_resolved_in_transcript(prompt, &info.path));
-        upsert_thread_snapshot(conn, &snapshot, now)?;
-        threads.push(thread_snapshot_json(&snapshot));
+        //
+        // What the scan may act on is THIS prompt and no other: it read it,
+        // it checked the transcript, it found it answered. A prompt written
+        // since is none of its business.
+        let resolved = pending
+            .as_ref()
+            .filter(|(prompt, _)| prompt_resolved_in_transcript(prompt, &info.path))
+            .map(|(_, revision)| *revision);
+        snapshot.pending_prompt = pending
+            .filter(|_| resolved.is_none())
+            .map(|(prompt, _)| prompt);
+        // Is the file STILL the one this answer came from? Ordering two
+        // readings inside the write could not settle it — two inodes have no
+        // order between them — so the question is asked of the disk, and
+        // asked INSIDE the write transaction: between an unlocked check and
+        // an unlocked write another writer could commit a newer reading and
+        // have it overwritten by this one, already known to be stale.
+        let path = info.path.clone();
+        let still_current = move || file_unchanged_since(&path, read_from);
+        // A REFUSED write is not a synced thread. The snapshot in hand
+        // describes a file that has already moved; reporting it would hand
+        // the caller, and the count, a reading the database just threw away.
+        if upsert_thread_snapshot(
+            conn,
+            &snapshot,
+            now,
+            source,
+            resolved,
+            Some(&still_current),
+            None,
+        )? == crate::state::SnapshotWrite::Applied
+        {
+            threads.push(thread_snapshot_json(&snapshot));
+        }
     }
 
     let mut result = json!({
@@ -1270,6 +2004,22 @@ pub(crate) fn sync_state_from_sessions(
         }
     }
     let enqueued = crate::daemon::enqueue_daemon_notification_events(conn, &notifiable, now)?;
+    // ONLY NOW. Until this point each spool entry is the one copy of its
+    // hook: the row, the derived events and the outbound queue all had to
+    // commit first. Deleting at parse time meant a failed enqueue rolled the
+    // delivery marker back correctly and still lost the notification, because
+    // the input it would have been re-derived from was already gone.
+    for path in held_spool_entries {
+        if let Err(error) = fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "tinyctb: could not release hook spool entry {} ({error}); it will be read \
+                     again next cycle",
+                    path.display()
+                );
+            }
+        }
+    }
     if let Some(object) = result.as_object_mut() {
         object.insert("enqueued".to_string(), json!(enqueued));
     }
@@ -3392,7 +4142,7 @@ pub(crate) fn send_user_message(
         find_session_file(session_id)
             .ok()
             .flatten()
-            .and_then(|info| parse_transcript_summary(&info.path).ok())
+            .and_then(|info| parse_transcript_summary(&info.path, now).ok())
             .and_then(|summary| summary.cwd)
     });
     // The random suffix keeps turn ids unique even for two replies to the
@@ -3673,6 +4423,1253 @@ pub(crate) fn start_claude_watch_receiver() -> Result<ClaudeWatchReceiver> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stamp parser, against the shape Claude Code actually writes and
+    /// against everything it must refuse: a wrong time in the ordering is
+    /// worse than the `None` that falls back to the file mtime.
+    #[test]
+    fn transcript_stamps_parse_strictly_and_only_in_utc() {
+        assert_eq!(transcript_timestamp_ms("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(transcript_timestamp_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            transcript_timestamp_ms("1970-01-02T00:00:00Z"),
+            Some(86_400_000)
+        );
+        // A leap day, and the day after it, walked by hand.
+        assert_eq!(
+            transcript_timestamp_ms("2024-03-01T00:00:00Z").unwrap()
+                - transcript_timestamp_ms("2024-02-29T00:00:00Z").unwrap(),
+            86_400_000
+        );
+        // The record that started this: 2026-08-12T13:32:34.162Z.
+        let stamp = transcript_timestamp_ms("2026-08-12T13:32:34.162Z").expect("valid");
+        assert_eq!(stamp % 1_000, 162, "millis are kept");
+        let day = transcript_timestamp_ms("2026-08-12T00:00:00Z").expect("valid");
+        assert_eq!(stamp - day, (13 * 3_600 + 32 * 60 + 34) * 1_000 + 162);
+        // Ordering across a month boundary, which the civil-day arithmetic
+        // is the only thing standing behind.
+        assert!(
+            transcript_timestamp_ms("2026-09-01T00:00:00Z")
+                > transcript_timestamp_ms("2026-08-31T23:59:59Z")
+        );
+        // The leap day that DOES exist still parses, so the calendar check
+        // rejects the impossible rather than everything unusual.
+        assert!(transcript_timestamp_ms("2024-02-29T12:00:00Z").is_some());
+        assert!(transcript_timestamp_ms("2000-02-29T12:00:00Z").is_some());
+        assert!(transcript_timestamp_ms("1900-02-29T12:00:00Z").is_none());
+        for refused in [
+            "",
+            "2026-08-12",
+            // Dates that do not exist, which a 1..=31 range check waved
+            // through and which would then order as real times.
+            "2026-02-31T00:00:00Z",
+            "2026-02-29T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2026-00-10T00:00:00Z",
+            "2026-08-00T00:00:00Z",
+            // Not fixed width, and signs inside components.
+            "2026-8-2T1:2:3Z",
+            "2026-08-12T-1:00:00Z",
+            "2026-08-12T00:-1:00Z",
+            "202-08-12T00:00:00Z",
+            // A leap second lands ahead of the next day's first record.
+            "2026-08-12T23:59:60Z",
+            // Extreme years must return None, never wrap or panic.
+            "999999-08-12T00:00:00Z",
+            "0000-01-01T00:00:00Z",
+            "2026-08-12T13:32:34",       // no zone: not ours to guess
+            "2026-08-12T13:32:34+08:00", // an offset we do not convert
+            "2026-08-12T13:32:34.1Z",    // not the three-digit shape
+            "2026-08-12T13:32:34.162162Z",
+            "2026-13-12T00:00:00Z", // month out of range
+            "2026-08-32T00:00:00Z",
+            "2026-08-12T24:00:00Z",
+            "2026-08-12T13:32:34.abcZ",
+            "yesterday",
+        ] {
+            assert_eq!(
+                transcript_timestamp_ms(refused),
+                None,
+                "must refuse {refused:?} rather than guess"
+            );
+        }
+    }
+
+    /// A transient READ failure is not a malformed entry. Merging the two
+    /// meant one permissions blip, one EMFILE, one mount going away, and the
+    /// only copy of a real hook was deleted.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_spool_entry_is_kept_while_a_malformed_one_is_dropped() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-unread-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("events")).expect("spool dir");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+
+        // Malformed: it can never succeed, so it goes.
+        let malformed = root.join("events").join("1000-1-Stop.json");
+        fs::write(&malformed, "{ not json").expect("write");
+        let (_, _, consumed, held) = ingest_spool_events(2_000).expect("ingest");
+        assert_eq!(consumed, 1);
+        assert!(held.is_empty(), "a malformed entry is not held");
+        assert!(!malformed.exists(), "and does not wedge the loop");
+
+        // Unreadable: a real file with no read permission — `read_to_string`
+        // fails with an I/O error rather than a parse error.
+        let unreadable = root.join("events").join("2000-1-Stop.json");
+        fs::write(
+            &unreadable,
+            json!({"hookEventName": "Stop", "sessionId": "sess-unread", "receivedAt": 2000})
+                .to_string(),
+        )
+        .expect("write");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).expect("chmod");
+        }
+        let (_, _, consumed, held) = ingest_spool_events(3_000).expect("ingest");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600));
+        }
+        assert_eq!(consumed, 0, "an unreadable entry is not consumed");
+        assert!(held.is_empty());
+        assert!(
+            unreadable.exists(),
+            "and is left for the next cycle rather than deleted"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The same file, rewritten to the same LENGTH. That is what an
+    /// append-and-truncate or a restore looks like, and against a key of
+    /// (milliseconds, size) it matched exactly — the stale summary was then
+    /// served forever, so the row could never be corrected again however the
+    /// file changed. The earlier tests dodged this shape by using a
+    /// different file per case; this one meets it head on.
+    #[test]
+    fn a_same_length_rewrite_is_not_served_from_the_cache() {
+        let dir = std::env::temp_dir().join(format!("tinyctb-rewrite-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("rewritten.jsonl");
+        let line = |stamp: &str| {
+            format!(
+                "{{\"type\":\"user\",\"timestamp\":\"{stamp}\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n"
+            )
+        };
+        let first = "2026-08-12T13:32:34.162Z";
+        let second = "2026-08-11T09:00:00.000Z";
+        assert_eq!(
+            line(first).len(),
+            line(second).len(),
+            "the fixture is only meaningful if both writes are the same length"
+        );
+        let now = transcript_timestamp_ms("2026-08-20T00:00:00.000Z").expect("clock");
+
+        // The two writes are pinned to timestamps HALF A MILLISECOND apart.
+        // Waiting for the machine to be fast enough would make this a race;
+        // stating the interval makes it the property under test — a key with
+        // millisecond granularity cannot tell these apart, and one with
+        // nanoseconds can.
+        let base = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let stamp = |at: std::time::SystemTime| {
+            let file = fs::File::options().write(true).open(&path).expect("open");
+            file.set_modified(at).expect("set mtime");
+        };
+
+        fs::write(&path, line(first)).expect("write");
+        stamp(base);
+        assert_eq!(
+            parse_transcript_summary(&path, now)
+                .expect("parse")
+                .last_record_at,
+            transcript_timestamp_ms(first)
+        );
+
+        // Rewritten in place, same length, within the same millisecond.
+        fs::write(&path, line(second)).expect("rewrite");
+        stamp(base + Duration::from_micros(500));
+        assert_eq!(
+            parse_transcript_summary(&path, now)
+                .expect("parse")
+                .last_record_at,
+            transcript_timestamp_ms(second),
+            "a rewritten file is a different file to read, whatever its length"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The summary cache is keyed on the FILE, but the answer depends on the
+    /// clock: a record refused for being ahead of it is ordinary once the
+    /// clock arrives, and one accepted before a rollback is in the future
+    /// afterwards. Neither may be served from a cache that cannot see it.
+    #[test]
+    fn the_summary_cache_does_not_outlive_the_clock_it_was_built_against() {
+        let dir = std::env::temp_dir().join(format!("tinyctb-clockcache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let at = transcript_timestamp_ms("2026-08-12T13:32:34.162Z").expect("stamp");
+        let path = dir.join("later.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"user\",\"timestamp\":\"2026-08-12T13:32:34.162Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .expect("transcript");
+
+        // The clock is behind the record: refused, and remembered as refused.
+        let early = parse_transcript_summary(&path, at - 1).expect("parse");
+        assert_eq!(early.last_record_at, None);
+        assert_eq!(early.earliest_refused_future_at, Some(at));
+
+        // The clock catches up. The FILE has not changed, so the cache would
+        // hand back the refusal — it must re-read instead.
+        let later = parse_transcript_summary(&path, at + 1).expect("parse");
+        assert_eq!(
+            later.last_record_at,
+            Some(at),
+            "a record refused for being ahead of the clock counts once the clock arrives"
+        );
+
+        // And back the other way: after a rollback the accepted record is in
+        // the future, and must not be served from the cache either.
+        let rolled_back = parse_transcript_summary(&path, at - 1).expect("parse");
+        assert_eq!(
+            rolled_back.last_record_at, None,
+            "a stamp this clock cannot believe is not reported as fact"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// One record from 2099 must not hide every legitimate one behind it.
+    /// Taking the maximum first and clamping afterwards read as "now" on
+    /// every scan, for good — the same permanent-top-of-the-list failure,
+    /// arriving by a different door.
+    #[test]
+    fn a_single_future_record_does_not_hide_the_real_ones() {
+        let dir = std::env::temp_dir().join(format!("tinyctb-future-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let spoke_at = transcript_timestamp_ms("2026-08-12T13:32:34.162Z").expect("stamp");
+        let now = spoke_at + 60_000;
+        let path = dir.join("mixed.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"user\",\"timestamp\":\"2026-08-12T13:32:34.162Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n\
+             {\"type\":\"user\",\"timestamp\":\"2099-01-01T00:00:00.000Z\",\"message\":{\"role\":\"user\",\"content\":\"from the future\"}}\n",
+        )
+        .expect("transcript");
+
+        let summary = parse_transcript_summary(&path, now).expect("parse");
+        assert_eq!(
+            summary.last_record_at,
+            Some(spoke_at),
+            "an unbelievable stamp is refused per record, so the real one still counts"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The tie policy, through the door it actually comes in. Testing it on
+    /// `reconcile_thread_snapshots` alone missed that the batch is collapsed
+    /// per session FIRST: a Notification and a Stop stamped the same
+    /// millisecond came out as the Stop alone, so if the real order was
+    /// Stop-then-question and the pid ordering read the other way, the
+    /// question was never announced at all.
+    #[test]
+    fn a_question_and_an_answer_in_the_same_millisecond_both_get_out() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-tiebatch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("events")).expect("spool");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        let projects = root.join("projects");
+        fs::create_dir_all(&projects).expect("projects");
+        let _projects_seam =
+            crate::state::EnvVarGuard::set("TINYCTB_CLAUDE_PROJECTS_DIR", &projects);
+        let conn = create_state_db_in_memory().expect("db");
+        crate::state::set_setting_text(&conn, "away", "true").expect("away");
+
+        // Same millisecond, and the pid field decides the order they are
+        // read in — here putting the question first, which is exactly the
+        // arrangement that used to lose it.
+        fs::write(
+            root.join("events")
+                .join("000000001000000-111-Notification.json"),
+            json!({
+                "hookEventName": "Notification",
+                "sessionId": "sess-tie",
+                "receivedAt": 1_000u64,
+                "payload": {"message": "Claude needs your permission to run ls"}
+            })
+            .to_string(),
+        )
+        .expect("notification");
+        fs::write(
+            root.join("events").join("000000001000000-222-Stop.json"),
+            json!({
+                "hookEventName": "Stop",
+                "sessionId": "sess-tie",
+                "receivedAt": 1_000u64,
+                "payload": {"last_assistant_message": "做完了"}
+            })
+            .to_string(),
+        )
+        .expect("stop");
+
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        let result = sync_state_from_sessions(&conn, &config, 1_100, 10, false).expect("sync");
+        let kinds = result
+            .get("events")
+            .and_then(Value::as_array)
+            .expect("events")
+            .iter()
+            .filter_map(|event| event.get("type").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(
+            kinds.contains(&"thread_waiting"),
+            "the question must reach the phone even when an answer shares its millisecond, \
+             got {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"thread_completed"),
+            "and the answer must still go out too, got {kinds:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Setting an entry aside is the thing that unblocks the queue, so a
+    /// failure to do it is a failure of the cycle. It was counted before the
+    /// move and the error only printed: the poison stayed exactly where it
+    /// was, starving everything behind it, while the sync reported the
+    /// entries set aside and returned success.
+    #[test]
+    fn a_failed_set_aside_is_not_reported_as_success() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-noaside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("events")).expect("spool");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        // An ordinary file sitting exactly where the dead letters go.
+        fs::write(root.join("events").join("unplaceable"), "in the way").expect("blocker");
+        let entry = root.join("events").join("no-stamp-Notification.json");
+        fs::write(
+            &entry,
+            json!({
+                "hookEventName": "Notification",
+                "sessionId": "sess-stuck",
+                "payload": {"message": "Claude needs your permission to run ls"}
+            })
+            .to_string(),
+        )
+        .expect("entry");
+
+        assert!(
+            ingest_spool_events(1_000).is_err(),
+            "a queue that could not be cleared must not report a clean cycle"
+        );
+        assert!(
+            entry.exists(),
+            "and the entry is still there, which is precisely why it must be reported"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The queue reads the oldest bounded number of entries each cycle. An
+    /// entry that is never placed is never released, so enough of them hold
+    /// that window permanently and every real hook behind them waits forever
+    /// — while the cycle reports the same files consumed, over and over.
+    #[test]
+    fn unplaceable_entries_cannot_starve_the_hooks_behind_them() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-starve-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("events")).expect("spool");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+
+        // A full window of entries that can be placed by neither body nor
+        // name, and one real hook queued behind all of them.
+        for index in 0..MAX_SPOOL_EVENTS_PER_CYCLE {
+            fs::write(
+                root.join("events")
+                    .join(format!("not-a-stamp-{index:04}-Notification.json")),
+                json!({
+                    "hookEventName": "Notification",
+                    "sessionId": "sess-noise",
+                    "payload": {"message": "Claude needs your permission to run ls"}
+                })
+                .to_string(),
+            )
+            .expect("noise");
+        }
+        fs::write(
+            root.join("events").join("zzzz-real-Stop.json"),
+            json!({
+                "hookEventName": "Stop",
+                "sessionId": "sess-real",
+                "receivedAt": 900u64,
+                "payload": {"last_assistant_message": "做完了"}
+            })
+            .to_string(),
+        )
+        .expect("real hook");
+
+        let (snapshots, _, consumed, _) = ingest_spool_events(1_000).expect("first cycle");
+        assert_eq!(
+            consumed, 0,
+            "nothing was taken from any of them, so nothing may be reported as consumed"
+        );
+        assert!(
+            snapshots.is_empty(),
+            "the real hook is behind the window on this cycle"
+        );
+
+        // They are out of the queue, not destroyed.
+        assert_eq!(
+            fs::read_dir(spool_dead_letter_dir().expect("dir"))
+                .expect("read dead letters")
+                .count(),
+            MAX_SPOOL_EVENTS_PER_CYCLE,
+            "every one of them is still on disk, just not in the way"
+        );
+
+        // And the next cycle reaches what was behind them.
+        let (snapshots, _, consumed, held) = ingest_spool_events(1_100).expect("second cycle");
+        assert_eq!(consumed, 1);
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.thread_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sess-real"],
+            "a real hook must not wait behind entries nobody can order"
+        );
+        assert_eq!(held.len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An entry that follows no protocol still gets asked what time it is,
+    /// and `unwrap_or(now)` answered for it — with the NEWEST time there is.
+    /// That handed the weakest evidence in the spool the strongest authority
+    /// in the system: permission to rewrite status, raise a prompt, and move
+    /// the reply route.
+    #[test]
+    fn an_entry_that_cannot_be_placed_in_time_gets_no_authority() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-unplaced-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("events")).expect("spool");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        let conn = create_state_db_in_memory().expect("db");
+
+        for (name, envelope) in [
+            (
+                "no-stamp-a-Notification.json",
+                json!({
+                    "hookEventName": "Notification",
+                    "sessionId": "sess-noproto",
+                    "messagingSocket": "/run/user/1000/wrong.sock",
+                    "payload": {"message": "Claude needs your permission to run ls"}
+                }),
+            ),
+            (
+                "no-stamp-b-Notification.json",
+                json!({
+                    "hookEventName": "Notification",
+                    "sessionId": "sess-noproto",
+                    "receivedAt": "600",
+                    "payload": {"message": "Claude needs your permission to run ls"}
+                }),
+            ),
+            (
+                "no-stamp-c-Notification.json",
+                json!({
+                    "hookEventName": "Notification",
+                    "sessionId": "sess-noproto",
+                    "receivedAt": Value::Null,
+                    "payload": {"message": "Claude needs your permission to run ls"}
+                }),
+            ),
+        ] {
+            fs::write(root.join("events").join(name), envelope.to_string()).expect("entry");
+        }
+
+        // Fail CLOSED: one of these may be the entry that moved the socket,
+        // so the socket picture cannot be reported as complete.
+        assert!(
+            peek_session_sockets(&conn, 1_000).is_err(),
+            "an unplaceable entry makes the socket answer unsafe, not empty"
+        );
+
+        let (snapshots, sockets, consumed, held) = ingest_spool_events(1_000).expect("ingest");
+        assert!(
+            snapshots.is_empty(),
+            "nothing that cannot be placed in time may speak about a session"
+        );
+        assert!(
+            sockets.is_empty(),
+            "and none of them may move a reply route"
+        );
+        assert!(
+            held.is_empty(),
+            "nor be released, which would delete a real hook nobody could read again"
+        );
+        assert_eq!(
+            consumed, 0,
+            "and nothing was taken from them, so nothing may be reported as consumed"
+        );
+        // Out of the queue, still on disk.
+        for name in [
+            "no-stamp-a-Notification.json",
+            "no-stamp-b-Notification.json",
+            "no-stamp-c-Notification.json",
+        ] {
+            assert!(
+                !root.join("events").join(name).exists(),
+                "{name} must not keep its place in the queue"
+            );
+            assert!(
+                spool_dead_letter_dir().expect("dir").join(name).exists(),
+                "{name} must still exist to be looked at"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The name carries the same instant, written by the same process, in a
+    /// form nothing since could edit. When the body's stamp is impossible and
+    /// the name's is not, the name is simply the better copy.
+    #[test]
+    fn a_future_stamp_falls_back_to_the_name_before_giving_up() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-byname-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("events")).expect("spool");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        fs::write(
+            root.join("events").join("000000000000900-1-Stop.json"),
+            json!({
+                "hookEventName": "Stop",
+                "sessionId": "sess-byname",
+                "receivedAt": 9_000_000u64,
+                "payload": {"last_assistant_message": "做完了"}
+            })
+            .to_string(),
+        )
+        .expect("entry");
+
+        // And the same second chance for a body that says nothing at all:
+        // missing is no more placeable than impossible, and the name is no
+        // less of an answer in one case than the other.
+        fs::write(
+            root.join("events").join("000000000000800-1-Stop.json"),
+            json!({
+                "hookEventName": "Stop",
+                "sessionId": "sess-noname",
+                "payload": {"last_assistant_message": "也做完了"}
+            })
+            .to_string(),
+        )
+        .expect("entry with no stamp at all");
+
+        let (snapshots, _, _, _) = ingest_spool_events(1_000).expect("ingest");
+        let placed = snapshots
+            .iter()
+            .map(|snapshot| (snapshot.thread_id.as_str(), snapshot.updated_at))
+            .collect::<Vec<_>>();
+        assert!(
+            placed.contains(&("sess-byname", Some(900))),
+            "the name's stamp is believable and the body's is not: {placed:?}"
+        );
+        assert!(
+            placed.contains(&("sess-noname", Some(800))),
+            "a body that says nothing gets the same second chance: {placed:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ONE hook with a stamp from the future, and nothing after it. The
+    /// repair that waits for a second event never runs, so the session would
+    /// sit pinned at a time the clock has to reach — for a badly wrong stamp,
+    /// never. The stamp is corrected at the door instead.
+    #[test]
+    fn a_lone_hook_from_the_future_leaves_no_future_watermark() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-futurehook-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("events")).expect("spool");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        let projects = root.join("projects");
+        fs::create_dir_all(&projects).expect("projects");
+        let _projects_seam =
+            crate::state::EnvVarGuard::set("TINYCTB_CLAUDE_PROJECTS_DIR", &projects);
+        let conn = create_state_db_in_memory().expect("db");
+
+        fs::write(
+            root.join("events").join("000000009000000-1-Stop.json"),
+            json!({
+                "hookEventName": "Stop",
+                "sessionId": "sess-future",
+                "receivedAt": 9_000_000u64,
+                "messagingSocket": "/run/user/1000/future.sock",
+                "payload": {"last_assistant_message": "来自未来"}
+            })
+            .to_string(),
+        )
+        .expect("hook");
+
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        sync_state_from_sessions(&conn, &config, 1_000, 10, false).expect("sync");
+
+        let stamps: Option<(Option<i64>, Option<i64>)> = conn
+            .query_row(
+                "SELECT last_observed_at, socket_observed_at FROM threads_cache
+                 WHERE thread_id = 'sess-future'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })
+            .expect("query");
+        // The entry cannot be placed in time at all, so it writes nothing —
+        // no state, no route, and above all no stamp from a moment that has
+        // not happened, which would have frozen this session for as long as
+        // the clock took to reach it.
+        if let Some((observed, socket_seen)) = stamps {
+            assert!(
+                observed.is_none_or(|at| at <= 1_000),
+                "a hook cannot pin a session at a moment that has not happened, got {observed:?}"
+            );
+            assert!(
+                socket_seen.is_none_or(|at| at <= 1_000),
+                "nor pin its reply routing there, got {socket_seen:?}"
+            );
+        }
+        // Kept, not destroyed — and out of the queue, so it cannot hold its
+        // place in the window forever.
+        assert!(
+            !root
+                .join("events")
+                .join("000000009000000-1-Stop.json")
+                .exists(),
+            "an entry nobody can place must not keep its place in the queue"
+        );
+        assert!(
+            spool_future_dir()
+                .expect("dir")
+                .join("000000009000000-1-Stop.json")
+                .exists(),
+            "it is only EARLY, so it waits for the clock rather than being written off"
+        );
+
+        // And when the clock reaches it, it is an ordinary hook again.
+        let (snapshots, _, consumed, _) =
+            ingest_spool_events(9_000_001).expect("cycle with a caught-up clock");
+        assert_eq!(consumed, 1);
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.thread_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sess-future"],
+            "a clock correction must not cost a real hook"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `read_dir` succeeding says only that the directory OPENED. Each step
+    /// of the walk can still fail on its own, and dropping those silently
+    /// hands back a shorter list that no caller can tell from a complete
+    /// one — the same fail-open as before, one level in.
+    #[test]
+    fn a_directory_entry_that_fails_mid_walk_is_not_silently_dropped() {
+        let ok = |name: &str| -> std::io::Result<fs::DirEntry> {
+            let dir = std::env::temp_dir().join(format!("tinyctb-walk-{}", std::process::id()));
+            fs::create_dir_all(&dir).expect("dir");
+            fs::write(dir.join(name), "{}").expect("file");
+            fs::read_dir(&dir)
+                .expect("read_dir")
+                .filter_map(Result::ok)
+                .find(|entry| entry.file_name() == std::ffi::OsStr::new(name))
+                .map(Ok)
+                .expect("entry")
+        };
+
+        let complete = spool_entry_paths(vec![ok("1000-1-Stop.json")]).expect("all readable");
+        assert_eq!(complete.len(), 1);
+
+        let partial = spool_entry_paths(vec![
+            ok("1000-1-Stop.json"),
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        ]);
+        assert!(
+            partial.is_err(),
+            "a walk that could not finish must not be handed back as a finished one"
+        );
+        let dir = std::env::temp_dir().join(format!("tinyctb-walk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// "I could not look" is not "there is nothing there". The socket peek
+    /// answers a question a Telegram reply is about to act on, and acting on
+    /// a wrong "no socket" means a headless `--resume` that forks the
+    /// session — which nothing later can undo. So a read that FAILED must
+    /// surface as a failure. Malformed JSON is the other thing entirely: it
+    /// is a settled fact about one file, it will never parse, and treating
+    /// it as an outage would wedge replies forever.
+    #[test]
+    fn the_socket_peek_reports_ignorance_but_not_bad_json_as_failure() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-peekfail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let conn = create_state_db_in_memory().expect("db");
+
+        // 1. The spool cannot be listed at all — here because something else
+        //    is sitting where the directory belongs.
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        fs::write(root.join("events"), "not a directory").expect("blocker");
+        let listed = peek_session_sockets(&conn, 1_000);
+        assert!(
+            listed.is_err(),
+            "an unlistable spool must not be reported as an empty one"
+        );
+        fs::remove_file(root.join("events")).expect("unblock");
+
+        // 2. An entry that cannot be READ. Same rule: it may well read next
+        //    cycle, and until then the socket picture is unknown.
+        fs::create_dir_all(root.join("events")).expect("spool dir");
+        let unreadable = root.join("events").join("1000-1-Notification.json");
+        fs::write(&unreadable, "{}").expect("entry");
+        let mut perms = fs::metadata(&unreadable).expect("meta").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+        fs::set_permissions(&unreadable, perms).expect("chmod");
+        let read_failed = peek_session_sockets(&conn, 1_000);
+        let unreadable_is_an_error = read_failed.is_err();
+        let mut perms = fs::metadata(&unreadable).expect("meta").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o600);
+        fs::set_permissions(&unreadable, perms).expect("restore");
+        assert!(
+            unreadable_is_an_error,
+            "an unreadable entry leaves the socket picture unknown, and must say so"
+        );
+
+        // 3. Malformed JSON: readable, hopeless, and NOT an outage.
+        fs::write(&unreadable, "{ this is not json").expect("garbage");
+        assert_eq!(
+            peek_session_sockets(&conn, 1_000).expect("bad json is not a failure"),
+            0,
+            "a file that will never parse must not stall replies forever"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The mapping is only as current as the observation behind it. Hooks
+    /// arrive out of order, so a kept-over entry can name a socket the
+    /// session has already moved off — and routing a reply there is the
+    /// same fork this feature exists to prevent.
+    #[test]
+    fn a_late_hook_cannot_move_the_socket_back() {
+        let conn = create_state_db_in_memory().expect("db");
+        let socket = |name: &str| SessionSocket {
+            path: format!("/run/user/1000/{name}.sock"),
+            inode: None,
+            boot_id: None,
+        };
+        let stored = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT messaging_socket FROM threads_cache WHERE thread_id = 'sess-move'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row")
+        };
+
+        crate::state::record_session_messaging_socket(
+            &conn,
+            "sess-move",
+            &socket("new"),
+            2_000,
+            2_000,
+        )
+        .expect("current");
+        assert_eq!(stored(&conn).as_deref(), Some("/run/user/1000/new.sock"));
+
+        crate::state::record_session_messaging_socket(
+            &conn,
+            "sess-move",
+            &socket("old"),
+            1_000,
+            2_100,
+        )
+        .expect("late");
+        assert_eq!(
+            stored(&conn).as_deref(),
+            Some("/run/user/1000/new.sock"),
+            "an overtaken hook may not point replies at where the session used to listen"
+        );
+
+        crate::state::record_session_messaging_socket(
+            &conn,
+            "sess-move",
+            &socket("newer"),
+            3_000,
+            3_000,
+        )
+        .expect("newer");
+        assert_eq!(
+            stored(&conn).as_deref(),
+            Some("/run/user/1000/newer.sock"),
+            "and a genuinely newer sighting still moves it"
+        );
+    }
+
+    /// The spool entry is the ONE copy of a hook until everything it causes
+    /// is durable. Deleting it at parse time made the delivery marker's
+    /// rollback pointless: the marker went back and the input it would have
+    /// been re-derived from was already gone.
+    #[test]
+    fn a_spool_entry_outlives_the_parse_and_dies_only_after_the_enqueue() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-hold-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("events")).expect("spool dir");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        let entry = root.join("events").join("1000-1-Stop.json");
+        fs::write(
+            &entry,
+            json!({"hookEventName": "Stop", "sessionId": "sess-hold", "receivedAt": 1000})
+                .to_string(),
+        )
+        .expect("spool entry");
+
+        let (snapshots, _, consumed, held) = ingest_spool_events(2_000).expect("ingest");
+        assert_eq!(consumed, 1);
+        assert_eq!(snapshots.len(), 1, "the hook is read");
+        assert!(
+            entry.exists(),
+            "and its file is still there — nothing it causes is durable yet"
+        );
+        assert_eq!(held, vec![entry.clone()], "the cycle is holding it");
+
+        // A malformed entry is the exception: it can never succeed, and
+        // re-reading it every cycle would wedge the loop.
+        let malformed = root.join("events").join("2000-1-Stop.json");
+        fs::write(&malformed, "{ not json").expect("write");
+        let (_, _, consumed, held) = ingest_spool_events(3_000).expect("ingest");
+        assert_eq!(consumed, 2);
+        assert!(!malformed.exists(), "malformed goes at once");
+        assert_eq!(held, vec![entry], "and only the readable one is held");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A reading is only worth filing if it belongs to a KNOWN state of the
+    /// file. Taking the identity separately, after the parse, let a reader
+    /// stamp one file's contents with the identity of the file that replaced
+    /// it — an old answer recorded under a new generation, where nothing
+    /// downstream could tell.
+    ///
+    /// The window is entered on purpose, through a seam, rather than raced
+    /// with a sleep: "parsing 120k lines takes longer than 5ms" is a bet on
+    /// the machine, not a synchronisation.
+    #[test]
+    fn a_reading_that_the_file_moved_under_is_not_filed() {
+        let dir = std::env::temp_dir().join(format!("tinyctb-stable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("stable.jsonl");
+        let line = |stamp: &str| {
+            format!(
+                "{{\"type\":\"user\",\"timestamp\":\"{stamp}\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n"
+            )
+        };
+        fs::write(&path, line("2026-08-12T13:32:34.162Z")).expect("transcript");
+        let now = u64::MAX;
+
+        // Settled: the reading knows exactly which file it came from.
+        let (summary, fingerprint) = read_transcript_summary(&path, now).expect("read");
+        assert_eq!(
+            summary.last_record_at,
+            transcript_timestamp_ms("2026-08-12T13:32:34.162Z")
+        );
+        assert_eq!(
+            fingerprint,
+            file_fingerprint(&path),
+            "and it is the identity of the file as it stands"
+        );
+
+        // Moved under the read, precisely in the window: no identity, so the
+        // caller has nothing to file it under.
+        let churning = dir.join("churning.jsonl");
+        fs::write(&churning, line("2026-08-12T13:32:34.162Z")).expect("transcript");
+        let writer_path = churning.clone();
+        let _armed = transcript_read_seam::arm(move || {
+            fs::write(&writer_path, line("2026-08-13T00:00:00.000Z")).expect("rewrite");
+        });
+        let (_, fingerprint) = read_transcript_summary(&churning, now).expect("read");
+        assert_eq!(
+            fingerprint, None,
+            "a file that moved under the read has no state this answer belongs to"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// End to end: a session whose transcript moves under the read must not
+    /// have ANYTHING written for it — not a row, not a time, not a prompt.
+    /// The seam enters the window exactly, so this is a statement about the
+    /// code rather than about how fast the machine is.
+    #[test]
+    fn a_session_whose_file_moved_under_the_read_is_not_written_at_all() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-nowrite-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let projects = root.join("projects");
+        fs::create_dir_all(projects.join("-home-user-x")).expect("projects dir");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        let _projects_seam =
+            crate::state::EnvVarGuard::set("TINYCTB_CLAUDE_PROJECTS_DIR", &projects);
+        let conn = create_state_db_in_memory().expect("db");
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+
+        let transcript = projects.join("-home-user-x").join("sess-moving.jsonl");
+        let line = |stamp: &str| {
+            format!(
+                "{{\"type\":\"user\",\"timestamp\":\"{stamp}\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n"
+            )
+        };
+        fs::write(&transcript, line("2026-08-12T13:32:34.162Z")).expect("transcript");
+
+        // Rewritten inside the window, every time it is read.
+        let churn = transcript.clone();
+        let _armed = transcript_read_seam::arm(move || {
+            let _ = fs::write(&churn, line("2026-08-13T00:00:00.000Z"));
+        });
+        let result = sync_state_from_sessions(&conn, &config, 9_000, 10, false).expect("sync");
+
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM threads_cache WHERE thread_id = 'sess-moving'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            rows, 0,
+            "a reading of a file that would not hold still is filed nowhere"
+        );
+        // And the ANSWER must say so too. Writing nothing while reporting a
+        // sync handed the caller the very snapshot the database had just
+        // refused, and counted it -- an empty table behind a receipt.
+        assert_eq!(
+            result.get("synced").and_then(Value::as_u64),
+            Some(0),
+            "a refused write is not a synced thread"
+        );
+        assert_eq!(
+            result
+                .get("threads")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0),
+            "and the refused snapshot is not handed back"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A reading that held still, and a file that moved before the write
+    /// could take the lock. Nothing is written -- and the ANSWER must agree:
+    /// returning `Ok(())` from the refusal left the caller unable to tell a
+    /// write from a refusal, so it went on to hand back the snapshot the
+    /// database had just thrown away and to count it as synced.
+    #[test]
+    fn a_write_refused_at_the_last_moment_is_not_counted_as_synced() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-lastmoment-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let projects = root.join("projects");
+        fs::create_dir_all(projects.join("-home-user-x")).expect("projects dir");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        let _projects_seam =
+            crate::state::EnvVarGuard::set("TINYCTB_CLAUDE_PROJECTS_DIR", &projects);
+        let conn = create_state_db_in_memory().expect("db");
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+
+        let transcript = projects.join("-home-user-x").join("sess-late.jsonl");
+        let line = |stamp: &str| {
+            format!(
+                "{{\"type\":\"user\",\"timestamp\":\"{stamp}\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n"
+            )
+        };
+        fs::write(&transcript, line("2026-08-12T13:32:34.162Z")).expect("transcript");
+
+        // The seam fires twice per session: once inside the read, once inside
+        // the freshness check. Let the READ hold still, then move the file in
+        // the gap the check exists to close.
+        let churn = transcript.clone();
+        let signals = std::cell::Cell::new(0u32);
+        let _armed = transcript_read_seam::arm(move || {
+            signals.set(signals.get() + 1);
+            if signals.get() == 2 {
+                let _ = fs::write(&churn, line("2026-08-13T00:00:00.000Z"));
+            }
+        });
+        let result = sync_state_from_sessions(&conn, &config, 9_000, 10, false).expect("sync");
+
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM threads_cache WHERE thread_id = 'sess-late'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(rows, 0, "the file moved, so the reading was not written");
+        assert_eq!(
+            result.get("synced").and_then(Value::as_u64),
+            Some(0),
+            "a refused write is not a synced thread"
+        );
+        assert_eq!(
+            result
+                .get("threads")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0),
+            "and the refused snapshot is not handed back to the caller"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A prompt that was already open when the upgrade landed. The revision
+    /// column is added to a live table, so every row already in it starts
+    /// NULL -- and NULL is not equal to anything in SQL, including the 0 a
+    /// reader might substitute for it. Without a backfill the scan's
+    /// compare-and-clear matches no row, so an answered question can never be
+    /// retired; if the session has already ended there is no hook left to
+    /// clear it either, and it sits in `/threads` forever.
+    #[test]
+    fn a_prompt_open_across_the_upgrade_can_still_be_retired() {
+        // Two shapes a live database can be in when this version arrives.
+        // The column may be missing entirely, in which case ALTER TABLE
+        // leaves NULL; or it may already be there carrying `NOT NULL
+        // DEFAULT 0`, left by an earlier build, in which case every writer
+        // that omits it lands on the SAME value -- and 0, unlike NULL, does
+        // match, so one clear would retire whichever prompt it found.
+        let shapes: [(&str, &str); 2] = [
+            ("absent", ""),
+            ("default-zero", ", revision INTEGER NOT NULL DEFAULT 0"),
+        ];
+        for (label, revision_column) in shapes {
+            let path = std::env::temp_dir().join(format!(
+                "tinyctb-legacy-revision-{label}-{}.db",
+                std::process::id()
+            ));
+            let _ = fs::remove_file(&path);
+            {
+                let conn = Connection::open(&path).expect("open legacy db");
+                conn.execute_batch(&format!(
+                    "
+                    CREATE TABLE pending_prompts (
+                        thread_id TEXT PRIMARY KEY,
+                        prompt_id TEXT NOT NULL,
+                        prompt_kind TEXT NOT NULL,
+                        prompt_status TEXT NOT NULL,
+                        question TEXT NOT NULL,
+                        created_at INTEGER NOT NULL{revision_column}
+                    );
+                    INSERT INTO pending_prompts(
+                        thread_id, prompt_id, prompt_kind, prompt_status, question, created_at)
+                    VALUES ('thr_a', 'notify:1', 'reply', 'pending', '升级前的问题', 1000),
+                           ('thr_b', 'notify:1', 'reply', 'pending', '同一毫秒的另一个', 1000);
+                    "
+                ))
+                .expect("legacy pending_prompts");
+            }
+            let conn = crate::state::create_state_db(&path).expect("migrated db");
+
+            // The scan reads each prompt the way production does.
+            let mut revisions = Vec::new();
+            for thread in ["thr_a", "thr_b"] {
+                let (_, pending) = existing_thread_state(&conn, thread).expect("read prompt");
+                let (prompt, revision) = pending.expect("the legacy prompt survives the migration");
+                assert_eq!(prompt.prompt_id, "notify:1");
+                assert!(
+                    revision > 0,
+                    "{label}: a row from before the upgrade needs a real instance id, got {revision}"
+                );
+                revisions.push(revision);
+            }
+            assert_ne!(
+                revisions[0], revisions[1],
+                "{label}: two legacy prompts sharing an id is the collision this guards"
+            );
+
+            // Having confirmed thr_a was answered, the scan retires THAT
+            // instance -- and only that one.
+            let _ = crate::state::upsert_thread_snapshot(
+                &conn,
+                &crate::state::BridgeThreadSnapshot {
+                    thread_id: "thr_a".to_string(),
+                    name: None,
+                    cwd: None,
+                    updated_at: Some(2_000),
+                    status_type: "idle".to_string(),
+                    status_flags: Vec::new(),
+                    last_turn_status: None,
+                    last_preview: None,
+                    pending_prompt: None,
+                    event_uid: None,
+                },
+                2_000,
+                crate::state::UpdatedAt::Measured,
+                Some(revisions[0]),
+                None,
+                None,
+            )
+            .expect("clear");
+
+            let left: Vec<String> = {
+                let mut stmt = conn
+                    .prepare("SELECT thread_id FROM pending_prompts ORDER BY thread_id")
+                    .expect("prepare");
+                let rows = stmt.query_map([], |row| row.get(0)).expect("query");
+                rows.collect::<rusqlite::Result<Vec<String>>>()
+                    .expect("rows")
+            };
+            assert_eq!(
+                left,
+                vec!["thr_b".to_string()],
+                "{label}: the answered prompt must clear, and only it"
+            );
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    /// The last question before a reading is written down: is the file still
+    /// the one it came from?
+    #[test]
+    fn a_reading_is_only_written_while_its_file_is_unchanged() {
+        let dir = std::env::temp_dir().join(format!("tinyctb-fresh-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("fresh.jsonl");
+        fs::write(&path, "{}\n").expect("write");
+
+        let read_from = file_fingerprint(&path).expect("stat");
+        assert!(
+            file_unchanged_since(&path, read_from),
+            "nothing happened, so the reading still stands"
+        );
+
+        fs::write(&path, "{}{}\n").expect("rewrite");
+        assert!(
+            !file_unchanged_since(&path, read_from),
+            "the file moved on, so the reading is about something else now"
+        );
+
+        let _ = fs::remove_file(&path);
+        assert!(
+            !file_unchanged_since(&path, read_from),
+            "and a file that is gone is certainly not the one that was read"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The bug this release exists for. A session that last spoke on the
+    /// 12th, whose transcript file was TOUCHED today — a backup, a copy,
+    /// anything — used to report today's time and sit at the top of
+    /// `/threads` permanently, with no way to clear it.
+    #[test]
+    fn a_touched_transcript_does_not_make_an_old_session_look_recent() {
+        let dir = std::env::temp_dir().join(format!("tinyctb-recency-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let spoke_at = transcript_timestamp_ms("2026-08-12T13:32:34.162Z").expect("stamp");
+        let touched_now = spoke_at + 14 * 24 * 60 * 60 * 1000;
+        // A FILE PER CASE. One file rewritten three times is the same path
+        // at the same length, and the summary cache is keyed on exactly
+        // that — rewrites inside one millisecond read back the previous
+        // parse, and the test then measures the cache instead of the code.
+        let scan = |name: &str, line: &str| {
+            let path = dir.join(format!("{name}.jsonl"));
+            fs::write(&path, line).expect("transcript");
+            scan_snapshot(
+                &SessionFileInfo {
+                    session_id: name.to_string(),
+                    path,
+                    mtime_ms: touched_now,
+                },
+                touched_now,
+            )
+        };
+
+        assert_eq!(
+            scan(
+                "spoke-on-the-12th",
+                "{\"type\":\"user\",\"timestamp\":\"2026-08-12T13:32:34.162Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n"
+            )
+            .0
+            .updated_at,
+            Some(spoke_at),
+            "the row must say when the SESSION spoke, not when the file was touched"
+        );
+
+        // A stamp from the future cannot outrank the clock: a wrong time in
+        // the ordering is exactly what this release is fixing.
+        assert_eq!(
+            scan(
+                "claims-the-future",
+                "{\"type\":\"user\",\"timestamp\":\"2099-01-01T00:00:00.000Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n"
+            )
+            .0
+            .updated_at,
+            Some(touched_now),
+            "a stamp this clock cannot believe is clamped, never trusted"
+        );
+
+        // No readable stamp at all: the mtime is the only evidence there is.
+        assert_eq!(
+            scan(
+                "no-stamp-at-all",
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n"
+            )
+            .0
+            .updated_at,
+            Some(touched_now),
+            "without a stamp the mtime is all there is, and it is used"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
     use crate::state::create_state_db_in_memory;
     use std::io::Write;
 
@@ -4068,7 +6065,7 @@ mod tests {
                 ]}}),
             ],
         );
-        let first = parse_transcript_summary(&path).expect("first parse");
+        let first = parse_transcript_summary(&path, u64::MAX).expect("first parse");
         assert_eq!(first.last_assistant_text.as_deref(), Some("first answer"));
 
         let mut file = fs::OpenOptions::new()
@@ -4084,16 +6081,17 @@ mod tests {
         )
         .expect("append line");
 
-        let second = parse_transcript_summary(&path).expect("second parse");
+        let second = parse_transcript_summary(&path, u64::MAX).expect("second parse");
         assert_eq!(second.last_assistant_text.as_deref(), Some("second answer"));
     }
 
+    /// A restore must not be able to hide a rewrite. This test used to
+    /// assert the opposite — rewrite the content, put the mtime back, and
+    /// expect the OLD text — which made a stale cache the contract rather
+    /// than a bug. Putting the mtime back is exactly what a backup tool
+    /// does, and the row could then never be corrected again.
     #[test]
-    fn transcript_summary_cache_hits_on_unchanged_fingerprint() {
-        // Proves the cache actually SERVES hits: rewrite the file with
-        // different same-length content and restore the mtime, so only a
-        // cache hit can explain seeing the old text. Deleting the cache
-        // implementation makes this fail — the append test alone would not.
+    fn a_rewrite_with_a_restored_mtime_is_still_a_rewrite() {
         let temp = TempDirGuard::new("tinyctb-summary-cache-hit");
         let path = write_transcript(
             &temp.path,
@@ -4104,7 +6102,7 @@ mod tests {
                 ]}}),
             ],
         );
-        let first = parse_transcript_summary(&path).expect("first parse");
+        let first = parse_transcript_summary(&path, u64::MAX).expect("first parse");
         assert_eq!(first.last_assistant_text.as_deref(), Some("cache hit one"));
 
         let saved_mtime = fs::metadata(&path)
@@ -4120,11 +6118,71 @@ mod tests {
         file.set_modified(saved_mtime).expect("restore mtime");
         drop(file);
 
-        let second = parse_transcript_summary(&path).expect("second parse");
+        let second = parse_transcript_summary(&path, u64::MAX).expect("second parse");
         assert_eq!(
             second.last_assistant_text.as_deref(),
-            Some("cache hit one"),
-            "an unchanged (mtime, len) fingerprint must be served from cache"
+            Some("cache hit two"),
+            "same mtime, same length, same inode — and still a different file to read"
+        );
+    }
+
+    /// The cache must still SERVE hits, or it is just a slow path with extra
+    /// steps. Proven by looking at the cache itself: chmod and rename both
+    /// change the inode's own change time, which the fingerprint now reads,
+    /// so there is no way left to make a file look untouched from outside.
+    #[test]
+    fn an_untouched_transcript_is_answered_from_the_cache() {
+        let temp = TempDirGuard::new("tinyctb-summary-cache-served");
+        let path = write_transcript(
+            &temp.path,
+            "sess-cache-served",
+            &[
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "only answer"}
+                ]}}),
+            ],
+        );
+        let cached_summary = || -> Option<TranscriptSummary> {
+            let guard = TRANSCRIPT_SUMMARY_CACHE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard
+                .as_ref()
+                .and_then(|cache| cache.get(&path))
+                .map(|(_, summary)| summary.clone())
+        };
+
+        assert_eq!(
+            parse_transcript_summary(&path, u64::MAX)
+                .expect("first parse")
+                .last_assistant_text
+                .as_deref(),
+            Some("only answer")
+        );
+        assert_eq!(
+            cached_summary()
+                .expect("the parse must be remembered")
+                .last_assistant_text
+                .as_deref(),
+            Some("only answer"),
+            "a parse that is not remembered is not a cache"
+        );
+
+        // A second call with the file untouched answers the same, and the
+        // entry is still the one that first parse put there.
+        assert_eq!(
+            parse_transcript_summary(&path, u64::MAX)
+                .expect("second parse")
+                .last_assistant_text
+                .as_deref(),
+            Some("only answer")
+        );
+        assert_eq!(
+            cached_summary()
+                .expect("still remembered")
+                .last_assistant_text
+                .as_deref(),
+            Some("only answer")
         );
     }
 
@@ -4217,7 +6275,7 @@ mod tests {
             ],
         );
 
-        let summary = parse_transcript_summary(&path).expect("summary");
+        let summary = parse_transcript_summary(&path, u64::MAX).expect("summary");
         assert_eq!(summary.name.as_deref(), Some("Fix the parser"));
         assert_eq!(summary.cwd.as_deref(), Some("/home/user/project"));
         assert_eq!(
@@ -4241,7 +6299,7 @@ mod tests {
                 ]}}),
             ],
         );
-        let summary = parse_transcript_summary(&path).expect("summary");
+        let summary = parse_transcript_summary(&path, u64::MAX).expect("summary");
         assert_eq!(
             summary.pending_tool_use.as_deref(),
             Some("Bash: cargo build --release")
@@ -4260,7 +6318,7 @@ mod tests {
                 ]}}),
             ],
         );
-        let summary = parse_transcript_summary(&path).expect("summary");
+        let summary = parse_transcript_summary(&path, u64::MAX).expect("summary");
         assert_eq!(summary.pending_tool_use, None);
     }
 
@@ -4279,7 +6337,7 @@ mod tests {
                 ]}}),
             ],
         );
-        let summary = parse_transcript_summary(&path).expect("summary");
+        let summary = parse_transcript_summary(&path, u64::MAX).expect("summary");
         let pending = summary.pending_tool_use.expect("pending tool");
         assert!(pending.contains("Which database should we use?"));
         assert!(pending.contains("Postgres / SQLite"));
@@ -4316,7 +6374,7 @@ mod tests {
         );
         write_hook_event_from_reader(&mut notify_payload, 1000).expect("spool notify");
 
-        let (snapshots, _, _) = ingest_spool_events(2000).expect("ingest");
+        let (snapshots, _, _, _) = ingest_spool_events(2000).expect("ingest");
         std::env::remove_var("TINYCTB_STATE_DIR");
         std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
 
@@ -4528,7 +6586,7 @@ mod tests {
         let boundary = base.len() as u64;
 
         let seed = |bytes: Option<u64>| {
-            crate::state::upsert_thread_snapshot(
+            let _ = crate::state::upsert_thread_snapshot(
                 &conn,
                 &crate::state::BridgeThreadSnapshot {
                     thread_id: "sess-answered".to_string(),
@@ -4550,6 +6608,10 @@ mod tests {
                     event_uid: None,
                 },
                 1000,
+                crate::state::UpdatedAt::Observed,
+                None,
+                None,
+                None,
             )
             .expect("seed");
         };
@@ -4647,7 +6709,7 @@ mod tests {
 
         // auth_success must vanish without minting a wait.
         spool(1000, "auth_success", "Authentication successful");
-        let (snapshots, _, _) = ingest_spool_events(2000).expect("ingest");
+        let (snapshots, _, _, _) = ingest_spool_events(2000).expect("ingest");
         assert!(
             snapshots
                 .iter()
@@ -4662,7 +6724,7 @@ mod tests {
             "permission_prompt",
             "Claude needs your permission to use Bash",
         );
-        let (snapshots, _, _) = ingest_spool_events(4000).expect("ingest");
+        let (snapshots, _, _, _) = ingest_spool_events(4000).expect("ingest");
         let prompt = snapshots
             .iter()
             .find_map(|snapshot| snapshot.pending_prompt.as_ref())
@@ -4681,7 +6743,7 @@ mod tests {
             "brand_new_wait_type",
             "Claude needs your permission to use Frobnicator",
         );
-        let (snapshots, _, _) = ingest_spool_events(6000).expect("ingest");
+        let (snapshots, _, _, _) = ingest_spool_events(6000).expect("ingest");
         let prompt = snapshots
             .iter()
             .find_map(|snapshot| snapshot.pending_prompt.as_ref())
@@ -4763,7 +6825,8 @@ mod tests {
             ("sess-question", "agent_needs_input"),
         ] {
             let (_, prompt) = existing_thread_state(&conn, session).expect("state");
-            let prompt = prompt.unwrap_or_else(|| panic!("{session} must have a pending prompt"));
+            let (prompt, _) =
+                prompt.unwrap_or_else(|| panic!("{session} must have a pending prompt"));
             assert_eq!(
                 prompt.kind, "reply",
                 "{session} folds to reply for rendering"
@@ -4840,7 +6903,7 @@ mod tests {
         );
         write_hook_event_from_reader(&mut notify_payload, 1001).expect("spool notify");
 
-        let (snapshots, _, consumed) = ingest_spool_events(2000).expect("ingest");
+        let (snapshots, _, consumed, _) = ingest_spool_events(2000).expect("ingest");
         std::env::remove_var("TINYCTB_STATE_DIR");
         std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
 
@@ -5775,6 +7838,7 @@ mod tests {
                 boot_id,
             },
             1000,
+            1000,
         )
         .expect("record");
         assert_eq!(
@@ -5796,6 +7860,7 @@ mod tests {
                 inode,
                 boot_id,
             },
+            1000,
             1000,
         )
         .expect("record");
@@ -6699,12 +8764,12 @@ mod tests {
             json!({"hook_event_name": "Stop", "session_id": "sess-sock"}).to_string(),
         );
         write_hook_event_from_reader(&mut payload, 1000).expect("spool");
-        let (_, sockets, _) = ingest_spool_events(2000).expect("ingest");
+        let (_, sockets, _, _) = ingest_spool_events(2000).expect("ingest");
         std::env::remove_var("CLAUDE_CODE_MESSAGING_SOCKET");
         std::env::remove_var("TINYCTB_STATE_DIR");
 
         assert_eq!(
-            sockets.get("sess-sock").map(|s| s.path.as_str()),
+            sockets.get("sess-sock").map(|(s, _)| s.path.as_str()),
             Some("/run/user/1000/cc-socks/4242.sock")
         );
     }
@@ -7008,7 +9073,7 @@ mod tests {
         assert_eq!(socket.path, "/run/user/1000/cc-socks/77.sock");
 
         // Peek is non-destructive: the sync still gets the event.
-        let (snapshots, _, consumed) = ingest_spool_events(2000).expect("ingest");
+        let (snapshots, _, consumed, _) = ingest_spool_events(2000).expect("ingest");
         std::env::remove_var("TINYCTB_STATE_DIR");
         assert_eq!(consumed, 1, "peek must not consume the spool");
         assert_eq!(snapshots.len(), 1);

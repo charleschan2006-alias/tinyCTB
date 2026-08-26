@@ -618,6 +618,12 @@ pub(crate) fn create_state_db_in_memory() -> Result<Connection> {
 }
 
 pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
+    // The clock the one-time backfill below clamps against. Taken here so a
+    // database that cannot read a clock still opens.
+    let migration_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(u64::MAX);
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS settings (
@@ -807,11 +813,134 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "threads_cache", "messaging_socket", "TEXT")?;
     ensure_column(conn, "threads_cache", "socket_inode", "INTEGER")?;
     ensure_column(conn, "threads_cache", "socket_boot_id", "TEXT")?;
+    // WHERE the stored `updated_at` came from. Knowing only the arriving
+    // value's provenance is not enough to decide whether it may replace what
+    // is there: a measurement must be able to correct a GUESS downward, and
+    // must not drag a real OBSERVATION backwards. Rows written before this
+    // column existed default to 0 — treated as a guess, which is what the
+    // damaged ones are; a sound one is simply re-established by the next
+    // event, at most seconds away.
+    // Provenance, kept in its OWN columns rather than as a label on one
+    // shared value. A single winner remembers who wrote it and nothing else,
+    // so the lower bound a real observation had established was lost the
+    // moment a measurement replaced it: Observed(9000) then Measured(9500)
+    // then Measured(8000) walked straight past 9000, which a hook had seen
+    // happen. Two kinds of evidence, two columns, combined when read by
+    // `EFFECTIVE_RECENCY_SQL` — the observation is a floor, the measurement
+    // moves freely above it, and `updated_at` is only what v0.2.7 left.
+    ensure_column(conn, "threads_cache", "last_record_at", "INTEGER")?;
+    ensure_column(conn, "threads_cache", "last_observed_at", "INTEGER")?;
+    // WHICH generation of the file a measurement read. "The newest reading
+    // wins" only holds if commit order matches read order, and it does not:
+    // one scan can read an old file, stall, and commit after a scan that
+    // read a newer one — writing the older answer last. The generation goes
+    // in with the measurement and is compared on the way, so a reading of an
+    // older file cannot replace a reading of a newer one.
+    // NOTE: two earlier revisions stored `last_record_generation` and
+    // `last_record_inode` here, to order two readings inside the write. They
+    // could not: a generation comparison rejected a replacement file that
+    // carried an older mtime, and "a different inode always wins" let the
+    // replaced file win by committing second. Ordering readings is now the
+    // caller's job — it confirms the file is still the one it read — and the
+    // columns are gone. Old databases keep them, unread.
+    // Everything v0.2.7 wrote went into one column, scans and hooks alike,
+    // so its provenance cannot be recovered from the row. Some of it can be
+    // recovered from history — but only some, and only carefully:
+    //
+    //   * the floor is the time the hook SAW, which lives in the payload's
+    //     `updatedAt`. `observed_at` is when reconcile happened to run, so a
+    //     backlog processed today would have backfilled ten-day-old activity
+    //     as today's — the very failure this release is about, rebuilt by
+    //     its own migration.
+    //   * `thread_events` holds only the events that were worth notifying
+    //     about: an event skipped because away mode was off and nothing was
+    //     owed left no row at all. Plenty of legacy threads therefore have
+    //     no recoverable floor, and that is FINE — the floor only guards
+    //     against a measurement read before the transcript was flushed, and
+    //     the measurement itself is the ground truth for when a session
+    //     last spoke.
+    // Guarded on every side, because this runs while the database is being
+    // OPENED: one malformed historical payload must not be able to stop
+    // tinyctb from starting. `json_valid` before `json_extract`, an integer
+    // type check rather than a CAST that would silently turn "soon" into 0,
+    // and a clamp — an absurd future value written by anything at all would
+    // otherwise become a permanent floor no measurement could ever correct.
+    conn.execute(
+        "UPDATE threads_cache
+            SET last_observed_at = (
+                SELECT MAX(json_extract(e.payload_json, '$.updatedAt'))
+                  FROM thread_events e
+                 WHERE e.thread_id = threads_cache.thread_id
+                   AND json_valid(e.payload_json)
+                   AND json_type(e.payload_json, '$.updatedAt') = 'integer'
+                   AND json_extract(e.payload_json, '$.updatedAt') <= ?1
+            )
+          WHERE last_observed_at IS NULL
+            AND EXISTS (
+                SELECT 1 FROM thread_events e
+                 WHERE e.thread_id = threads_cache.thread_id
+                   AND json_valid(e.payload_json)
+                   AND json_type(e.payload_json, '$.updatedAt') = 'integer'
+                   AND json_extract(e.payload_json, '$.updatedAt') <= ?1
+            )",
+        params![to_sql_i64(migration_now)?],
+    )?;
     ensure_column(conn, "telegram_command_routes", "payload_json", "TEXT")?;
     ensure_column(conn, "telegram_callback_routes", "approval_id", "TEXT")?;
     ensure_column(conn, "pending_questions", "multi_select", "INTEGER")?;
     ensure_column(conn, "pending_prompts", "transcript_bytes", "INTEGER")?;
     ensure_column(conn, "pending_prompts", "notification_type", "TEXT")?;
+    // WHICH INSTANCE of a prompt this row is. The id is `notify:{received_at}`
+    // at millisecond resolution, so two Notifications in one millisecond
+    // share it — and a scan that resolved the first would then clear the
+    // second by name. A revision comes from an AUTOINCREMENT rowid, which
+    // SQLite promises never to reuse, so no two instances can collide.
+    ensure_column(conn, "pending_prompts", "revision", "INTEGER")?;
+    // WHEN the socket in this row was seen. Without it the mapping was
+    // whatever the last writer said, and hooks do not arrive in order — an
+    // overtaken one could point replies back at a socket the session had
+    // already moved off.
+    ensure_column(conn, "threads_cache", "socket_observed_at", "INTEGER")?;
+    // SET when the sighting behind a route stopped being believable, CLEARED
+    // when a real one replaces it. Not the same as "no sighting recorded":
+    // every row written before that column existed has none, and those are
+    // ordinary, not suspect.
+    ensure_column(conn, "threads_cache", "socket_unverified_since", "INTEGER")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS prompt_revisions (id INTEGER PRIMARY KEY AUTOINCREMENT);",
+    )?;
+    // A column added to a live table starts NULL on every row already in it,
+    // and in SQL NULL is not 0 — it is not equal to ANYTHING, including
+    // itself. The compare-and-clear below matches on the revision, so a
+    // prompt that predates this upgrade could never be retired: the scan
+    // would confirm it was answered, ask to delete it, and match no row. A
+    // session already closed has no hook left to clear it either, so it
+    // would sit in `/threads` as a question nobody can dismiss.
+    //
+    // ZERO counts as absent too, and this is not hypothetical: on a database
+    // an earlier build of this version already touched, the column carries
+    // `NOT NULL DEFAULT 0`, so any writer that omits it — an older binary
+    // still installed as the hook, say — lands on 0. That is worse than
+    // NULL, because 0 MATCHES, and every such row matches every other one:
+    // the compare-and-clear would retire whichever prompt happened to be
+    // there. The counter starts at 1, so 0 can only ever mean "no instance
+    // id was assigned".
+    //
+    // Give each of them a real one, drawn from the same counter the new ones
+    // use, so no legacy row can collide with a future one or with another.
+    let legacy: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT rowid FROM pending_prompts WHERE revision IS NULL OR revision = 0")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<i64>>>()?
+    };
+    for rowid in legacy {
+        let revision = next_prompt_revision(conn)?;
+        conn.execute(
+            "UPDATE pending_prompts SET revision = ?2 WHERE rowid = ?1",
+            params![rowid, revision],
+        )?;
+    }
     ensure_column(conn, "outbound_events", "claimed_at", "INTEGER")?;
     ensure_column(conn, "outbound_events", "claim_token", "TEXT")?;
     ensure_column(
@@ -1140,31 +1269,354 @@ pub(crate) fn delete_setting(conn: &Connection, key: &str) -> Result<()> {
     Ok(())
 }
 
+/// The next prompt instance identity. Never reused, even after deletes —
+/// that is what AUTOINCREMENT buys, and why a plain MAX(id)+1 would not do.
+fn next_prompt_revision(conn: &Connection) -> Result<i64> {
+    conn.execute("INSERT INTO prompt_revisions DEFAULT VALUES", [])?;
+    let revision = conn.last_insert_rowid();
+    // An identity source, not a log.
+    conn.execute(
+        "DELETE FROM prompt_revisions WHERE id < ?1",
+        params![revision],
+    )?;
+    Ok(revision)
+}
+
+/// How recent a thread is, from the evidence the row holds.
+///
+/// A measurement and an observation are different KINDS of evidence and are
+/// stored apart, so the answer is composed here rather than fought over at
+/// write time. The observation is a FLOOR — something was seen happening,
+/// and no later reading of a file may claim it did not. Above that floor the
+/// newest measurement wins, up or down. Only when there is neither does the
+/// row fall back to what v0.2.7 left behind, and then to when it was last
+/// seen at all.
+pub(crate) const EFFECTIVE_RECENCY_SQL: &str = "COALESCE(
+    NULLIF(
+        MAX(COALESCE(t.last_record_at, 0), COALESCE(t.last_observed_at, 0)),
+        0
+    ),
+    t.updated_at,
+    t.last_seen_at,
+    0
+)";
+
+/// What the database DID with a snapshot. A refusal is not a failure -- the
+/// row is simply not this reading's to write any more -- but it is also not a
+/// write, and a caller that cannot tell the two apart will go on to report a
+/// snapshot the database deliberately threw away.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotWrite {
+    /// The row was written.
+    Applied,
+    /// The file moved under the reading before the write could take the lock,
+    /// so nothing was written.
+    RejectedStale,
+    /// A hook that arrived after a NEWER one had already been recorded. Its
+    /// hook-owned state was left alone -- it does not describe the present --
+    /// but it still happened, and effects that are statements about the PAST
+    /// rather than about now may still be owed.
+    Superseded,
+}
+
+/// Where an `updated_at` came from, ordered by nothing — these are KINDS of
+/// evidence, and the rules between them are not a ranking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdatedAt {
+    /// A file mtime. Says when the file was touched, which is not when the
+    /// session spoke: a backup or a copy makes it lie by days.
+    ///
+    /// A reading with no stamps still CLEARS the measurement the last one
+    /// left behind: a transcript rewritten or truncated must not go on
+    /// reporting a time that is no longer anywhere in it.
+    ///
+    /// Neither reading carries a file identity any more. Ordering two
+    /// readings inside the write could not work — two inodes have no order
+    /// between them — so the caller instead confirms, as late as it can,
+    /// that the file is still the one it read.
+    Guessed,
+    /// Read off the transcript's own records. A reading of the file as it is
+    /// now, so the NEWEST reading is the true one — including when it is
+    /// earlier than what is stored, which is how a row a touched file pushed
+    /// to today comes back down.
+    ///
+    Measured,
+    /// A hook reporting what it saw. Real activity, and it only ever moves
+    /// forward.
+    Observed,
+}
+
+impl UpdatedAt {
+    fn as_i64(self) -> i64 {
+        match self {
+            UpdatedAt::Guessed => 0,
+            UpdatedAt::Measured => 1,
+            UpdatedAt::Observed => 2,
+        }
+    }
+}
+
 pub(crate) fn upsert_thread_snapshot(
     conn: &Connection,
     snapshot: &BridgeThreadSnapshot,
     now: u64,
-) -> Result<()> {
+    source: UpdatedAt,
+    // The prompt a SCAN read and found answered, if it found one. Its only
+    // licence to clear the row: it may retire that prompt and no other.
+    // The prompt INSTANCE a scan read and found answered, if it found one.
+    // Its only licence to touch the prompt row: it may retire that instance
+    // and no other.
+    resolved_prompt_revision: Option<i64>,
+    // Asked again once the write lock is held. Its answer decides whether
+    // this write happens at all.
+    still_current: Option<&dyn Fn() -> bool>,
+    // The newest observation THIS cycle holds for this session, used only
+    // when the stored high point turns out to be unusable. `None` from
+    // callers that have no batch around them.
+    cycle_floor: Option<u64>,
+) -> Result<SnapshotWrite> {
+    // ONE TRANSACTION, and an IMMEDIATE one: the row and the prompt are one
+    // statement about a session, and a reader must never see half of it.
+    //
+    // It is also what makes the caller's freshness check mean anything. The
+    // check used to run just before an unlocked write, so a second writer
+    // could slip in between and be overwritten by an answer already known to
+    // be stale. Taking the write lock FIRST and re-asking inside it closes
+    // that: nobody else can commit while this decision is being made.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    if let Some(still_current) = still_current {
+        if !still_current() {
+            return Ok(SnapshotWrite::RejectedStale);
+        }
+    }
+    let conn = &tx;
+    // IS THIS OBSERVATION STILL THE PRESENT? Hooks are spooled as files and
+    // read back a cycle later, and one that could not be read is KEPT for the
+    // next cycle — deliberately, so a transient error never destroys a real
+    // hook. The price is that hooks can arrive OUT OF ORDER: a Stop stamped
+    // 2000 lands, then the Notification stamped 1000 that failed to read
+    // before it. Only `last_observed_at` was a maximum, so the floor held
+    // while everything it exists to protect — status, turn status, preview,
+    // the prompt — was written straight over by the older hook, putting a
+    // session back to `waiting` on a question it had already answered.
+    //
+    // The ruling is made HERE, under the write lock already held, so nothing
+    // can land between deciding and acting on it.
+    let (last_observed_at, last_record_at): (Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT last_observed_at, last_record_at FROM threads_cache WHERE thread_id = ?1",
+            params![snapshot.thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or((None, None));
+    // A WATERMARK IN THE FUTURE is not a watermark. Every rule below reads
+    // the stored high point as "the newest thing that has happened", which
+    // assumes the wall clock only ever moves forward. It does not: an NTP
+    // correction steps it back, and one hook with a bad `receivedAt` plants a
+    // stamp years ahead all by itself. Either way the stored high point then
+    // sits above everything real, every genuine hook after it looks late,
+    // and the session's status, prompt and routing freeze until the clock
+    // catches up — which for a bad future stamp is never.
+    //
+    // So a high point ahead of the clock reading this transaction is not
+    // evidence to be defended, it is damage to be repaired: the incoming
+    // hook is accepted and the baseline is REBUILT from it rather than
+    // maxed against the old one.
+    let now_i64 = to_sql_i64(now)?;
+    // A high point ahead of the clock is DISCARDED, not translated. Two
+    // wrong repairs were tried on the way here and both had the same shape,
+    // of answering "this number is unusable" with a different number:
+    //
+    //   * rebuild from whatever arrives next — but entries that failed to
+    //     read are kept and retried, so the next arrival is as likely to be
+    //     an old backlog entry as a fresh hook, and it would re-declare the
+    //     past as the present;
+    //   * bring it down to the clock — but a hook is stamped when it is
+    //     WRITTEN and read a cycle later, so `received_at < now` is the
+    //     normal case, and a floor at `now` swallows the very next genuine
+    //     hook. If that was the session's last one, its old status and its
+    //     old question stay forever.
+    //
+    // So the damaged value simply stops counting, and the floor is taken
+    // from the evidence that is left. Two pieces, both real, neither of them
+    // the processing clock:
+    //
+    //   * what this CYCLE is holding for this session — its newest hook, so
+    //     an entry retried out of the backlog is measured against the batch
+    //     it arrived with rather than against the first thing to be read;
+    //   * the last record time MEASURED off the transcript, which no hook
+    //     wrote and which a hook stamped before it cannot be describing.
+    //
+    // If neither exists there is nothing in the world to order this against,
+    // and it is taken. That case is stated rather than hidden: a session
+    // whose stored high point is damaged and whose repairing cycle holds
+    // only one old entry, with no transcript reading on the row, lets that
+    // entry set the new floor.
+    let watermark_ahead_of_the_clock = last_observed_at.is_some_and(|seen| seen > now_i64);
+    let effective_seen = if watermark_ahead_of_the_clock {
+        let from_cycle = cycle_floor.map(to_sql_i64).transpose()?;
+        let from_transcript = last_record_at.filter(|at| *at <= now_i64);
+        from_cycle.max(from_transcript)
+    } else {
+        last_observed_at
+    };
+    let superseded = matches!(source, UpdatedAt::Observed)
+        && match (snapshot.updated_at, effective_seen) {
+            // STRICTLY behind, and that limit is deliberate. Two hooks
+            // stamped the same millisecond cannot be ordered at all: the
+            // spool file names them `{received_at}-{pid}-{event}`, and a pid
+            // is not a sequence — sorting by it would dress an arbitrary
+            // order up as causality. So a tie is treated as CURRENT, and the
+            // choice is between two losses. Accepting a tie can push a
+            // question that was in fact already answered. Refusing one can
+            // drop a real question so it is never pushed at all, and nothing
+            // later re-raises it.
+            //
+            // The asymmetry is only in how far each can be walked back, and
+            // it is smaller than it looks. A wrong push cannot be recalled
+            // at all. What the revision buys is narrower than "the next scan
+            // fixes it": it guarantees that IF this session is scanned again,
+            // the stale row can be cleared precisely, without retiring a
+            // question that replaced it. It does not promise the scan
+            // happens — the same cycle skips sessions a hook just spoke for,
+            // and later cycles only look at the most recently touched, so a
+            // quiet session can sit outside that pool for a long time. Even
+            // so: a stale row that MIGHT be cleared beats a real question
+            // that was never announced and that nothing will announce.
+            (Some(at), Some(seen)) => to_sql_i64(at)? < seen,
+            _ => false,
+        };
     conn.execute(
         "INSERT INTO threads_cache(
             thread_id, name, cwd, source, status_type, status_flags_json,
-            updated_at, last_seen_at, last_turn_status, last_preview
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            updated_at, last_seen_at, last_turn_status, last_preview,
+            last_record_at, last_observed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                   CASE WHEN ?11 = 1 THEN ?7 END,
+                   CASE WHEN ?11 = 2 THEN ?7 END)
          ON CONFLICT(thread_id) DO UPDATE SET
-            name = excluded.name,
-            cwd = excluded.cwd,
+            -- A MISSING value is silence, not an erasure. A hook without a
+            -- transcript to hand carries neither name nor cwd, and writing
+            -- its `None` straight in wiped what a scan had read off the file.
+            --
+            -- WHO MAY SPEAK ABOUT METADATA, though, is a second question, and
+            -- COALESCE alone did not answer it: a lagging scan holding an OLD
+            -- non-null name still wrote it over the hook\'s new one. A hook
+            -- (2) reports its own payload and is always current. A MEASURED
+            -- reading (1) carries the transcript\'s own record time, so it may
+            -- speak when the file it read is not older than the last thing
+            -- actually seen. A GUESS (0) carries only an mtime -- the very
+            -- number this version exists to stop trusting -- so it may fill a
+            -- gap and must never outrank an observation.
+            name = CASE
+                WHEN (?11 = 2 AND ?12 = 0)
+                  OR (?11 = 1 AND excluded.updated_at IS NOT NULL
+                      AND excluded.updated_at >= ?14)
+                  OR (?11 = 0 AND ?14 = 0)
+                    THEN COALESCE(excluded.name, threads_cache.name)
+                ELSE threads_cache.name
+            END,
+            cwd = CASE
+                WHEN (?11 = 2 AND ?12 = 0)
+                  OR (?11 = 1 AND excluded.updated_at IS NOT NULL
+                      AND excluded.updated_at >= ?14)
+                  OR (?11 = 0 AND ?14 = 0)
+                    THEN COALESCE(excluded.cwd, threads_cache.cwd)
+                ELSE threads_cache.cwd
+            END,
             source = excluded.source,
-            status_type = excluded.status_type,
-            status_flags_json = excluded.status_flags_json,
+            -- HOOK-OWNED. A scan learns these by READING THE ROW and
+            -- writing them straight back, which is not a fresh answer at
+            -- all — it is whatever the row said when the scan started. A
+            -- hook landing in between was then undone by a scan that never
+            -- saw it, no file race required. Only an observation writes
+            -- them; a reading leaves them exactly as they are.
+            status_type = CASE
+                WHEN ?11 = 2 AND ?12 = 0 THEN excluded.status_type
+                ELSE threads_cache.status_type
+            END,
+            status_flags_json = CASE
+                WHEN ?11 = 2 AND ?12 = 0 THEN excluded.status_flags_json
+                ELSE threads_cache.status_flags_json
+            END,
+            -- `updated_at` is the FALLBACK now, not the answer: it is what
+            -- v0.2.7 rows carry and what a session with no other evidence
+            -- has. It keeps its old forward-only rule so a guess cannot drag
+            -- it about; the two columns below are what ordering reads.
             updated_at = CASE
-                WHEN threads_cache.updated_at IS NULL THEN excluded.updated_at
                 WHEN excluded.updated_at IS NULL THEN threads_cache.updated_at
+                WHEN threads_cache.updated_at IS NULL THEN excluded.updated_at
                 WHEN excluded.updated_at > threads_cache.updated_at THEN excluded.updated_at
                 ELSE threads_cache.updated_at
             END,
+            -- MEASURED: a reading of the file as it is. The newest reading
+            -- is the true one, earlier or later — that is how a row a
+            -- touched file pushed to today comes back down.
+            -- MEASURED sets the reading; GUESSED clears it. One reading of
+            -- one file, committed as a unit — a transcript rewritten to
+            -- carry no stamps must not go on reporting a time that is no
+            -- longer in it.
+            --
+            -- No generation is compared here. Two inodes have no order
+            -- between them, so a rule of always-accept-a-different-inode let
+            -- a reading of the REPLACED file beat a reading of the file that
+            -- replaced it, purely by committing second. The caller asks the
+            -- only question that settles it -- is the file still the one I
+            -- read -- immediately before this runs.
+            last_record_at = CASE
+                WHEN ?11 = 2 THEN threads_cache.last_record_at
+                WHEN ?11 = 1 THEN excluded.updated_at
+                ELSE NULL
+            END,
+            -- OBSERVED: something was seen happening. It only ever moves
+            -- forward, and it is the floor no measurement may cross.
+            last_observed_at = CASE
+                -- Repairing. The floor the ruling above was made against
+                -- must OUTLIVE this write, or the repair lasts exactly one
+                -- statement: the first entry of the batch would write its own
+                -- older stamp here, the damage would be gone, and every
+                -- entry after it would be judged against that lower mark
+                -- instead of the evidence — the second one walking straight
+                -- past a floor the first was refused by.
+                --
+                -- So the floor is kept, and only an observation that was NOT
+                -- refused (?12 = 0) may raise it.
+                WHEN ?13 = 1
+                    THEN NULLIF(
+                        MAX(?14, CASE
+                            WHEN ?11 = 2 AND ?12 = 0 THEN COALESCE(excluded.updated_at, 0)
+                            ELSE 0
+                        END),
+                        0
+                    )
+                WHEN ?11 = 2
+                 AND excluded.updated_at > COALESCE(threads_cache.last_observed_at, 0)
+                    THEN excluded.updated_at
+                ELSE threads_cache.last_observed_at
+            END,
             last_seen_at = excluded.last_seen_at,
-            last_turn_status = excluded.last_turn_status,
-            last_preview = excluded.last_preview",
+            last_turn_status = CASE
+                WHEN ?11 = 2 AND ?12 = 0 THEN excluded.last_turn_status
+                ELSE threads_cache.last_turn_status
+            END,
+            -- The preview follows the same evidence as the time it belongs
+            -- to. A hook has the answer from its own payload and is always
+            -- current. A READING is only current if the file it read is not
+            -- older than the last thing actually SEEN — a Stop whose text has
+            -- not reached the transcript yet would otherwise be replaced by
+            -- the previous answer, read from a file that had not caught up.
+            -- Same authority as the name above: a GUESS could otherwise put
+            -- the previous answer back by nothing more than a `touch`.
+            last_preview = CASE
+                WHEN (?11 = 2 AND ?12 = 0)
+                  OR (?11 = 1 AND excluded.updated_at IS NOT NULL
+                      AND excluded.updated_at >= ?14)
+                  OR (?11 = 0 AND ?14 = 0)
+                    THEN COALESCE(excluded.last_preview, threads_cache.last_preview)
+                ELSE threads_cache.last_preview
+            END",
         params![
             snapshot.thread_id,
             snapshot.name,
@@ -1176,14 +1628,40 @@ pub(crate) fn upsert_thread_snapshot(
             to_sql_i64(now)?,
             snapshot.last_turn_status,
             snapshot.last_preview,
+            source.as_i64(),
+            i64::from(superseded),
+            i64::from(watermark_ahead_of_the_clock),
+            effective_seen.unwrap_or(0),
         ],
     )?;
 
-    match &snapshot.pending_prompt {
-        Some(prompt) => {
+    // The PROMPT ROW, and who may say what about it.
+    //
+    // A hook is authoritative: it saw the session ask, or saw it stop. A
+    // scan is not — it can only report what it read out of a transcript, and
+    // it learned the prompt itself by reading this very row a moment ago. A
+    // scan writing `None` therefore said nothing about the present: it said
+    // "the row had no prompt when I started", and deleting on the strength
+    // of that erased a prompt a hook had written in between. No file race
+    // was needed for it, only a scan and a hook in the same second.
+    //
+    // So a scan may only CLEAR the prompt it actually looked at, by name:
+    // it read that prompt, checked the transcript, and found it answered.
+    match (&snapshot.pending_prompt, source, superseded) {
+        // A SUPERSEDED hook is not a statement about the present, and a
+        // prompt is the loudest such statement there is: re-raising a
+        // question the session has already answered puts a dead question
+        // back in `/threads` with nothing left to clear it.
+        (_, UpdatedAt::Observed, true) => {}
+        // A SCAN carrying a prompt is saying "the one I read is still
+        // unresolved" — a statement about what it READ, not about what is
+        // there now. Writing it back put a prompt the hook had already
+        // replaced straight over the new one.
+        (Some(_), UpdatedAt::Measured | UpdatedAt::Guessed, _) => {}
+        (Some(prompt), UpdatedAt::Observed, _) => {
             conn.execute(
-                "INSERT INTO pending_prompts(thread_id, prompt_id, prompt_kind, prompt_status, question, created_at, transcript_bytes, notification_type)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO pending_prompts(thread_id, prompt_id, prompt_kind, prompt_status, question, created_at, transcript_bytes, notification_type, revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(thread_id) DO UPDATE SET
                     prompt_id = excluded.prompt_id,
                     prompt_kind = excluded.prompt_kind,
@@ -1191,7 +1669,10 @@ pub(crate) fn upsert_thread_snapshot(
                     question = excluded.question,
                     created_at = excluded.created_at,
                     transcript_bytes = excluded.transcript_bytes,
-                    notification_type = excluded.notification_type",
+                    notification_type = excluded.notification_type,
+                    -- Every write is a NEW instance, so a compare-and-clear
+                    -- made against the previous one finds nothing.
+                    revision = ?9",
                 params![
                     snapshot.thread_id,
                     prompt.prompt_id,
@@ -1201,43 +1682,161 @@ pub(crate) fn upsert_thread_snapshot(
                     to_sql_i64(now)?,
                     prompt.transcript_bytes.map(|bytes| bytes as i64),
                     prompt.notification_type,
+                    next_prompt_revision(conn)?,
                 ],
             )?;
         }
-        None => {
+        (None, UpdatedAt::Observed, _) => {
+            // A hook saying "no prompt" is a fact about the session now.
             conn.execute(
                 "DELETE FROM pending_prompts WHERE thread_id = ?1",
                 params![snapshot.thread_id],
             )?;
         }
+        (None, _, _) => {
+            // A scan resolved the prompt it read. Compare-and-clear, so a
+            // prompt written since — which this scan never saw — survives.
+            // Compare-and-clear on the INSTANCE, not the name:
+            // `notify:{received_at}` repeats within a millisecond, so
+            // clearing by name could retire a prompt that had replaced the
+            // one this scan actually looked at.
+            if let Some(revision) = resolved_prompt_revision {
+                conn.execute(
+                    "DELETE FROM pending_prompts WHERE thread_id = ?1 AND revision = ?2",
+                    params![snapshot.thread_id, revision],
+                )?;
+            }
+        }
     }
-    Ok(())
+    tx.commit()?;
+    Ok(if superseded {
+        SnapshotWrite::Superseded
+    } else {
+        SnapshotWrite::Applied
+    })
 }
 
 /// Remember where a live session listens for injected messages. Reported by
 /// the session's own hooks (they inherit CLAUDE_CODE_MESSAGING_SOCKET), so
 /// this mapping is authoritative rather than guessed from process state.
+/// Mark every route whose sighting sits ahead of the clock as UNVERIFIED.
+///
+/// Making the timestamp believable does not make the path believable, and an
+/// earlier version of this did only that: it wrote `now` over the bad stamp,
+/// the row stopped looking suspect on the next cycle, and the same unchecked
+/// socket went straight back into service as if something had confirmed it.
+/// Worse, a stamp of `now` then out-ranked the next genuine hook, which is
+/// always stamped a little earlier than the cycle that reads it.
+///
+/// So the sighting is REMOVED rather than rewritten, and the row is marked.
+/// The mark is what persists: it survives cycles, and only two things end it
+/// — a real sighting arriving (`record_session_messaging_socket` clears it),
+/// or the route being shown to be gone (`clear_resolved_socket_quarantines`).
+/// While it stands, replies are held rather than routed or forked.
+pub(crate) fn quarantine_future_socket_sightings(conn: &Connection, now: u64) -> Result<usize> {
+    let now = to_sql_i64(now)?;
+    let quarantined = conn.execute(
+        "UPDATE threads_cache
+            SET socket_unverified_since = ?1, socket_observed_at = NULL
+          WHERE socket_observed_at > ?1",
+        params![now],
+    )?;
+    if quarantined > 0 {
+        eprintln!(
+            "tinyctb: {quarantined} session(s) carried a socket sighting from ahead of the \
+             clock; the route is now unverified and replies are held until something vouches \
+             for it"
+        );
+    }
+    Ok(quarantined)
+}
+
+/// Every route currently marked unverified, so the caller can check whether
+/// each is still there.
+pub(crate) fn unverified_socket_routes(
+    conn: &Connection,
+) -> Result<Vec<(String, crate::claude::SessionSocket)>> {
+    let mut stmt = conn.prepare(
+        "SELECT thread_id, messaging_socket, socket_inode, socket_boot_id
+           FROM threads_cache
+          WHERE socket_unverified_since IS NOT NULL
+            AND messaging_socket IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            crate::claude::SessionSocket {
+                path: row.get::<_, String>(1)?,
+                inode: row.get::<_, Option<i64>>(2)?.map(|value| value as u64),
+                boot_id: row.get::<_, Option<String>>(3)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The route answered to the identity recorded for it, which is the thing
+/// that was ever actually in question. The doubt ends; the route stays.
+pub(crate) fn vouch_for_socket_route(conn: &Connection, thread_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE threads_cache SET socket_unverified_since = NULL WHERE thread_id = ?1",
+        params![thread_id],
+    )?;
+    Ok(())
+}
+
+/// The route is gone, so there is nothing left to be unsure about: drop it.
+/// A reply for this session now falls back honestly instead of being held
+/// forever waiting for a session that will never speak again.
+pub(crate) fn forget_unverified_socket_route(conn: &Connection, thread_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE threads_cache
+            SET messaging_socket = NULL, socket_inode = NULL, socket_boot_id = NULL,
+                socket_observed_at = NULL, socket_unverified_since = NULL
+          WHERE thread_id = ?1",
+        params![thread_id],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn record_session_messaging_socket(
     conn: &Connection,
     thread_id: &str,
     socket: &crate::claude::SessionSocket,
+    // WHEN the hook that carried this socket was received. The mapping is
+    // only as current as the observation behind it, and observations arrive
+    // out of order: a hook kept over from a failed read comes back a cycle
+    // late and would otherwise route replies to wherever it was pointing.
+    observed_at: u64,
     now: u64,
 ) -> Result<()> {
     conn.execute(
         "INSERT INTO threads_cache(
             thread_id, status_type, status_flags_json, last_seen_at,
-            messaging_socket, socket_inode, socket_boot_id
-         ) VALUES (?1, 'active', '[]', ?3, ?2, ?4, ?5)
+            messaging_socket, socket_inode, socket_boot_id, socket_observed_at
+         ) VALUES (?1, 'active', '[]', ?3, ?2, ?4, ?5, ?6)
          ON CONFLICT(thread_id) DO UPDATE SET
             messaging_socket = excluded.messaging_socket,
             socket_inode = excluded.socket_inode,
-            socket_boot_id = excluded.socket_boot_id",
+            socket_boot_id = excluded.socket_boot_id,
+            socket_observed_at = excluded.socket_observed_at,
+            -- Something vouched for the route: the doubt is over.
+            socket_unverified_since = NULL
+            -- The stored sighting is only usable as far as the clock. Above
+            -- that it is damage, and MIN brings it back down for this
+            -- comparison rather than letting it lock the routing out
+            -- forever. It does NOT open the door to anything: an old backlog
+            -- entry is still older than the clock and still loses. Only a
+            -- sighting at least as new as now can take a corrupted slot.
+         WHERE excluded.socket_observed_at
+               >= MIN(COALESCE(threads_cache.socket_observed_at, 0), ?3)",
         params![
             thread_id,
             socket.path,
             to_sql_i64(now)?,
             socket.inode.map(|value| value as i64),
-            socket.boot_id
+            socket.boot_id,
+            to_sql_i64(observed_at)?
         ],
     )?;
     Ok(())
@@ -1249,21 +1848,41 @@ pub(crate) fn session_messaging_socket(
     conn: &Connection,
     thread_id: &str,
 ) -> Result<Option<crate::claude::SessionSocket>> {
-    let row: Option<(Option<String>, Option<i64>, Option<String>)> = conn
+    Ok(session_messaging_route(conn, thread_id)?.map(|(socket, _)| socket))
+}
+
+/// A route as the row holds it: path, inode, boot id, and when the doubt
+/// about it began, if it ever did.
+type StoredSocketRoute = (Option<String>, Option<i64>, Option<String>, Option<i64>);
+
+/// The route for a session, and whether anything currently vouches for it.
+///
+/// `true` means the sighting behind it stopped being believable and nothing
+/// has settled it since. The route may well be right — it usually is — but a
+/// caller may not treat its ABSENCE of a reply as proof the session is gone,
+/// because spawning a second one is the mistake that cannot be taken back.
+pub(crate) fn session_messaging_route(
+    conn: &Connection,
+    thread_id: &str,
+) -> Result<Option<(crate::claude::SessionSocket, bool)>> {
+    let row: Option<StoredSocketRoute> = conn
         .query_row(
-            "SELECT messaging_socket, socket_inode, socket_boot_id
+            "SELECT messaging_socket, socket_inode, socket_boot_id, socket_unverified_since
              FROM threads_cache WHERE thread_id = ?1",
             params![thread_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    Ok(row.and_then(|(path, inode, boot_id)| {
+    Ok(row.and_then(|(path, inode, boot_id, unverified_since)| {
         let path = path.filter(|value| !value.trim().is_empty())?;
-        Some(crate::claude::SessionSocket {
-            path,
-            inode: inode.map(|value| value as u64),
-            boot_id,
-        })
+        Some((
+            crate::claude::SessionSocket {
+                path,
+                inode: inode.map(|value| value as u64),
+                boot_id,
+            },
+            unverified_since.is_some(),
+        ))
     }))
 }
 
@@ -1334,19 +1953,30 @@ pub(crate) fn live_injection_pending(
 }
 
 /// Mark the injection this completion answered as settled.
+/// Settle one injection debt against this completion, and say whether THIS
+/// caller is the one that settled it.
+///
+/// The answer is what decides bridge routing, so it cannot be a separate
+/// question asked earlier: two completions that both read "a debt is
+/// pending" each pushed themselves as the promised answer, and the user got
+/// the same reply twice. The UPDATE carries its own precondition, so exactly
+/// one caller comes away with `true` — the other falls back to the away
+/// rules like any ordinary completion.
 pub(crate) fn consume_live_injection(
     conn: &Connection,
     thread_id: &str,
     event_at: Option<u64>,
     now: u64,
-) -> Result<()> {
-    if let Some(id) = claimable_live_injection(conn, thread_id, event_at, now)? {
-        conn.execute(
-            "UPDATE live_injections SET claimed_at = ?2 WHERE id = ?1",
-            params![id, to_sql_i64(now)?],
-        )?;
-    }
-    Ok(())
+) -> Result<bool> {
+    let Some(id) = claimable_live_injection(conn, thread_id, event_at, now)? else {
+        return Ok(false);
+    };
+    let changed = conn.execute(
+        "UPDATE live_injections SET claimed_at = ?2
+         WHERE id = ?1 AND claimed_at IS NULL",
+        params![id, to_sql_i64(now)?],
+    )?;
+    Ok(changed > 0)
 }
 
 pub(crate) fn record_action(
@@ -1450,7 +2080,7 @@ pub(crate) fn should_emit_for_away_window(
     }
 }
 
-fn record_delivery(
+pub(crate) fn record_delivery(
     conn: &Connection,
     event_key: &str,
     thread_id: &str,
@@ -1491,16 +2121,47 @@ pub(crate) fn reconcile_thread_snapshots(
     conn: &Connection,
     now: u64,
     snapshots: Vec<BridgeThreadSnapshot>,
-    record_deliveries: bool,
+    // Kept for the call sites that still pass it: the delivery marker moved
+    // to the outbound enqueue, so nothing here writes one any more.
+    _record_deliveries: bool,
 ) -> Result<Value> {
     let away = get_setting_text(conn, "away")?.unwrap_or_default() == "true";
     let away_started_at = get_setting_number(conn, "away_started_at")?;
     let mut events = Vec::new();
     let mut threads = Vec::new();
 
+    // The newest observation this cycle holds per session. It is what
+    // re-establishes a damaged floor: not the clock, and not whichever entry
+    // happened to be read first.
+    let mut cycle_floor: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
     for snapshot in &snapshots {
-        upsert_thread_snapshot(conn, snapshot, now)?;
-        threads.push(thread_snapshot_json(snapshot));
+        if let Some(at) = snapshot.updated_at {
+            let seen = cycle_floor.entry(snapshot.thread_id.as_str()).or_insert(at);
+            *seen = (*seen).max(at);
+        }
+    }
+
+    for snapshot in &snapshots {
+        // A hook OBSERVES; it never measures the transcript. It also hands
+        // over no freshness check, so there is nothing here that CAN refuse
+        // it -- said out loud rather than by discarding the answer.
+        let write = upsert_thread_snapshot(
+            conn,
+            snapshot,
+            now,
+            UpdatedAt::Observed,
+            None,
+            None,
+            cycle_floor.get(snapshot.thread_id.as_str()).copied(),
+        )?;
+        debug_assert_ne!(write, SnapshotWrite::RejectedStale);
+        // A hook a NEWER one already overtook describes the past, not the
+        // present. Its row was left alone; handing it back here would put
+        // the same stale state in front of the reader by another door.
+        let superseded = write == SnapshotWrite::Superseded;
+        if !superseded {
+            threads.push(thread_snapshot_json(snapshot));
+        }
 
         // Hook events drive away notifications only — EXCEPT for a session
         // that owes an answer to a message injected from Telegram. That
@@ -1525,13 +2186,24 @@ pub(crate) fn reconcile_thread_snapshots(
                 .unwrap_or_else(|| "none".to_string())
         });
 
-        if let Some(prompt) = &snapshot.pending_prompt {
+        // EFFECTS SPLIT BY WHAT THEY CLAIM. A waiting notification says "this
+        // session is asking you something NOW" -- an overtaken hook cannot
+        // say that, and saying it anyway is how an answered question comes
+        // back to the phone. A completion says "this session finished" --
+        // that happened, it is still true, and the person it was promised to
+        // has not heard it yet, so a late one is still owed.
+        if let Some(prompt) = snapshot.pending_prompt.as_ref().filter(|_| !superseded) {
             let event_key = format!(
                 "thread_waiting:{}:{}:{}",
                 snapshot.thread_id, prompt.prompt_id, event_discriminator
             );
-            let should_emit = !record_deliveries
-                || record_delivery(conn, &event_key, &snapshot.thread_id, "thread_waiting", now)?;
+            // NOT gated on a delivery marker here. The marker used to be
+            // written in this function while the outbound row was written
+            // much later; a failure in between left the marker standing and
+            // silenced every retry, so the notification was lost for good.
+            // The marker now commits WITH the outbound row, and this loop
+            // simply reports what it saw.
+            let should_emit = true;
             if should_emit {
                 let event = json!({
                     "type": "thread_waiting",
@@ -1561,14 +2233,9 @@ pub(crate) fn reconcile_thread_snapshots(
                 "thread_completed:{}:{}",
                 snapshot.thread_id, event_discriminator
             );
-            let should_emit = !record_deliveries
-                || record_delivery(
-                    conn,
-                    &event_key,
-                    &snapshot.thread_id,
-                    "thread_completed",
-                    now,
-                )?;
+            // Same rule as the waiting event above: the marker belongs with
+            // the outbound row, not here.
+            let should_emit = true;
             if should_emit {
                 let event = json!({
                     "type": "thread_completed",
@@ -1604,13 +2271,15 @@ pub(crate) fn list_waiting_from_db(
     project_filter: Option<&str>,
     limit: u64,
 ) -> Result<WaitingResult> {
-    let mut stmt = conn.prepare(
-        "SELECT t.thread_id, t.name, t.cwd, t.updated_at, t.status_type, t.status_flags_json,
+    let mut stmt = conn.prepare(&format!(
+        "SELECT t.thread_id, t.name, t.cwd, {recency} AS updated_at, t.status_type,
+                t.status_flags_json,
                 t.last_preview, p.prompt_id, p.prompt_kind, p.prompt_status, p.question
          FROM pending_prompts p
          INNER JOIN threads_cache t ON t.thread_id = p.thread_id
-         ORDER BY COALESCE(t.updated_at, 0) DESC",
-    )?;
+         ORDER BY {recency} DESC",
+        recency = EFFECTIVE_RECENCY_SQL
+    ))?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -1718,16 +2387,17 @@ pub(crate) fn list_recent_thread_snapshots_from_db(
     if limit == 0 {
         return Ok(Vec::new());
     }
-
-    let mut stmt = conn.prepare(
-        "SELECT t.thread_id, t.name, t.cwd, t.updated_at, t.status_type, t.status_flags_json,
+    let mut stmt = conn.prepare(&format!(
+        "SELECT t.thread_id, t.name, t.cwd, {recency} AS updated_at, t.status_type,
+                t.status_flags_json,
                 t.last_turn_status, t.last_preview, p.prompt_id, p.prompt_kind, p.prompt_status,
                 p.question
          FROM threads_cache t
          LEFT JOIN pending_prompts p ON p.thread_id = t.thread_id
-         ORDER BY COALESCE(t.updated_at, t.last_seen_at, 0) DESC
+         ORDER BY {recency} DESC
          LIMIT ?1",
-    )?;
+        recency = EFFECTIVE_RECENCY_SQL
+    ))?;
     let rows = stmt.query_map(params![to_sql_i64(limit)?], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -1794,13 +2464,15 @@ pub(crate) fn list_inbox_from_db(
     waiting_on_filter: Option<&str>,
     limit: u64,
 ) -> Result<InboxResult> {
-    let mut stmt = conn.prepare(
-        "SELECT t.thread_id, t.name, t.cwd, t.updated_at, t.last_seen_at, t.status_type, t.status_flags_json,
+    let mut stmt = conn.prepare(&format!(
+        "SELECT t.thread_id, t.name, t.cwd, {recency} AS updated_at, t.last_seen_at, t.status_type,
+                t.status_flags_json,
                 t.last_turn_status, t.last_preview, p.prompt_kind, p.prompt_status, p.question
          FROM threads_cache t
          LEFT JOIN pending_prompts p ON p.thread_id = t.thread_id
-         ORDER BY COALESCE(t.updated_at, 0) DESC",
-    )?;
+         ORDER BY {recency} DESC",
+        recency = EFFECTIVE_RECENCY_SQL
+    ))?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -3971,6 +4643,1759 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `/threads` actually orders by. Asserting on the raw column would
+    /// have missed the point: the answer is composed from two kinds of
+    /// evidence, and this is the composition.
+    fn effective_recency(conn: &Connection, thread: &str) -> Option<i64> {
+        conn.query_row(
+            &format!("SELECT {EFFECTIVE_RECENCY_SQL} FROM threads_cache t WHERE t.thread_id = ?1"),
+            params![thread],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("row")
+    }
+
+    /// A row that v0.2.7 pushed to "today" from a file mtime must be able to
+    /// come back DOWN. Ordering by a value that only ever moves forward left
+    /// every such row pinned at the top of `/threads` for good — the very
+    /// thing this release exists to fix, and unreachable if the fix only
+    /// applies to rows that do not exist yet.
+    #[test]
+    fn a_measurement_corrects_a_row_that_was_pushed_forward() {
+        let conn = create_state_db_in_memory().expect("db");
+        let snapshot = |at: u64| BridgeThreadSnapshot {
+            thread_id: "sess-inflated".to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(at),
+            status_type: "idle".to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: None,
+            last_preview: None,
+            pending_prompt: None,
+            event_uid: None,
+        };
+        let spoke_at = 1_000u64;
+        let inflated = 9_000u64;
+
+        // What v0.2.7 left behind: a guess from the file's mtime.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot(inflated),
+            inflated,
+            UpdatedAt::Guessed,
+            None,
+            None,
+            None,
+        )
+        .expect("inflated");
+        assert_eq!(
+            effective_recency(&conn, "sess-inflated"),
+            Some(inflated as i64),
+            "with nothing but a guess, the guess is all there is"
+        );
+
+        // A scan that MEASURED the transcript corrects it downward.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot(spoke_at),
+            9_500,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("measured");
+        assert_eq!(
+            effective_recency(&conn, "sess-inflated"),
+            Some(spoke_at as i64),
+            "a measurement is a reading of the file as it is, and it supersedes a guess"
+        );
+
+        // An OBSERVATION still only moves forward: a late hook may not drag
+        // the row back.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot(500),
+            9_600,
+            UpdatedAt::Observed,
+            None,
+            None,
+            None,
+        )
+        .expect("late observation");
+        assert_eq!(
+            effective_recency(&conn, "sess-inflated"),
+            Some(spoke_at as i64),
+            "an observation that arrives late is still an older observation"
+        );
+    }
+
+    /// A v0.2.7 row holding a REAL Stop must not be dropped by the first
+    /// measurement below it. That column mixed scans and hooks, so the row
+    /// itself cannot say which it was — but history can, IF the right time
+    /// is taken from it: `observed_at` is when reconcile happened to run,
+    /// while the time the hook SAW is in the payload. A backlog processed
+    /// today would otherwise have backfilled ten-day-old activity as today's
+    /// — this release's own failure, rebuilt by its own migration.
+    #[test]
+    fn a_legacy_row_keeps_the_floor_its_events_prove() {
+        let path = std::env::temp_dir().join(format!("tinyctb-legacy-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            // A database as v0.2.7 left it. The event was SEEN at 1000 and
+            // RECONCILED at 9000 — a backlog, processed long afterwards.
+            let conn = create_state_db(&path).expect("db");
+            conn.execute_batch(
+                "INSERT INTO threads_cache(thread_id, status_type, status_flags_json,
+                                           updated_at, last_seen_at)
+                 VALUES ('sess-legacy', 'idle', '[]', 9000, 9000);
+                 INSERT INTO thread_events(event_key, thread_id, event_type, observed_at,
+                                           payload_json)
+                 VALUES ('thread_completed:sess-legacy:1', 'sess-legacy', 'thread_completed',
+                         9000, '{\"type\":\"thread_completed\",\"updatedAt\":1000}');
+                 -- A thread whose events were never worth notifying about, so
+                 -- nothing was recorded for it at all.
+                 INSERT INTO threads_cache(thread_id, status_type, status_flags_json,
+                                           updated_at, last_seen_at)
+                 VALUES ('sess-nofloor', 'idle', '[]', 9000, 9000);
+                 UPDATE threads_cache SET last_observed_at = NULL;",
+            )
+            .expect("legacy shape");
+        }
+
+        // Opening it again runs the migration.
+        let conn = create_state_db(&path).expect("reopen");
+        let floor: Option<i64> = conn
+            .query_row(
+                "SELECT last_observed_at FROM threads_cache WHERE thread_id = 'sess-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(
+            floor,
+            Some(1_000),
+            "the floor is when the hook SAW it, not when a backlog got round to it"
+        );
+
+        // A measurement above the floor is taken; the floor is not a ceiling.
+        let snapshot = |thread: &str, at: u64| BridgeThreadSnapshot {
+            thread_id: thread.to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(at),
+            status_type: "idle".to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: None,
+            last_preview: None,
+            pending_prompt: None,
+            event_uid: None,
+        };
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot("sess-legacy", 2_000),
+            9_500,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("first scan after the upgrade");
+        assert_eq!(
+            effective_recency(&conn, "sess-legacy"),
+            Some(2_000),
+            "the measurement is the ground truth for when the session last spoke"
+        );
+
+        // And below it, the floor holds.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot("sess-legacy", 500),
+            9_600,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("a lower reading");
+        assert_eq!(
+            effective_recency(&conn, "sess-legacy"),
+            Some(1_000),
+            "an upgrade may not lose what a hook had already seen"
+        );
+
+        // A row with nothing to recover from gets no floor — and that is
+        // the honest outcome, not a regression: the measurement is what says
+        // when the session spoke, and the floor only guards against reading
+        // a transcript before it was flushed.
+        let floor: Option<i64> = conn
+            .query_row(
+                "SELECT last_observed_at FROM threads_cache WHERE thread_id = 'sess-nofloor'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(floor, None, "nothing was recorded, so nothing is invented");
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot("sess-nofloor", 1_000),
+            9_700,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("scan");
+        assert_eq!(
+            effective_recency(&conn, "sess-nofloor"),
+            Some(1_000),
+            "and the measurement corrects it, which is the whole point"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A scan may not undo a hook. It learns status, turn state and the
+    /// prompt by READING THE ROW and writing them back, so what it writes is
+    /// whatever the row said when it started — a hook landing in between was
+    /// simply erased. No file race is needed for this: a scan and a hook in
+    /// the same second is enough.
+    #[test]
+    fn a_scan_does_not_write_back_what_a_hook_has_since_changed() {
+        let conn = create_state_db_in_memory().expect("db");
+        let row = |status: &str, turn: Option<&str>, prompt: Option<&str>| BridgeThreadSnapshot {
+            thread_id: "sess-authority".to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(1_000),
+            status_type: status.to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: turn.map(str::to_string),
+            last_preview: None,
+            pending_prompt: prompt.map(|id| PendingPrompt {
+                prompt_id: id.to_string(),
+                kind: "reply".to_string(),
+                status: "pending".to_string(),
+                question: Some("在等你".to_string()),
+                transcript_bytes: None,
+                notification_type: None,
+            }),
+            event_uid: None,
+        };
+        let prompt_now = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT prompt_id FROM pending_prompts WHERE thread_id = 'sess-authority'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .expect("row")
+        };
+        let status_now = |conn: &Connection| -> (String, Option<String>) {
+            conn.query_row(
+                "SELECT status_type, last_turn_status FROM threads_cache
+                  WHERE thread_id = 'sess-authority'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row")
+        };
+
+        // The state a scan read a moment ago: idle, finished, no prompt.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &row("idle", Some("completed"), None),
+            1_000,
+            UpdatedAt::Observed,
+            None,
+            None,
+            None,
+        )
+        .expect("seed");
+
+        // A hook lands: the session is asking something now.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &row("active", None, Some("notify:new")),
+            2_000,
+            UpdatedAt::Observed,
+            None,
+            None,
+            None,
+        )
+        .expect("hook");
+        assert_eq!(prompt_now(&conn).as_deref(), Some("notify:new"));
+
+        // The scan, holding what it read BEFORE the hook, writes its answer.
+        // It carries the prompt IT read — which is a statement about what it
+        // saw, not about what is there now.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &row("idle", Some("completed"), Some("notify:old")),
+            2_100,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("scan");
+        assert_eq!(
+            prompt_now(&conn).as_deref(),
+            Some("notify:new"),
+            "a scan that never saw this prompt may not delete it"
+        );
+        assert_eq!(
+            status_now(&conn),
+            ("active".to_string(), None),
+            "nor put back the status and turn state the hook has since changed"
+        );
+
+        // What a scan MAY do: retire the INSTANCE it actually read and found
+        // answered. Not the name — `notify:{received_at}` repeats inside a
+        // millisecond, so a name would clear whatever holds it now.
+        let revision_now = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT revision FROM pending_prompts WHERE thread_id = 'sess-authority'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("row")
+        };
+        let live = revision_now(&conn);
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &row("idle", Some("completed"), None),
+            2_200,
+            UpdatedAt::Measured,
+            Some(live - 1),
+            None,
+            None,
+        )
+        .expect("stale clear");
+        assert_eq!(
+            prompt_now(&conn).as_deref(),
+            Some("notify:new"),
+            "an instance this scan never read is not its to retire"
+        );
+
+        // Same NAME, new instance: a second Notification inside the same
+        // millisecond. A scan holding the first instance must not touch it.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &row("active", None, Some("notify:new")),
+            2_250,
+            UpdatedAt::Observed,
+            None,
+            None,
+            None,
+        )
+        .expect("same name, new instance");
+        let replaced = revision_now(&conn);
+        assert_ne!(
+            replaced, live,
+            "a rewrite is a new instance, never the old one"
+        );
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &row("idle", Some("completed"), None),
+            2_275,
+            UpdatedAt::Measured,
+            Some(live),
+            None,
+            None,
+        )
+        .expect("clear the instance that is gone");
+        assert_eq!(
+            prompt_now(&conn).as_deref(),
+            Some("notify:new"),
+            "the name is the same, the instance is not — and the instance is what counts"
+        );
+
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &row("idle", Some("completed"), None),
+            2_300,
+            UpdatedAt::Measured,
+            Some(replaced),
+            None,
+            None,
+        )
+        .expect("clear");
+        assert_eq!(
+            prompt_now(&conn),
+            None,
+            "the prompt it did read, and did find answered, it may retire"
+        );
+    }
+
+    /// Metadata has owners too. A hook that has no transcript to hand
+    /// carries neither name nor cwd — silence, not an erasure — and writing
+    /// its `None` in wiped what a scan had read off the file. And a Stop
+    /// whose answer has not reached the transcript yet must not have its
+    /// preview replaced by the previous one, read from a file that had not
+    /// caught up.
+    #[test]
+    fn metadata_has_owners_and_silence_erases_nothing() {
+        let conn = create_state_db_in_memory().expect("db");
+        let row = |name: Option<&str>, preview: Option<&str>, at: u64| BridgeThreadSnapshot {
+            thread_id: "sess-meta".to_string(),
+            name: name.map(str::to_string),
+            cwd: name.map(|_| "/work".to_string()),
+            updated_at: Some(at),
+            status_type: "idle".to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: None,
+            last_preview: preview.map(str::to_string),
+            pending_prompt: None,
+            event_uid: None,
+        };
+        let meta = |conn: &Connection| -> (Option<String>, Option<String>, Option<String>) {
+            conn.query_row(
+                "SELECT name, cwd, last_preview FROM threads_cache WHERE thread_id = 'sess-meta'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("row")
+        };
+
+        // A scan read a name, a cwd and a preview off the transcript.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &row(Some("项目"), Some("旧答复"), 1_000),
+            1_000,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("scan");
+        assert_eq!(
+            meta(&conn),
+            (
+                Some("项目".into()),
+                Some("/work".into()),
+                Some("旧答复".into())
+            )
+        );
+
+        // A hook with no transcript to hand: it knows nothing about the name.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &row(None, Some("新答复"), 2_000),
+            2_000,
+            UpdatedAt::Observed,
+            None,
+            None,
+            None,
+        )
+        .expect("hook");
+        assert_eq!(
+            meta(&conn),
+            (
+                Some("项目".into()),
+                Some("/work".into()),
+                Some("新答复".into())
+            ),
+            "silence about the name is not an instruction to forget it"
+        );
+
+        // A scan of a transcript that has not caught up yet: its reading is
+        // older than what was seen, so its preview is not the current one.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &row(Some("项目"), Some("旧答复"), 1_500),
+            2_100,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("lagging scan");
+        assert_eq!(
+            meta(&conn).2,
+            Some("新答复".into()),
+            "a file that had not caught up may not undo an answer that was seen"
+        );
+
+        // Once the transcript catches up, its reading is current again.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &row(Some("项目"), Some("更新的答复"), 3_000),
+            3_000,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("caught up");
+        assert_eq!(meta(&conn).2, Some("更新的答复".into()));
+    }
+
+    /// A hook that could not be read is kept for the next cycle, so hooks
+    /// can arrive OUT OF ORDER. The one that matters: a Stop lands, then the
+    /// Notification that came before it. Only `last_observed_at` was a
+    /// maximum, so the floor held while everything under it — status, turn
+    /// status, preview, the prompt — was written straight back to the older
+    /// hook's version, and an answered question reappeared in `/threads`
+    /// with no hook left to clear it.
+    ///
+    /// The effects split by what they CLAIM, not by their age: an old
+    /// "waiting" asserts something about now and must not be spoken; an old
+    /// "completed" is a fact that happened and is still owed to whoever was
+    /// promised it.
+    #[test]
+    fn a_late_hook_cannot_reopen_what_a_newer_one_closed() {
+        let conn = create_state_db_in_memory().expect("db");
+        set_setting_text(&conn, "away", "true").expect("away");
+        let hook = |at: u64,
+                    status: &str,
+                    turn: Option<&str>,
+                    preview: &str,
+                    prompt: Option<&str>,
+                    uid: &str| BridgeThreadSnapshot {
+            thread_id: "sess-order".to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(at),
+            status_type: status.to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: turn.map(str::to_string),
+            last_preview: Some(preview.to_string()),
+            pending_prompt: prompt.map(|id| PendingPrompt {
+                prompt_id: id.to_string(),
+                kind: "reply".to_string(),
+                status: "pending".to_string(),
+                question: Some("要不要继续？".to_string()),
+                transcript_bytes: None,
+                notification_type: None,
+            }),
+            event_uid: Some(uid.to_string()),
+        };
+        let row = |conn: &Connection| -> (String, Option<String>, Option<String>, i64) {
+            conn.query_row(
+                "SELECT status_type, last_turn_status, last_preview,
+                        (SELECT COUNT(*) FROM pending_prompts WHERE thread_id = 'sess-order')
+                 FROM threads_cache WHERE thread_id = 'sess-order'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("row")
+        };
+
+        // The Stop lands first: the session finished and is asking nothing.
+        let done = reconcile_thread_snapshots(
+            &conn,
+            2_000,
+            vec![hook(
+                2_000,
+                "idle",
+                Some("completed"),
+                "新答复",
+                None,
+                "uid-stop",
+            )],
+            false,
+        )
+        .expect("stop");
+        assert_eq!(
+            row(&conn),
+            (
+                "idle".into(),
+                Some("completed".into()),
+                Some("新答复".into()),
+                0
+            )
+        );
+        assert_eq!(
+            done.get("events").and_then(Value::as_array).map(Vec::len),
+            Some(1),
+            "the completion is announced"
+        );
+
+        // Now the Notification that PRECEDED it finally gets read.
+        let late = reconcile_thread_snapshots(
+            &conn,
+            2_100,
+            vec![hook(
+                1_000,
+                "active",
+                None,
+                "旧答复",
+                Some("notify:1000"),
+                "uid-notify",
+            )],
+            false,
+        )
+        .expect("late notification");
+        assert_eq!(
+            row(&conn),
+            (
+                "idle".into(),
+                Some("completed".into()),
+                Some("新答复".into()),
+                0
+            ),
+            "an overtaken hook may not put the session back to what it was"
+        );
+        assert_eq!(
+            late.get("events").and_then(Value::as_array).map(Vec::len),
+            Some(0),
+            "and must not ask a question the session has already answered"
+        );
+        assert_eq!(
+            late.get("threads").and_then(Value::as_array).map(Vec::len),
+            Some(0),
+            "nor hand its stale snapshot back by another door"
+        );
+
+        // A late COMPLETION is a different claim: it happened, and the
+        // person it was promised to still has not heard it.
+        let late_done = reconcile_thread_snapshots(
+            &conn,
+            2_200,
+            vec![hook(
+                1_500,
+                "idle",
+                Some("completed"),
+                "更早就完成了",
+                None,
+                "uid-stop-early",
+            )],
+            false,
+        )
+        .expect("late completion");
+        assert_eq!(
+            late_done
+                .get("events")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1),
+            "a completion that arrived late is still a completion that happened"
+        );
+        assert_eq!(
+            row(&conn).2,
+            Some("新答复".into()),
+            "though it still may not restate the present"
+        );
+    }
+
+    /// Two hooks stamped the SAME millisecond. There is no order to find:
+    /// the spool names entries `{received_at}-{pid}-{event}`, and a pid is
+    /// not a sequence, so sorting on it would dress an arbitrary order up as
+    /// causality. This pins the policy instead of pretending — a tie counts
+    /// as CURRENT, in both directions — and the reason is which loss is
+    /// recoverable. Accepting a tie can push a question already answered,
+    /// and the next scan retires the row. Refusing one can drop a real
+    /// question that nothing later re-raises, and an away user never learns
+    /// it was asked.
+    #[test]
+    fn hooks_stamped_the_same_millisecond_are_not_ordered_and_do_not_lose() {
+        let hook = |thread: &str,
+                    at: u64,
+                    status: &str,
+                    turn: Option<&str>,
+                    prompt: Option<&str>,
+                    uid: &str| BridgeThreadSnapshot {
+            thread_id: thread.to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(at),
+            status_type: status.to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: turn.map(str::to_string),
+            last_preview: None,
+            pending_prompt: prompt.map(|id| PendingPrompt {
+                prompt_id: id.to_string(),
+                kind: "reply".to_string(),
+                status: "pending".to_string(),
+                question: Some("同毫秒".to_string()),
+                transcript_bytes: None,
+                notification_type: None,
+            }),
+            event_uid: Some(uid.to_string()),
+        };
+        let prompt_of = |conn: &Connection, thread: &str| -> Option<(String, i64)> {
+            conn.query_row(
+                "SELECT prompt_id, revision FROM pending_prompts WHERE thread_id = ?1",
+                params![thread],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .expect("prompt")
+        };
+
+        // Stop first, then the Notification stamped the same millisecond.
+        let conn = create_state_db_in_memory().expect("db");
+        set_setting_text(&conn, "away", "true").expect("away");
+        reconcile_thread_snapshots(
+            &conn,
+            1_000,
+            vec![hook(
+                "sess-tie-a",
+                1_000,
+                "idle",
+                Some("completed"),
+                None,
+                "uid-1",
+            )],
+            false,
+        )
+        .expect("stop");
+        let after = reconcile_thread_snapshots(
+            &conn,
+            1_100,
+            vec![hook(
+                "sess-tie-a",
+                1_000,
+                "active",
+                None,
+                Some("notify:1000"),
+                "uid-2",
+            )],
+            false,
+        )
+        .expect("tied notification");
+        let raised = prompt_of(&conn, "sess-tie-a").expect("a tie is treated as current");
+        assert_eq!(raised.0, "notify:1000");
+        assert!(
+            raised.1 > 0,
+            "and it carries a real instance id, so a scan that finds it answered can clear it"
+        );
+        assert_eq!(
+            after.get("events").and_then(Value::as_array).map(Vec::len),
+            Some(1),
+            "the question reaches the phone rather than being silently dropped"
+        );
+
+        // The other direction, same millisecond: the Stop lands second.
+        let conn = create_state_db_in_memory().expect("db");
+        set_setting_text(&conn, "away", "true").expect("away");
+        reconcile_thread_snapshots(
+            &conn,
+            1_000,
+            vec![hook(
+                "sess-tie-b",
+                1_000,
+                "active",
+                None,
+                Some("notify:1000"),
+                "uid-3",
+            )],
+            false,
+        )
+        .expect("notification");
+        let after = reconcile_thread_snapshots(
+            &conn,
+            1_100,
+            vec![hook(
+                "sess-tie-b",
+                1_000,
+                "idle",
+                Some("completed"),
+                None,
+                "uid-4",
+            )],
+            false,
+        )
+        .expect("tied stop");
+        assert_eq!(
+            prompt_of(&conn, "sess-tie-b"),
+            None,
+            "a tie is current in this direction too: the Stop clears the prompt"
+        );
+        assert_eq!(
+            after.get("events").and_then(Value::as_array).map(Vec::len),
+            Some(1),
+            "and the completion is announced"
+        );
+    }
+
+    /// The high point is only meaningful while the clock moves forward. An
+    /// NTP correction steps it back, and one bad `receivedAt` plants a stamp
+    /// years ahead by itself — after which every real hook looks late and the
+    /// session's status, prompt and routing freeze until the clock catches
+    /// up, which for a future stamp is never. A high point ahead of the clock
+    /// is damage, not evidence, and the baseline is rebuilt from what is
+    /// actually arriving.
+    #[test]
+    fn a_high_point_ahead_of_the_clock_stops_counting_as_evidence() {
+        let conn = create_state_db_in_memory().expect("db");
+        let hook = |at: u64, status: &str| BridgeThreadSnapshot {
+            thread_id: "sess-clock".to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(at),
+            status_type: status.to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: None,
+            last_preview: Some(status.to_string()),
+            pending_prompt: None,
+            event_uid: None,
+        };
+        let seen = |conn: &Connection| -> (String, Option<i64>) {
+            conn.query_row(
+                "SELECT status_type, last_observed_at FROM threads_cache
+                 WHERE thread_id = 'sess-clock'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row")
+        };
+
+        // A hook arrives with a stamp far ahead of everything — a bad clock
+        // on the machine that wrote it, or an NTP step about to happen here.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &hook(10_000, "active"),
+            10_000,
+            UpdatedAt::Observed,
+            None,
+            None,
+            None,
+        )
+        .expect("future hook");
+        assert_eq!(seen(&conn), ("active".into(), Some(10_000)));
+
+        // The clock is now 9_100, and a real hook is stamped 9_000 — BEFORE
+        // the cycle that reads it, which is the normal case and the one a
+        // floor of `now` would have swallowed. The stored high point is in
+        // the future, so it cannot judge anything; the hook is taken and the
+        // floor is rebuilt from it.
+        let write = upsert_thread_snapshot(
+            &conn,
+            &hook(9_000, "idle"),
+            9_100,
+            UpdatedAt::Observed,
+            None,
+            None,
+            None,
+        )
+        .expect("hook after the step back");
+        assert_eq!(
+            write,
+            SnapshotWrite::Applied,
+            "a session must not freeze because the clock moved backwards"
+        );
+        assert_eq!(
+            seen(&conn),
+            ("idle".into(), Some(9_000)),
+            "and the floor is REBUILT from what arrived, not maxed against the damage"
+        );
+
+        // Rebuilt, not merely disabled: an older hook is refused again.
+        let write = upsert_thread_snapshot(
+            &conn,
+            &hook(8_000, "active"),
+            9_200,
+            UpdatedAt::Observed,
+            None,
+            None,
+            None,
+        )
+        .expect("older hook");
+        assert_eq!(write, SnapshotWrite::Superseded);
+        assert_eq!(
+            seen(&conn),
+            ("idle".into(), Some(9_000)),
+            "the new baseline holds the line the old one used to"
+        );
+    }
+
+    /// A clock that steps BACKWARDS is the case the repair exists for, and
+    /// it only ever fires on the stored high point being ahead of the clock.
+    /// Anything that holds the clock up — a `max` against the cycle's start,
+    /// say — hides exactly that condition, and then every real hook after
+    /// the correction is judged against a mark from before it.
+    #[test]
+    fn a_step_backwards_lets_the_session_move_again() {
+        let conn = create_state_db_in_memory().expect("db");
+        conn.execute(
+            "INSERT INTO threads_cache(
+                thread_id, status_type, status_flags_json, updated_at, last_seen_at,
+                last_turn_status, last_preview, last_observed_at)
+             VALUES ('sess-back', 'active', '[]', 9000, 9000, NULL, '旧答复', 9000)",
+            [],
+        )
+        .expect("row");
+        conn.execute(
+            "INSERT INTO pending_prompts(
+                thread_id, prompt_id, prompt_kind, prompt_status, question, created_at, revision)
+             VALUES ('sess-back', 'notify:8000', 'reply', 'pending', '回拨前的问题', 8000, 1)",
+            [],
+        )
+        .expect("prompt");
+
+        // The clock is now 5000, and a real Stop arrives stamped 5100.
+        let write = upsert_thread_snapshot(
+            &conn,
+            &BridgeThreadSnapshot {
+                thread_id: "sess-back".to_string(),
+                name: None,
+                cwd: None,
+                updated_at: Some(5_100),
+                status_type: "idle".to_string(),
+                status_flags: Vec::new(),
+                last_turn_status: Some("completed".to_string()),
+                last_preview: Some("新答复".to_string()),
+                pending_prompt: None,
+                event_uid: Some("uid-back".to_string()),
+            },
+            5_200,
+            UpdatedAt::Observed,
+            None,
+            None,
+            Some(5_100),
+        )
+        .expect("stop after the step back");
+
+        assert_eq!(
+            write,
+            SnapshotWrite::Applied,
+            "a session must not stay frozen at where an old clock left it"
+        );
+        let (status, turn, preview, observed, prompts): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT status_type, last_turn_status, last_preview, last_observed_at,
+                        (SELECT COUNT(*) FROM pending_prompts WHERE thread_id = 'sess-back')
+                 FROM threads_cache WHERE thread_id = 'sess-back'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("row");
+        assert_eq!(
+            (
+                status.as_str(),
+                turn.as_deref(),
+                preview.as_deref(),
+                prompts
+            ),
+            ("idle", Some("completed"), Some("新答复"), 0),
+            "the answer lands and the question it answered is cleared"
+        );
+        assert_eq!(
+            observed,
+            Some(5_100),
+            "and the floor is rebuilt from the hook that actually arrived"
+        );
+
+        // The route moves with it, on a sighting stamped before the cycle
+        // that reads it, as every real one is.
+        record_session_messaging_socket(
+            &conn,
+            "sess-back",
+            &crate::claude::SessionSocket {
+                path: "/run/after.sock".to_string(),
+                inode: None,
+                boot_id: None,
+            },
+            5_100,
+            5_200,
+        )
+        .expect("socket after the step back");
+        let routed: Option<String> = conn
+            .query_row(
+                "SELECT messaging_socket FROM threads_cache WHERE thread_id = 'sess-back'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(routed.as_deref(), Some("/run/after.sock"));
+    }
+
+    /// The evidence a repair is made against has to last as long as the
+    /// batch it is judging. It did not: the first entry wrote its own stamp
+    /// over the damaged high point, so the damage was gone by the second
+    /// statement and everything after it was measured against whatever that
+    /// first entry happened to say — a floor two events had just been
+    /// refused by, lowered by one of them.
+    #[test]
+    fn a_refused_event_cannot_lower_the_floor_it_was_refused_by() {
+        let conn = create_state_db_in_memory().expect("db");
+        let hook = |at: u64, status: &str, turn: Option<&str>, prompt: Option<&str>, uid: &str| {
+            BridgeThreadSnapshot {
+                thread_id: "sess-floor".to_string(),
+                name: None,
+                cwd: None,
+                updated_at: Some(at),
+                status_type: status.to_string(),
+                status_flags: Vec::new(),
+                last_turn_status: turn.map(str::to_string),
+                last_preview: None,
+                pending_prompt: prompt.map(|id| PendingPrompt {
+                    prompt_id: id.to_string(),
+                    kind: "reply".to_string(),
+                    status: "pending".to_string(),
+                    question: Some("旧问题".to_string()),
+                    transcript_bytes: None,
+                    notification_type: None,
+                }),
+                event_uid: Some(uid.to_string()),
+            }
+        };
+
+        // A damaged high point, and a transcript reading that is real: the
+        // session was demonstrably still talking at 2000.
+        conn.execute(
+            "INSERT INTO threads_cache(
+                thread_id, status_type, status_flags_json, updated_at, last_seen_at,
+                last_turn_status, last_preview, last_observed_at, last_record_at)
+             VALUES ('sess-floor', 'active', '[]', 2000, 2000,
+                     NULL, '现状', 9000, 2000)",
+            [],
+        )
+        .expect("damaged row");
+
+        // Both of these are older than the transcript already proves.
+        let result = reconcile_thread_snapshots(
+            &conn,
+            2_500,
+            vec![
+                hook(1_000, "active", None, Some("notify:1000"), "uid-a"),
+                hook(1_500, "idle", Some("completed"), None, "uid-b"),
+            ],
+            false,
+        )
+        .expect("batch");
+
+        let (status, turn, preview, observed, prompts): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT status_type, last_turn_status, last_preview, last_observed_at,
+                        (SELECT COUNT(*) FROM pending_prompts WHERE thread_id = 'sess-floor')
+                 FROM threads_cache WHERE thread_id = 'sess-floor'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("row");
+        assert_eq!(
+            (
+                status.as_str(),
+                turn.as_deref(),
+                preview.as_deref(),
+                prompts
+            ),
+            ("active", None, Some("现状"), 0),
+            "neither entry is newer than what the transcript proves, so neither may speak"
+        );
+        assert!(
+            observed.is_some_and(|at| at >= 2_000),
+            "and the floor they were both refused by must still be standing, got {observed:?}"
+        );
+        assert_eq!(
+            result
+                .get("threads")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0),
+            "nor may either be handed back as the present"
+        );
+    }
+
+    /// The repair must not become a second way in. A high point from the
+    /// future makes the stored one unusable — and the next thing to arrive is
+    /// as likely to be an entry kept over from a failed read as a fresh hook.
+    /// Handing THAT the baseline would let the backlog re-declare the past as
+    /// the present: the old question back on the phone, the old socket back
+    /// on the reply route.
+    #[test]
+    fn a_backlog_entry_does_not_inherit_a_broken_baseline() {
+        let conn = create_state_db_in_memory().expect("db");
+        let old_hook = BridgeThreadSnapshot {
+            thread_id: "sess-backlog".to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(1_000),
+            status_type: "active".to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: None,
+            last_preview: Some("旧答复".to_string()),
+            pending_prompt: Some(PendingPrompt {
+                prompt_id: "notify:1000".to_string(),
+                kind: "reply".to_string(),
+                status: "pending".to_string(),
+                question: Some("积压的旧问题".to_string()),
+                transcript_bytes: None,
+                notification_type: None,
+            }),
+            event_uid: Some("uid-backlog".to_string()),
+        };
+
+        // The row as an older build left it: a high point from the future,
+        // and the session long since finished and quiet.
+        conn.execute(
+            "INSERT INTO threads_cache(
+                thread_id, status_type, status_flags_json, updated_at, last_seen_at,
+                last_turn_status, last_preview, last_observed_at,
+                messaging_socket, socket_observed_at)
+             VALUES ('sess-backlog', 'idle', '[]', 9_000_000, 9_000_000,
+                     'completed', '新答复', 9_000_000, '/run/new.sock', 9_000_000)",
+            [],
+        )
+        .expect("damaged row");
+
+        // The cycle also holds this session's current hook — which is what a
+        // retained entry comes back alongside — so the floor is rebuilt from
+        // the batch's newest observation rather than from the entry that
+        // happened to be read first.
+        let write = upsert_thread_snapshot(
+            &conn,
+            &old_hook,
+            1_100,
+            UpdatedAt::Observed,
+            None,
+            None,
+            Some(1_050),
+        )
+        .expect("backlog hook");
+        assert_eq!(
+            write,
+            SnapshotWrite::Superseded,
+            "a broken high point is not a licence for the backlog to speak"
+        );
+        let (status, turn, preview, prompts): (String, Option<String>, Option<String>, i64) = conn
+            .query_row(
+                "SELECT status_type, last_turn_status, last_preview,
+                        (SELECT COUNT(*) FROM pending_prompts WHERE thread_id = 'sess-backlog')
+                 FROM threads_cache WHERE thread_id = 'sess-backlog'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("row");
+        assert_eq!(
+            (
+                status.as_str(),
+                turn.as_deref(),
+                preview.as_deref(),
+                prompts
+            ),
+            ("idle", Some("completed"), Some("新答复"), 0),
+            "the old question must not come back and the old answer must not return"
+        );
+
+        // Nor may the backlog's socket take the reply route.
+        record_session_messaging_socket(
+            &conn,
+            "sess-backlog",
+            &crate::claude::SessionSocket {
+                path: "/run/old.sock".to_string(),
+                inode: None,
+                boot_id: None,
+            },
+            1_000,
+            1_100,
+        )
+        .expect("backlog socket");
+        let routed: Option<String> = conn
+            .query_row(
+                "SELECT messaging_socket FROM threads_cache WHERE thread_id = 'sess-backlog'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("socket");
+        assert_eq!(
+            routed.as_deref(),
+            Some("/run/new.sock"),
+            "a reply must not be sent where the session used to listen"
+        );
+
+        // The doubt is RECORDED, not papered over with a fresh timestamp.
+        assert_eq!(
+            quarantine_future_socket_sightings(&conn, 1_200).expect("quarantine"),
+            1
+        );
+        let (route, seen, doubted): (Option<String>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT messaging_socket, socket_observed_at, socket_unverified_since
+                   FROM threads_cache WHERE thread_id = 'sess-backlog'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("row");
+        assert_eq!(route.as_deref(), Some("/run/new.sock"));
+        assert_eq!(
+            seen, None,
+            "the unbelievable sighting is removed, not rewritten"
+        );
+        assert!(doubted.is_some(), "and the doubt is what persists");
+        assert_eq!(
+            quarantine_future_socket_sightings(&conn, 1_300).expect("again"),
+            0,
+            "there is nothing left to mark, but the mark already made stands"
+        );
+
+        // A REAL hook ends it — stamped before the cycle that reads it, which
+        // is the normal case and which a floor of `now` would have refused.
+        record_session_messaging_socket(
+            &conn,
+            "sess-backlog",
+            &crate::claude::SessionSocket {
+                path: "/run/vouched.sock".to_string(),
+                inode: None,
+                boot_id: None,
+            },
+            1_350,
+            1_400,
+        )
+        .expect("fresh sighting");
+        let (route, doubted): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT messaging_socket, socket_unverified_since
+                   FROM threads_cache WHERE thread_id = 'sess-backlog'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(
+            route.as_deref(),
+            Some("/run/vouched.sock"),
+            "a hook stamped before the cycle that reads it must still be able to speak"
+        );
+        assert_eq!(doubted, None, "and vouching for the route ends the doubt");
+    }
+
+    /// The same repair for the reply route: a frozen socket sends answers to
+    /// where a session used to listen, for as long as the clock lags.
+    #[test]
+    fn a_socket_sighting_ahead_of_the_clock_is_rebuilt_too() {
+        let conn = create_state_db_in_memory().expect("db");
+        let socket = |name: &str| crate::claude::SessionSocket {
+            path: format!("/run/user/1000/{name}.sock"),
+            inode: None,
+            boot_id: None,
+        };
+        let stored = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT messaging_socket FROM threads_cache WHERE thread_id = 'sess-clock-sock'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row")
+        };
+
+        record_session_messaging_socket(
+            &conn,
+            "sess-clock-sock",
+            &socket("future"),
+            10_000,
+            10_000,
+        )
+        .expect("future sighting");
+        assert_eq!(stored(&conn).as_deref(), Some("/run/user/1000/future.sock"));
+
+        record_session_messaging_socket(&conn, "sess-clock-sock", &socket("real"), 9_000, 9_000)
+            .expect("after the step back");
+        assert_eq!(
+            stored(&conn).as_deref(),
+            Some("/run/user/1000/real.sock"),
+            "routing must not stay pinned to a sighting from a time that has not happened"
+        );
+
+        record_session_messaging_socket(&conn, "sess-clock-sock", &socket("older"), 8_000, 9_100)
+            .expect("older sighting");
+        assert_eq!(
+            stored(&conn).as_deref(),
+            Some("/run/user/1000/real.sock"),
+            "and the rebuilt baseline still refuses what is genuinely behind it"
+        );
+    }
+
+    /// `COALESCE` answers "is this value missing?" and nothing else. It does
+    /// not ask whether the writer had any business speaking: a scan holding
+    /// an OLD non-null name wrote it straight over the hook's new one, and a
+    /// GUESS -- whose only clock is the file mtime this whole version exists
+    /// to stop trusting -- could put the previous answer back with a `touch`.
+    #[test]
+    fn a_guess_cannot_outrank_an_observation() {
+        let conn = create_state_db_in_memory().expect("db");
+        let row = |name: &str, preview: &str, at: u64| BridgeThreadSnapshot {
+            thread_id: "sess-rank".to_string(),
+            name: Some(name.to_string()),
+            cwd: Some(format!("/work/{name}")),
+            updated_at: Some(at),
+            status_type: "idle".to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: None,
+            last_preview: Some(preview.to_string()),
+            pending_prompt: None,
+            event_uid: None,
+        };
+        let meta = |conn: &Connection| -> (String, String, String) {
+            conn.query_row(
+                "SELECT name, cwd, last_preview FROM threads_cache WHERE thread_id = 'sess-rank'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("row")
+        };
+
+        // A transcript with no parseable stamps at all: only a guess is left,
+        // and on a row nothing has ever been observed on it may fill the gap.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &row("旧名", "旧答复", 1_000),
+            1_000,
+            UpdatedAt::Guessed,
+            None,
+            None,
+            None,
+        )
+        .expect("guess fills a gap");
+        assert_eq!(meta(&conn).2, "旧答复".to_string());
+
+        // A Stop hook: real activity, with the answer in its own payload.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &row("新名", "新答复", 2_000),
+            2_000,
+            UpdatedAt::Observed,
+            None,
+            None,
+            None,
+        )
+        .expect("hook");
+        assert_eq!(
+            meta(&conn),
+            ("新名".into(), "/work/新名".into(), "新答复".into())
+        );
+
+        // The file is touched -- backed up, copied, opened by an editor. Its
+        // mtime now says 9000 and its contents still say the old answer.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &row("旧名", "旧答复", 9_000),
+            9_000,
+            UpdatedAt::Guessed,
+            None,
+            None,
+            None,
+        )
+        .expect("guess after a touch");
+        assert_eq!(
+            meta(&conn),
+            ("新名".into(), "/work/新名".into(), "新答复".into()),
+            "an mtime is not evidence, and may not overrule something seen"
+        );
+
+        // A reading that DOES carry record stamps, but older ones: it is
+        // talking about a file that has not caught up yet.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &row("旧名", "旧答复", 1_500),
+            2_100,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("lagging reading");
+        assert_eq!(
+            meta(&conn),
+            ("新名".into(), "/work/新名".into(), "新答复".into()),
+            "a non-null old value is still an old value"
+        );
+
+        // Once the transcript catches up, the reading is current again.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &row("最新名", "更新的答复", 3_000),
+            3_000,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("caught up");
+        assert_eq!(
+            meta(&conn),
+            ("最新名".into(), "/work/最新名".into(), "更新的答复".into())
+        );
+    }
+
+    /// The queries must RETURN the effective time, not merely order by it.
+    /// Ordering with one value and handing back another meant a row could be
+    /// selected as 08-12 and then arrive carrying "today" — and `/threads`
+    /// sorts a second time on what it was handed, and shows it. The original
+    /// failure was still reachable inside the pool the SQL had ordered
+    /// correctly.
+    #[test]
+    fn the_listings_return_the_time_they_ordered_by() {
+        let conn = create_state_db_in_memory().expect("db");
+        let spoke_at = 1_000u64;
+        let inflated = 9_000u64;
+        let snapshot = BridgeThreadSnapshot {
+            thread_id: "sess-listed".to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(inflated),
+            status_type: "idle".to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: Some("completed".to_string()),
+            last_preview: None,
+            pending_prompt: None,
+            event_uid: None,
+        };
+        // A v0.2.7 row: the guess is in `updated_at` and stays there.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot,
+            inflated,
+            UpdatedAt::Guessed,
+            None,
+            None,
+            None,
+        )
+        .expect("guess");
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &BridgeThreadSnapshot {
+                updated_at: Some(spoke_at),
+                ..snapshot.clone()
+            },
+            9_500,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("measurement");
+        let raw: Option<i64> = conn
+            .query_row(
+                "SELECT updated_at FROM threads_cache WHERE thread_id = 'sess-listed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(
+            raw,
+            Some(inflated as i64),
+            "the fixture is only meaningful while the legacy column still lies"
+        );
+
+        let listed = list_recent_thread_snapshots_from_db(&conn, 10).expect("recent");
+        let found = listed
+            .iter()
+            .find(|item| item.thread_id == "sess-listed")
+            .expect("listed");
+        assert_eq!(
+            found.updated_at,
+            Some(spoke_at),
+            "what comes back is what was ordered by — anything else re-sorts on a lie"
+        );
+    }
+
+    /// The backfill runs while the database is being OPENED, so one bad
+    /// historical payload must not be able to stop tinyctb from starting —
+    /// and a value it cannot read must not be guessed at either.
+    #[test]
+    fn the_backfill_survives_whatever_history_holds() {
+        let path = std::env::temp_dir().join(format!("tinyctb-badjson-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = create_state_db(&path).expect("db");
+            conn.execute_batch(
+                "INSERT INTO threads_cache(thread_id, status_type, status_flags_json,
+                                           updated_at, last_seen_at)
+                 VALUES ('sess-bad', 'idle', '[]', 9000, 9000),
+                        ('sess-text', 'idle', '[]', 9000, 9000),
+                        ('sess-null', 'idle', '[]', 9000, 9000),
+                        ('sess-future', 'idle', '[]', 9000, 9000);
+                 INSERT INTO thread_events(event_key, thread_id, event_type, observed_at,
+                                           payload_json)
+                 VALUES ('a', 'sess-bad', 'thread_completed', 9000, '{ not json'),
+                        ('b', 'sess-text', 'thread_completed', 9000,
+                         '{\"updatedAt\":\"soon\"}'),
+                        ('c', 'sess-null', 'thread_completed', 9000, '{\"updatedAt\":null}'),
+                        ('d', 'sess-future', 'thread_completed', 9000,
+                         '{\"updatedAt\":99999999999999}');
+                 UPDATE threads_cache SET last_observed_at = NULL;",
+            )
+            .expect("history worth surviving");
+        }
+
+        // It opens at all — which is the first thing being asserted.
+        let conn = create_state_db(&path).expect("a bad payload may not stop the daemon");
+        for thread in ["sess-bad", "sess-text", "sess-null", "sess-future"] {
+            let floor: Option<i64> = conn
+                .query_row(
+                    "SELECT last_observed_at FROM threads_cache WHERE thread_id = ?1",
+                    params![thread],
+                    |row| row.get(0),
+                )
+                .expect("row");
+            assert_eq!(
+                floor, None,
+                "{thread}: a time that cannot be read is not a time — and a floor from the \
+                 future would never be correctable"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A transcript rewritten to carry NO stamps must not keep reporting the
+    /// time the last version had. "Measured first, guessed second" only held
+    /// for a row's first write: a later guess did not clear the measurement,
+    /// so a value no longer anywhere in the file went on being served, and
+    /// the mtime it should have fallen back to was never used.
+    #[test]
+    fn a_reading_with_no_stamps_clears_the_measurement_it_replaces() {
+        let conn = create_state_db_in_memory().expect("db");
+        let snapshot = |at: u64| BridgeThreadSnapshot {
+            thread_id: "sess-cleared".to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(at),
+            status_type: "idle".to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: None,
+            last_preview: None,
+            pending_prompt: None,
+            event_uid: None,
+        };
+
+        // Generation 100 carried a stamp at 1000.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot(1_000),
+            1_000,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("measured");
+        assert_eq!(effective_recency(&conn, "sess-cleared"), Some(1_000));
+
+        // Generation 200 is a truncation: no stamps at all, mtime 9000.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot(9_000),
+            9_100,
+            UpdatedAt::Guessed,
+            None,
+            None,
+            None,
+        )
+        .expect("guessed");
+        assert_eq!(
+            effective_recency(&conn, "sess-cleared"),
+            Some(9_000),
+            "the measurement is not in the file any more, so it is not the answer any more"
+        );
+        let record: Option<i64> = conn
+            .query_row(
+                "SELECT last_record_at FROM threads_cache WHERE thread_id = 'sess-cleared'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(record, None, "and it is cleared, not merely outranked");
+    }
+
+    /// A file REPLACED by rename can carry an older mtime than the one it
+    /// replaced. Comparing generations alone rejected every reading of the
+    /// new file, for good — a permanent failure traded for a microsecond
+    /// window. A different inode is a different file, and its reading is the
+    /// current one whatever its mtime says.
+    #[test]
+    fn a_replaced_file_is_not_rejected_for_carrying_an_older_mtime() {
+        let conn = create_state_db_in_memory().expect("db");
+        let snapshot = |at: u64| BridgeThreadSnapshot {
+            thread_id: "sess-renamed".to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(at),
+            status_type: "idle".to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: None,
+            last_preview: None,
+            pending_prompt: None,
+            event_uid: None,
+        };
+
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot(9_000),
+            9_000,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("original file");
+        // Replaced by rename: a different inode, an older mtime.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot(1_000),
+            9_100,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("replacement");
+        assert_eq!(
+            effective_recency(&conn, "sess-renamed"),
+            Some(1_000),
+            "a different file is not an older reading of the same one"
+        );
+    }
+
+    /// The observation FLOOR survives a measurement that moved past it.
+    /// Storing only "who wrote the current value" lost it: after
+    /// Observed(9000) → Measured(9500), the row simply said "measured", so
+    /// Measured(8000) walked straight past 9000 — a time a hook had SEEN
+    /// happen. Two kinds of evidence, kept apart, composed when read.
+    #[test]
+    fn a_measurement_cannot_cross_below_an_observation_it_once_passed() {
+        let conn = create_state_db_in_memory().expect("db");
+        let snapshot = |at: u64| BridgeThreadSnapshot {
+            thread_id: "sess-floor".to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(at),
+            status_type: "idle".to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: None,
+            last_preview: None,
+            pending_prompt: None,
+            event_uid: None,
+        };
+
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot(9_000),
+            9_000,
+            UpdatedAt::Observed,
+            None,
+            None,
+            None,
+        )
+        .expect("observed");
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot(9_500),
+            9_600,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("measured past it");
+        assert_eq!(effective_recency(&conn, "sess-floor"), Some(9_500));
+
+        // The third step is the one that used to walk past the floor.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot(8_000),
+            9_700,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("measured below it");
+        assert_eq!(
+            effective_recency(&conn, "sess-floor"),
+            Some(9_000),
+            "a reading may fall back to the floor, never below it — 9000 was SEEN"
+        );
+    }
+
+    /// A measurement must not drag a real OBSERVATION backwards. Knowing
+    /// only the arriving value's provenance cannot decide that: a Stop
+    /// observed at 9000, then a transcript read at 8000, and the row wrote
+    /// down real activity as older than it was — with a daemon and a CLI
+    /// running together, an older scan could do it to a hook that had just
+    /// landed.
+    #[test]
+    fn a_measurement_does_not_overwrite_a_real_observation() {
+        let conn = create_state_db_in_memory().expect("db");
+        let snapshot = |at: u64| BridgeThreadSnapshot {
+            thread_id: "sess-observed".to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(at),
+            status_type: "idle".to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: None,
+            last_preview: None,
+            pending_prompt: None,
+            event_uid: None,
+        };
+        let stored_at = |conn: &Connection| effective_recency(conn, "sess-observed");
+
+        // A hook saw real activity at 9000.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot(9_000),
+            9_000,
+            UpdatedAt::Observed,
+            None,
+            None,
+            None,
+        )
+        .expect("observation");
+        // A scan then reads the transcript's last record as 8000.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot(8_000),
+            9_100,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("measurement");
+        assert_eq!(
+            stored_at(&conn),
+            Some(9_000),
+            "a reading of the file may not contradict something that was seen happening"
+        );
+
+        // Forward, it may: the session has spoken since.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot(9_500),
+            9_600,
+            UpdatedAt::Measured,
+            None,
+            None,
+            None,
+        )
+        .expect("newer measurement");
+        assert_eq!(stored_at(&conn), Some(9_500));
+
+        // A reading with no stamps clears the measurement and falls back to
+        // the mtime — and the OBSERVATION floor still holds the row up.
+        let _ = upsert_thread_snapshot(
+            &conn,
+            &snapshot(500),
+            99_000,
+            UpdatedAt::Guessed,
+            None,
+            None,
+            None,
+        )
+        .expect("guess below the floor");
+        assert_eq!(
+            stored_at(&conn),
+            Some(9_000),
+            "a mtime below something that was SEEN cannot pull the row under it"
+        );
+    }
     use rusqlite::Connection;
     use serde_json::json;
 
@@ -4321,7 +6746,7 @@ mod tests {
         );
 
         // A fresh write through the production upsert carries the type.
-        upsert_thread_snapshot(
+        let _ = upsert_thread_snapshot(
             &conn,
             &BridgeThreadSnapshot {
                 thread_id: "thr_new".to_string(),
@@ -4343,6 +6768,10 @@ mod tests {
                 event_uid: None,
             },
             2000,
+            UpdatedAt::Observed,
+            None,
+            None,
+            None,
         )
         .expect("upsert on migrated db");
         let fresh: Option<String> = conn
@@ -4544,8 +6973,11 @@ mod tests {
             Some("completed"),
         );
 
-        upsert_thread_snapshot(&conn, &waiting, 2000).expect("upsert waiting");
-        upsert_thread_snapshot(&conn, &done, 2000).expect("upsert done");
+        let _ =
+            upsert_thread_snapshot(&conn, &waiting, 2000, UpdatedAt::Observed, None, None, None)
+                .expect("upsert waiting");
+        let _ = upsert_thread_snapshot(&conn, &done, 2000, UpdatedAt::Observed, None, None, None)
+            .expect("upsert done");
         record_action(
             &conn,
             "thr_wait",
@@ -4584,8 +7016,10 @@ mod tests {
             Some("in_progress"),
         );
 
-        upsert_thread_snapshot(&conn, &older, 1200).expect("upsert older");
-        upsert_thread_snapshot(&conn, &newer, 2400).expect("upsert newer");
+        let _ = upsert_thread_snapshot(&conn, &older, 1200, UpdatedAt::Observed, None, None, None)
+            .expect("upsert older");
+        let _ = upsert_thread_snapshot(&conn, &newer, 2400, UpdatedAt::Observed, None, None, None)
+            .expect("upsert newer");
 
         let recent = list_recent_thread_snapshots_from_db(&conn, 1).expect("recent threads");
 
@@ -4640,8 +7074,10 @@ mod tests {
             vec![],
             Some("in_progress"),
         );
-        upsert_thread_snapshot(&conn, &alpha, 2000).expect("upsert alpha");
-        upsert_thread_snapshot(&conn, &beta, 3000).expect("upsert beta");
+        let _ = upsert_thread_snapshot(&conn, &alpha, 2000, UpdatedAt::Observed, None, None, None)
+            .expect("upsert alpha");
+        let _ = upsert_thread_snapshot(&conn, &beta, 3000, UpdatedAt::Observed, None, None, None)
+            .expect("upsert beta");
 
         let imported = importable_projects_from_observed(
             &observed_workspaces_from_db(&conn, 10).expect("observed"),

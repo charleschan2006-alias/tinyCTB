@@ -25,12 +25,91 @@ fn shared_agent(timeout: Duration) -> ureq::Agent {
         .clone()
 }
 
+/// Records what the bridge tried to SAY, and answers for it, so a test can
+/// check that a user was told something without a request leaving the
+/// machine. Thread-local with an RAII guard, and inert until armed.
+#[cfg(test)]
+pub(crate) mod outbound_probe {
+    use serde_json::{json, Value};
+
+    type During = Box<dyn Fn()>;
+
+    thread_local! {
+        static SENT: std::cell::RefCell<Option<Vec<(String, Value)>>> =
+            const { std::cell::RefCell::new(None) };
+        static DURING: std::cell::RefCell<Option<During>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) struct Armed;
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            SENT.with(|sent| *sent.borrow_mut() = None);
+            DURING.with(|during| *during.borrow_mut() = None);
+        }
+    }
+
+    /// Arm it so every call FAILS, which is how a test asks what happens
+    /// when Telegram is unreachable at the exact moment something had to be
+    /// said. Answering successfully is not offered: a probe that only ever
+    /// says "sent" would let a fire-and-forget send look like delivery,
+    /// which is the defect this exists to catch.
+    pub(crate) fn arm_failing() -> Armed {
+        SENT.with(|sent| *sent.borrow_mut() = Some(Vec::new()));
+        DURING.with(|during| *during.borrow_mut() = None);
+        Armed
+    }
+
+    /// Answer successfully, and let the world MOVE while the call is in
+    /// flight — which is what talking to Telegram does in production, and
+    /// what makes a batch test able to ask about anything but its first
+    /// update.
+    pub(crate) fn arm_acting(action: impl Fn() + 'static) -> Armed {
+        SENT.with(|sent| *sent.borrow_mut() = Some(Vec::new()));
+        DURING.with(|during| *during.borrow_mut() = Some(Box::new(action)));
+        Armed
+    }
+
+    /// What has been sent on this thread since the probe was armed.
+    pub(crate) fn sent() -> Vec<(String, Value)> {
+        SENT.with(|sent| sent.borrow().clone().unwrap_or_default())
+    }
+
+    pub(crate) fn observe(method: &str, payload: &Value) -> Option<super::Result<Value>> {
+        SENT.with(|sent| {
+            let mut sent = sent.borrow_mut();
+            let log = sent.as_mut()?;
+            log.push((method.to_string(), payload.clone()));
+            let calls = log.len();
+            drop(sent);
+            let acting = DURING.with(|during| {
+                if let Some(action) = during.borrow().as_ref() {
+                    action();
+                    true
+                } else {
+                    false
+                }
+            });
+            if acting {
+                return Some(Ok(json!({ "ok": true, "result": { "message_id": calls } })));
+            }
+            Some(Err(anyhow::anyhow!(
+                "Telegram API {method} request failed: probe armed to fail"
+            )))
+        })
+    }
+}
+
 pub(crate) fn telegram_api_post(
     bot_token: &str,
     method: &str,
     payload: &Value,
     timeout: Duration,
 ) -> Result<Value> {
+    #[cfg(test)]
+    if let Some(canned) = outbound_probe::observe(method, payload) {
+        return canned;
+    }
     let agent = shared_agent(timeout);
     let url = format!(
         "https://api.telegram.org/bot{}/{}",

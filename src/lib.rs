@@ -470,7 +470,7 @@ fn run() -> Result<i32> {
             let conn = create_state_db(&db_path)?;
             let info = find_session_file(&thread_id)?
                 .with_context(|| format!("no Claude session transcript found for {thread_id}"))?;
-            let summary = parse_transcript_summary(&info.path)?;
+            let summary = parse_transcript_summary(&info.path, now_millis()?)?;
             let message_list = parse_transcript_messages(&info.path, messages)?;
             let cached = conn
                 .query_row(
@@ -558,7 +558,7 @@ fn run() -> Result<i32> {
     Ok(0)
 }
 
-fn now_millis() -> Result<u64> {
+pub(crate) fn now_millis() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| anyhow!(e))?

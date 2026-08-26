@@ -1,3 +1,6 @@
+#[cfg(test)]
+pub(crate) mod api;
+#[cfg(not(test))]
 mod api;
 pub(crate) mod render;
 
@@ -214,6 +217,84 @@ fn send_telegram_command_text(
 /// green (Sol proved exactly that by deleting the shortfall send). Tests can
 /// now read the message history — in order — and see what a user would have
 /// received.
+/// The one place the reply lane reaches for the network. Wrapped so a test
+/// can COUNT the reaching without any of it happening: whether this lane ran
+/// at all is a wiring question, and answering it by watching for a real
+/// request would put DNS, timeouts and a bot token's behaviour between the
+/// test and the thing it means to check.
+fn fetch_telegram_updates(
+    bot_token: &str,
+    offset: Option<i64>,
+    timeout: Duration,
+) -> Result<Value> {
+    #[cfg(test)]
+    if let Some(canned) = update_fetch_probe::observe() {
+        return Ok(canned);
+    }
+    telegram_get_updates(bot_token, offset, 0, timeout)
+}
+
+/// Counts calls to the update fetch, and answers them, so no request leaves
+/// the machine. Thread-local with an RAII guard: a process-wide counter would
+/// couple every test in the suite to every other one.
+#[cfg(test)]
+pub(crate) mod update_fetch_probe {
+    use serde_json::{json, Value};
+
+    type Poll = Box<dyn Fn() -> Value>;
+
+    thread_local! {
+        static CALLS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+        static POLL: std::cell::RefCell<Option<Poll>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) struct Armed;
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            CALLS.with(|calls| calls.set(None));
+            POLL.with(|poll| *poll.borrow_mut() = None);
+        }
+    }
+
+    /// Arm the probe on THIS thread until the returned guard is dropped.
+    pub(crate) fn arm() -> Armed {
+        CALLS.with(|calls| calls.set(Some(0)));
+        POLL.with(|poll| *poll.borrow_mut() = None);
+        Armed
+    }
+
+    /// Arm it with a body for the poll — which may also DO something, the
+    /// way a real long poll lets the world move while it waits. A probe that
+    /// only ever returned an empty batch made every assertion about what
+    /// happens to the batch vacuously true.
+    pub(crate) fn arm_polling(poll: impl Fn() -> Value + 'static) -> Armed {
+        CALLS.with(|calls| calls.set(Some(0)));
+        POLL.with(|slot| *slot.borrow_mut() = Some(Box::new(poll)));
+        Armed
+    }
+
+    /// Called from the fetch itself: counts, and stands in for the response.
+    pub(crate) fn observe() -> Option<Value> {
+        let armed = CALLS.with(|calls| {
+            let seen = calls.get()?;
+            calls.set(Some(seen + 1));
+            Some(())
+        });
+        armed?;
+        Some(POLL.with(|poll| {
+            poll.borrow()
+                .as_ref()
+                .map_or_else(|| json!({ "ok": true, "result": [] }), |poll| poll())
+        }))
+    }
+
+    /// How many times the reply lane went for updates on this thread.
+    pub(crate) fn calls() -> u32 {
+        CALLS.with(|calls| calls.get().unwrap_or(0))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_transport {
     thread_local! {
@@ -226,7 +307,6 @@ pub(crate) mod test_transport {
     pub(crate) fn record(text: &str) {
         SENT.with(|sent| sent.borrow_mut().push(text.to_string()));
     }
-
     /// Everything sent on this thread since the last call, oldest first.
     pub(crate) fn take() -> Vec<String> {
         SENT.with(|sent| std::mem::take(&mut *sent.borrow_mut()))
@@ -840,7 +920,9 @@ fn send_claude_reply_to_thread(
     // `--resume` would fork the transcript from the state it saw at spawn,
     // so the terminal the user is sitting at would never see the message and
     // the two branches would edit the same files unaware of each other.
-    let live_socket = crate::state::session_messaging_socket(conn, thread_id)?;
+    let route = crate::state::session_messaging_route(conn, thread_id)?;
+    let unverified = route.as_ref().is_some_and(|(_, unverified)| *unverified);
+    let live_socket = route.map(|(socket, _)| socket);
     let injected = match live_socket.as_ref() {
         Some(socket) => crate::claude::inject_into_live_session(
             &socket.path,
@@ -851,6 +933,48 @@ fn send_claude_reply_to_thread(
         .then(|| socket.path.clone()),
         None => None,
     };
+    // The route was never confirmed, and it did not answer. That is not
+    // enough to conclude the session is gone, and the fallback for "gone" is
+    // to spawn a headless one — which forks the transcript and leaves two
+    // branches editing the same files. So this reply is not delivered, and
+    // it is not delivered LOUDLY: the user is told, rather than answered by
+    // a second session they did not ask for.
+    if injected.is_none() && unverified {
+        // REFUSED, and refused as an error, because that is the only shape
+        // the caller acts on. Returning a JSON body that said "held" left
+        // the update acknowledged, the offset advanced and the user told
+        // nothing — the message was neither delivered nor kept nor
+        // reported, which is worse than either outcome it was choosing
+        // between. The batch handler's failure path acknowledges the update
+        // (so nothing behind it is blocked) and tells the user, who can send
+        // it again once the session speaks.
+        record_action(
+            conn,
+            thread_id,
+            "telegram_reply",
+            json!({
+                "ok": false,
+                "action": "telegram_reply",
+                "threadId": thread_id,
+                "message": prefixed,
+                "delivery": {
+                    "mode": "refused",
+                    "status": "route_unverified_and_silent"
+                },
+                "sentAt": now
+            }),
+            now,
+        )?;
+        anyhow::bail!(
+            "this session's connection was never confirmed and it did not answer. Nothing was \
+             sent, and no second session was started — send the message again once the session \
+             is active."
+        );
+    }
+    if injected.is_some() && unverified {
+        // It answered. Nothing else was ever in question about it.
+        crate::state::vouch_for_socket_route(conn, thread_id)?;
+    }
     if injected.is_some() {
         // The live session now owes an answer to Telegram; it is claimed by
         // that session's next completion (there is no per-turn log to read,
@@ -954,8 +1078,9 @@ fn start_new_thread_from_telegram(
         now,
     )?;
     // Register the freshly started session so /threads and reply routing see it
-    // before the first hook event arrives.
-    crate::state::upsert_thread_snapshot(
+    // before the first hook event arrives. No transcript was read, so no
+    // freshness check is handed over and nothing can refuse this write.
+    let write = crate::state::upsert_thread_snapshot(
         conn,
         &BridgeThreadSnapshot {
             thread_id: thread_id.clone(),
@@ -970,7 +1095,13 @@ fn start_new_thread_from_telegram(
             event_uid: None,
         },
         now,
+        // A session we just started: real activity, observed here.
+        crate::state::UpdatedAt::Observed,
+        None,
+        None,
+        None,
     )?;
+    debug_assert_eq!(write, crate::state::SnapshotWrite::Applied);
     if let Some(telegram) = config.telegram.as_ref() {
         register_telegram_typing_indicator(conn, telegram, &thread_id, now)?;
         let _ = refresh_telegram_typing_indicators(conn, telegram, now, Duration::from_secs(5));
@@ -2831,6 +2962,27 @@ pub(crate) fn process_telegram_updates(
     now: u64,
     timeout: Duration,
     deadline: Option<Instant>,
+    // Run immediately before a PLAIN SESSION REPLY is routed, once per such
+    // reply — not once for the batch, and not for any other kind of update.
+    //
+    // Once per reply, because the picture goes stale while the batch is
+    // being worked through: the fetch is a long poll that blocks for
+    // seconds, and each update handled before this one took time of its own.
+    // A session's first hook — the one that says where it listens — can land
+    // in any of that, and answering from the older picture reads "no route".
+    //
+    // Only for that branch, because "no route" is only dangerous where the
+    // fallback is a headless `--resume`, which forks the session. Commands,
+    // approvals and the answer to a question a session is blocked on reach
+    // their session by other means or by none, and holding THEM back on an
+    // unreadable spool would take `/repair` offline exactly when it is what
+    // you need.
+    //
+    // An error means the reply is not routed and the batch stops there. The
+    // prefix already handled keeps its markers and its offset; this update
+    // and everything behind it are left unacknowledged, so Telegram
+    // delivers them again.
+    before_routing: Option<&dyn Fn() -> Result<()>>,
 ) -> Result<Value> {
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Ok(json!({
@@ -2847,16 +2999,52 @@ pub(crate) fn process_telegram_updates(
     let bot_id = telegram_bot_id(&telegram.bot_token);
     let key = format!("telegram_offset:{bot_id}");
     let offset = get_setting_number(conn, &key)?.map(|value| value as i64 + 1);
-    let updates = telegram_get_updates(&telegram.bot_token, offset, 0, timeout)?;
+    let updates = fetch_telegram_updates(&telegram.bot_token, offset, timeout)?;
     let updates = telegram_updates_array(&updates)?;
     process_telegram_update_batch(
-        conn, config, telegram, &bot_id, &key, updates, now, timeout, deadline,
+        conn,
+        config,
+        telegram,
+        &bot_id,
+        &key,
+        updates,
+        now,
+        timeout,
+        deadline,
+        before_routing,
     )
 }
 
 fn advance_telegram_ack_offset(max_acked: &mut Option<i64>, update_id: Option<i64>) {
     if let Some(update_id) = update_id {
         *max_acked = Some(max_acked.map_or(update_id, |current: i64| current.max(update_id)));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// What makes a refusal notice the SAME refusal notice.
+///
+/// Inbound updates are deduplicated on `(bot_id, update_id)`, and the key
+/// here has to cover at least as much or it collapses cases the caller keeps
+/// apart: two bots share every update id Telegram has ever issued, so
+/// changing the token could silently swallow a notice that matched an old
+/// one. And an update with no id at all had them ALL collapse onto the word
+/// "unknown" — every future refusal deduplicated against the first.
+fn refusal_notice_key(bot_id: &str, update_id: Option<i64>, update: &Value) -> String {
+    match update_id {
+        Some(update_id) => format!("update-refused:{bot_id}:{update_id}"),
+        // No update id: fall back to what does identify this message.
+        None => {
+            let message = update.get("message");
+            let chat = message
+                .and_then(|message| message.get("chat"))
+                .and_then(|chat| chat.get("id"))
+                .map_or_else(|| "unknown".to_string(), |id| id.to_string());
+            let message_id = message
+                .and_then(telegram_message_id)
+                .map_or_else(|| "unknown".to_string(), |id| id.to_string());
+            format!("update-refused:{bot_id}:chat-{chat}:msg-{message_id}")
+        }
     }
 }
 
@@ -2871,6 +3059,7 @@ fn process_telegram_update_batch(
     now: u64,
     timeout: Duration,
     deadline: Option<Instant>,
+    before_routing: Option<&dyn Fn() -> Result<()>>,
 ) -> Result<Value> {
     let mut seen = 0usize;
     let mut replies = 0usize;
@@ -2884,6 +3073,7 @@ fn process_telegram_update_batch(
     // telegram_inbound_log. Unprocessed tail updates are left to the next cycle,
     // so a slow message or an expired batch budget can never skip later messages.
     let mut max_acked_update_id = None;
+    let mut stopped_early: Option<String> = None;
     for update in updates {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             break;
@@ -2897,6 +3087,11 @@ fn process_telegram_update_batch(
                 continue;
             }
         }
+        // Set by the one branch that needs a current picture, when it cannot
+        // get one. Not an error ABOUT this update — the ground gave way —
+        // so it is handled outside the per-update failure path below, which
+        // would otherwise mark the update as dealt with and move on.
+        let preflight_failure: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
         let outcome: Result<()> = (|| {
             if let Some(message) = update.get("message") {
                 let route_message_id = message
@@ -2930,6 +3125,27 @@ fn process_telegram_update_batch(
                     }
                     replies += 1;
                 } else if let Some(route) = extract_telegram_reply_route(conn, message, telegram)? {
+                    // HERE, and only here. This is the one branch that can
+                    // end in a headless spawn, and a spawn is what forks a
+                    // session. Everything above — commands, approvals, the
+                    // answer to a question a session is blocked on — reaches
+                    // its session by other means or by none, and blocking
+                    // those on an unreadable spool would take `/repair`
+                    // offline exactly when it is needed.
+                    //
+                    // Redone per update, not per batch: handling the ones
+                    // before this took time, and a session's first hook can
+                    // land in it. And quarantine belongs in here too — a
+                    // clock that stepped back during the poll leaves a
+                    // sighting from the future standing, and a route nothing
+                    // has vouched for is the one that must not be trusted
+                    // when it fails to answer.
+                    if let Some(before_routing) = before_routing {
+                        if let Err(error) = before_routing() {
+                            *preflight_failure.borrow_mut() = Some(format!("{error:#}"));
+                            anyhow::bail!("session sockets could not be read: {error:#}");
+                        }
+                    }
                     let result = send_claude_reply_to_thread(
                         conn,
                         config,
@@ -3151,14 +3367,41 @@ fn process_telegram_update_batch(
             }
             Ok(())
         })();
+        if let Some(error) = preflight_failure.take() {
+            println!(
+                "{}",
+                json!({
+                    "ok": false,
+                    "transport": "telegram",
+                    "action": "session_sockets_unreadable",
+                    "detail": "stopped before acting on this reply; it will be delivered again \
+                               rather than answered from a picture that could not be taken",
+                    "error": error
+                })
+            );
+            stopped_early = Some(error);
+            break;
+        }
         if let Err(error) = outcome {
             failed += 1;
-            // Acknowledge the failing update so Telegram long polling advances past it.
-            // Without this, the daemon re-processes the same update forever and every
-            // message behind it is blocked.
+            // ONE TRANSACTION for the two halves of "this update is done
+            // with". The marker alone means the next cycle sees a duplicate
+            // and skips it; the notice alone means it can be queued twice.
+            // Committed apart, a failure between them left the marker
+            // standing and the telling gone for good — the update refused,
+            // recorded as handled, and the person who sent it never told.
+            //
+            // The in-memory offset moves only AFTER the commit, so a failure
+            // here leaves the update for Telegram to redeliver rather than
+            // acknowledging something that was not written down.
+            let notice = format!("Your message could not be processed: {error:#}");
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             if let Some(update_id) = update_id {
                 record_telegram_inbound_processed(
-                    conn,
+                    &tx,
                     bot_id,
                     update_id,
                     "update_error",
@@ -3166,21 +3409,44 @@ fn process_telegram_update_batch(
                     TelegramInboundLogContext::default(),
                     now,
                 )?;
-                advance_telegram_ack_offset(&mut max_acked_update_id, Some(update_id));
             }
             if update.get("message").is_some() {
-                let _ = telegram_send_text(
-                    telegram,
-                    &format!("Your message could not be processed: {error:#}"),
-                    timeout,
-                );
+                // QUEUED, not fired and forgotten: a send attempted here
+                // would be the only telling there is, and Telegram being
+                // briefly unreachable would take it with it.
+                crate::state::enqueue_outbound_event(
+                    &tx,
+                    &json!({
+                        "type": "bridge_notice",
+                        "observedAt": now,
+                        "eventKey": refusal_notice_key(bot_id, update_id, update),
+                        "message": notice,
+                    }),
+                    now,
+                    "bridge",
+                )?;
             }
+            tx.commit()?;
+            advance_telegram_ack_offset(&mut max_acked_update_id, update_id);
         } else {
             advance_telegram_ack_offset(&mut max_acked_update_id, update_id);
         }
     }
     if let Some(update_id) = max_acked_update_id {
         set_setting(conn, offset_key, update_id as u64)?;
+    }
+    if let Some(error) = stopped_early {
+        // The prefix that WAS handled keeps its markers and its offset; the
+        // rest is simply not claimed. Reported as a failure, because a batch
+        // that stopped part-way is not a batch that was processed.
+        return Ok(json!({
+            "ok": false,
+            "transport": "telegram",
+            "seen": seen,
+            "replies": replies,
+            "stopped": "session_sockets_unreadable",
+            "error": error
+        }));
     }
     Ok(json!({
         "ok": true,
@@ -4227,6 +4493,311 @@ mod tests {
         assert_eq!(unauthorized, None);
     }
 
+    /// What is left after the filesystem has settled everything it can: a
+    /// route with no identity recorded to check against. Silence from it
+    /// proves nothing — and the fallback for "proved gone" is to spawn a
+    /// second session, which forks the transcript and leaves two branches
+    /// editing the same files. So the reply is not delivered, and it is not
+    /// delivered out loud.
+    /// The marker and the telling are two halves of "this update is dealt
+    /// with", and committing them apart loses one of them. If the marker
+    /// lands and the notice does not, the next cycle sees a duplicate and
+    /// skips it — the update refused, recorded as handled, and the person
+    /// who sent it never told, with nothing left to notice the gap.
+    #[test]
+    fn a_notice_that_cannot_be_queued_takes_the_marker_down_with_it() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let config = test_daemon_config();
+        let telegram = config.telegram.clone().expect("telegram configured");
+        let _probe = crate::telegram::api::outbound_probe::arm_failing();
+        let dir = std::env::temp_dir().join(format!("tinyctb-abort-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let socket_path = dir.join("silent.sock");
+        std::fs::write(&socket_path, "").expect("socket stand-in");
+        conn.execute(
+            "INSERT INTO threads_cache(
+                thread_id, status_type, status_flags_json, updated_at, last_seen_at,
+                messaging_socket, socket_unverified_since)
+             VALUES ('sess-abort', 'active', '[]', 1000, 1000, ?1, 900)",
+            params![socket_path.display().to_string()],
+        )
+        .expect("row");
+        conn.execute(
+            "INSERT INTO telegram_message_routes(
+                chat_id, message_id, thread_id, event_id, created_at)
+             VALUES (?1, 6, 'sess-abort', 'evt-abort', 900)",
+            params![telegram.chat_id],
+        )
+        .expect("route anchor");
+
+        let update = json!({
+            "update_id": 5150,
+            "message": {
+                "message_id": 7,
+                "chat": { "id": telegram.chat_id },
+                "from": { "id": telegram.allowed_user_id.clone().unwrap_or_default() },
+                "text": "继续",
+                "reply_to_message": { "message_id": 6 }
+            }
+        });
+
+        // The outbox refuses, from underneath, the way a disk or a
+        // constraint would.
+        conn.execute_batch(
+            "CREATE TRIGGER no_outbound BEFORE INSERT ON outbound_events
+             BEGIN SELECT RAISE(ABORT, 'outbox refused'); END;",
+        )
+        .expect("trigger");
+        let blocked = process_telegram_update_batch(
+            &conn,
+            &config,
+            &telegram,
+            "bot",
+            "telegram_offset:bot",
+            std::slice::from_ref(&update),
+            1_000,
+            Duration::from_secs(1),
+            None,
+            None,
+        );
+        assert!(
+            blocked.is_err(),
+            "a half-written outcome must not be reported as a batch"
+        );
+        let markers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM telegram_inbound_log WHERE update_id = 5150",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            markers, 0,
+            "the marker must go back with it, or the retry is skipped as a duplicate"
+        );
+        assert_eq!(
+            crate::state::get_setting_number(&conn, "telegram_offset:bot").expect("offset"),
+            None,
+            "and the offset must not move past an update nothing was written for"
+        );
+
+        // With the outbox working again, the retry gets through.
+        conn.execute_batch("DROP TRIGGER no_outbound;")
+            .expect("drop");
+        process_telegram_update_batch(
+            &conn,
+            &config,
+            &telegram,
+            "bot",
+            "telegram_offset:bot",
+            std::slice::from_ref(&update),
+            1_100,
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .expect("retry");
+        let queued: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events WHERE event_type = 'bridge_notice'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            queued, 1,
+            "the telling is queued once the outbox will take it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Inbound updates are deduplicated on `(bot_id, update_id)`. A notice
+    /// keyed on the update id alone covers less than that: every bot shares
+    /// the same update ids, so changing the token could silently swallow a
+    /// notice that matched an old one — and an update with no id at all had
+    /// them ALL collapse onto the word "unknown".
+    #[test]
+    fn a_refusal_notice_is_keyed_as_narrowly_as_the_update_it_is_about() {
+        let update = json!({
+            "update_id": 9,
+            "message": { "message_id": 3, "chat": { "id": "456" } }
+        });
+        assert_ne!(
+            refusal_notice_key("bot-a", Some(9), &update),
+            refusal_notice_key("bot-b", Some(9), &update),
+            "two bots share every update id there is"
+        );
+
+        let no_id = json!({ "message": { "message_id": 3, "chat": { "id": "456" } } });
+        let other = json!({ "message": { "message_id": 4, "chat": { "id": "456" } } });
+        assert_ne!(
+            refusal_notice_key("bot-a", None, &no_id),
+            refusal_notice_key("bot-a", None, &other),
+            "without an update id, the message still identifies itself"
+        );
+    }
+
+    /// Driven from the batch entry the daemon actually calls, because the
+    /// helper's return value was never the whole story: it said "held" while
+    /// the caller acknowledged the update, advanced the offset and told the
+    /// user nothing. The message was then neither delivered, nor kept, nor
+    /// reported — it simply stopped existing.
+    #[test]
+    fn a_refused_reply_acknowledges_the_update_and_tells_the_user() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let config = test_daemon_config();
+        let telegram = config.telegram.clone().expect("telegram configured");
+        let _ = crate::claude::test_spawn::take();
+        // Every outbound call FAILS: the point is that the telling survives
+        // Telegram being unreachable at the exact moment of the refusal.
+        let _probe = crate::telegram::api::outbound_probe::arm_failing();
+        let dir = std::env::temp_dir().join(format!("tinyctb-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let socket_path = dir.join("silent.sock");
+        std::fs::write(&socket_path, "").expect("socket stand-in");
+        conn.execute(
+            "INSERT INTO threads_cache(
+                thread_id, status_type, status_flags_json, updated_at, last_seen_at,
+                messaging_socket, socket_unverified_since)
+             VALUES ('sess-refused', 'active', '[]', 1000, 1000, ?1, 900)",
+            params![socket_path.display().to_string()],
+        )
+        .expect("row");
+        // The message the user is replying to, mapped to this session --
+        // which is how a reply finds its thread.
+        conn.execute(
+            "INSERT INTO telegram_message_routes(
+                chat_id, message_id, thread_id, event_id, created_at)
+             VALUES (?1, 6, 'sess-refused', 'evt-refused', 900)",
+            params![telegram.chat_id],
+        )
+        .expect("route anchor");
+
+        let update = json!({
+            "update_id": 4242,
+            "message": {
+                "message_id": 7,
+                "chat": { "id": telegram.chat_id },
+                "from": { "id": telegram.allowed_user_id.clone().unwrap_or_default() },
+                "text": "继续",
+                "reply_to_message": {
+                    "message_id": 6,
+                    "text": "sess-refused"
+                }
+            }
+        });
+        let result = process_telegram_update_batch(
+            &conn,
+            &config,
+            &telegram,
+            "bot",
+            "telegram_offset:bot",
+            std::slice::from_ref(&update),
+            1_000,
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .expect("batch");
+        assert_eq!(result.get("seen").and_then(Value::as_u64), Some(1));
+
+        // Nothing may be spawned: that is the fork this exists to prevent.
+        assert!(
+            crate::claude::test_spawn::take().is_empty(),
+            "a second session must not be started"
+        );
+        // The update is acknowledged, so nothing behind it is blocked.
+        assert_eq!(
+            crate::state::get_setting_number(&conn, "telegram_offset:bot").expect("offset"),
+            Some(4242),
+            "the update must be acknowledged rather than re-tried forever"
+        );
+        // And the telling is QUEUED, so a Telegram hiccup cannot swallow it
+        // after the update has already been acknowledged. The probe is armed
+        // to FAIL every call, precisely to prove that.
+        let queued: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT payload_json FROM outbound_events
+                      WHERE event_type = 'bridge_notice' AND status <> 'delivered'",
+                )
+                .expect("prepare");
+            let rows = stmt.query_map([], |row| row.get(0)).expect("query");
+            rows.collect::<rusqlite::Result<Vec<String>>>()
+                .expect("rows")
+        };
+        assert!(
+            queued
+                .iter()
+                .any(|payload| payload.contains("send the message again")),
+            "the telling must survive a send that fails: {queued:?}"
+        );
+        // The same update again: the queue must not grow a second copy.
+        let _ = process_telegram_update_batch(
+            &conn,
+            &config,
+            &telegram,
+            "bot",
+            "telegram_offset:bot",
+            std::slice::from_ref(&update),
+            1_100,
+            Duration::from_secs(1),
+            None,
+            None,
+        );
+        let notices: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events WHERE event_type = 'bridge_notice'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            notices, 1,
+            "the update id keys it, so a retry is not a second copy"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reply_to_an_unverified_silent_route_is_held_rather_than_forked() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let config = test_daemon_config();
+        let _ = crate::claude::test_spawn::take();
+        let dir = std::env::temp_dir().join(format!("tinyctb-silent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        // Present, but nothing is listening and nothing recorded what it was.
+        let socket_path = dir.join("silent.sock");
+        std::fs::write(&socket_path, "").expect("socket stand-in");
+        conn.execute(
+            "INSERT INTO threads_cache(
+                thread_id, status_type, status_flags_json, updated_at, last_seen_at,
+                messaging_socket, socket_unverified_since)
+             VALUES ('sess-silent', 'active', '[]', 1000, 1000, ?1, 900)",
+            params![socket_path.display().to_string()],
+        )
+        .expect("row");
+
+        let result = send_claude_reply_to_thread(&conn, &config, "sess-silent", "继续", 1_000);
+
+        let error = result.expect_err("a refusal must reach the caller as one");
+        assert!(
+            format!("{error:#}").contains("send the message again"),
+            "and must carry something the user can act on: {error:#}"
+        );
+        assert!(
+            crate::claude::test_spawn::take().is_empty(),
+            "nothing may be spawned: that is the fork this exists to prevent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn telegram_reply_spawns_headless_resume_without_waiting() {
         // test_spawn::RECORDED is a process-global; without the shared env
@@ -4304,6 +4875,7 @@ mod tests {
                 inode,
                 boot_id,
             },
+            1000,
             1000,
         )
         .expect("record socket");
@@ -5049,6 +5621,7 @@ mod tests {
             9000,
             Duration::from_secs(1),
             None,
+            None,
         )
         .expect("batch");
 
@@ -5159,6 +5732,7 @@ mod tests {
             &updates,
             9000,
             Duration::from_secs(1),
+            None,
             None,
         )
         .expect("batch");
@@ -5636,6 +6210,7 @@ mod tests {
             0,
             Duration::from_secs(1),
             None,
+            None,
         )
         .expect("first batch");
 
@@ -5658,6 +6233,7 @@ mod tests {
             &updates,
             0,
             Duration::from_secs(1),
+            None,
             None,
         )
         .expect("second batch");
@@ -5705,6 +6281,7 @@ mod tests {
             &updates,
             0,
             Duration::from_secs(1),
+            None,
             None,
         )
         .expect("batch");
@@ -5821,6 +6398,7 @@ mod tests {
             0,
             Duration::from_secs(1),
             Some(Instant::now() - Duration::from_secs(1)),
+            None,
         )
         .expect("expired batch");
         assert_eq!(expired["seen"], 0);
@@ -5838,6 +6416,7 @@ mod tests {
             &updates,
             0,
             Duration::from_secs(1),
+            None,
             None,
         )
         .expect("full batch");
@@ -5900,6 +6479,7 @@ mod tests {
             &updates,
             2000,
             Duration::from_secs(1),
+            None,
             None,
         )
         .expect("batch");
@@ -5966,6 +6546,7 @@ mod tests {
                 &updates,
                 2000,
                 Duration::from_secs(10),
+                None,
                 None,
             )
         };

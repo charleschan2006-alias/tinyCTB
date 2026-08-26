@@ -250,13 +250,33 @@ pub(crate) fn enqueue_daemon_notification_events(
         // like any other reply the user asked for from their phone.
         let thread_id = crate::event_thread_id(event);
         let event_at = event_observed_at(event);
-        let owed = match thread_id.as_deref() {
-            Some(thread_id) => {
-                crate::state::live_injection_pending(conn, thread_id, event_at, now)?
-            }
+        // EVERY decision about this event is taken inside one IMMEDIATE
+        // transaction, the debt included. Asking "is an answer owed?" before
+        // the transaction and settling it inside was a read of a value
+        // another writer could still change: two completions both read the
+        // same open debt, each declared itself the promised answer, and the
+        // user was pushed the same reply twice.
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        // Any event from a session that owes an answer is bridge traffic —
+        // a session asked from the phone may answer with a question of its
+        // own, and dropping that unless away mode happens to be on would
+        // strand the user mid-conversation. Only a COMPLETION may settle the
+        // debt, and settling it is what makes this event the promised reply.
+        let debt_open = match thread_id.as_deref() {
+            Some(thread_id) => crate::state::live_injection_pending(&tx, thread_id, event_at, now)?,
             None => false,
         };
-        if !owed && !should_enqueue_away_notification(conn, event)? {
+        let claimed = match thread_id.as_deref() {
+            Some(thread_id)
+                if event.get("type").and_then(Value::as_str) == Some("thread_completed") =>
+            {
+                crate::state::consume_live_injection(&tx, thread_id, event_at, now)?
+            }
+            _ => false,
+        };
+        let owed = debt_open || claimed;
+        if !owed && !should_enqueue_away_notification(&tx, event)? {
             continue;
         }
         // Claude fires an idle reminder 60s after every turn ends, carrying
@@ -264,25 +284,34 @@ pub(crate) fn enqueue_daemon_notification_events(
         // reads every answer twice. An idle wait whose preview matches the
         // last delivered push adds nothing: drop it. Approval waits and
         // owed bridge answers are never suppressed.
-        if !owed && redundant_idle_reminder(conn, event, thread_id.as_deref(), now)? {
+        if !owed && redundant_idle_reminder(&tx, event, thread_id.as_deref(), now)? {
             eprintln!(
                 "tinyctb: suppressed redundant idle reminder for {}",
                 thread_id.as_deref().unwrap_or("?")
             );
             continue;
         }
-        // Queueing the answer and settling the debt must be one unit: a crash
-        // between them would leave the answer queued and the debt open, so
-        // the next completion would be pushed as a second "answer" too.
-        let tx = conn.unchecked_transaction()?;
+        // The delivery marker and the outbound row are ONE decision. Written
+        // apart (marker during the sync, row here), a failure in between left
+        // the marker standing and the row missing — and the marker then
+        // silenced every retry, so the notification was lost permanently.
+        let first_time = crate::state::record_delivery(
+            &tx,
+            &crate::notification_event_id(event),
+            thread_id.as_deref().unwrap_or(""),
+            event.get("type").and_then(Value::as_str).unwrap_or("event"),
+            now,
+        )?;
+        if !first_time {
+            continue;
+        }
         let inserted =
             enqueue_outbound_event(&tx, event, now, if owed { "bridge" } else { "away" })?;
-        if inserted && owed && event.get("type").and_then(Value::as_str) == Some("thread_completed")
-        {
-            if let Some(thread_id) = thread_id.as_deref() {
-                crate::state::consume_live_injection(&tx, thread_id, event_at, now)?;
-            }
-        }
+        // Nothing to settle down here any more: the claim IS the question,
+        // and it was asked above. Nothing to undo on the way out either —
+        // every `continue` drops the transaction, so a debt claimed by a
+        // push that did not happen rolls back with it and the next
+        // completion can still claim it.
         tx.commit()?;
         if inserted {
             enqueued += 1;
@@ -1033,57 +1062,146 @@ fn daemon_cycle_lanes(
     // must already find the mapping, or it would fall back to a headless
     // `--resume` and fork the session this feature exists to protect.
     // Non-destructive — the spool is still consumed by the sync below.
+    //
+    // And if that lookup FAILS, the answer is not "carry on without it". The
+    // one thing a reply needs is the socket, and without it the fallback is
+    // a headless `--resume` that forks the session -- irreversibly, before
+    // the sync that would have found the mapping ever runs. A reply that
+    // waits is not lost: it is still on Telegram's side and the next cycle
+    // collects it. Waiting is recoverable; forking a session is not.
+    // Two different jobs, on two different clocks.
+    //
+    // Tending the routes — bringing back hooks that came due, marking
+    // sightings that cannot be believed, settling the ones the filesystem
+    // can settle — is about the session table and belongs to the cycle. It
+    // happens whether or not anyone wrote in.
     if lanes.telegram_updates {
-        if let Err(error) = crate::claude::peek_session_sockets(conn, now) {
+        let tend_now = crate::now_millis().unwrap_or(now);
+        if let Err(error) = crate::claude::requeue_due_future_entries(tend_now) {
             println!(
                 "{}",
                 json!({
                     "ok": false,
-                    "action": "session_socket_peek_error",
+                    "action": "parked_hook_requeue_error",
                     "error": format!("{error:#}")
                 })
             );
         }
+        match crate::state::quarantine_future_socket_sightings(conn, tend_now)
+            .and_then(|_| crate::claude::clear_resolved_socket_quarantines(conn))
+        {
+            Ok(0) => {}
+            Ok(unresolved) => println!(
+                "{}",
+                json!({
+                    "ok": true,
+                    "action": "session_socket_unverified",
+                    "sessions": unresolved,
+                    "detail": "route has no recorded identity to check; a reply will try it and \
+                               will not fall back to a second session if it stays silent"
+                })
+            ),
+            Err(error) => println!(
+                "{}",
+                json!({
+                    "ok": false,
+                    "action": "session_socket_verify_error",
+                    "error": format!("{error:#}")
+                })
+            ),
+        }
     }
-    let telegram_updates = match config.telegram.as_ref().filter(|_| lanes.telegram_updates) {
-        Some(telegram) => {
-            let mut result =
-                match process_telegram_updates(conn, config, now, timeout, Some(deadline)) {
+
+    // Knowing WHERE a session listens is the other job, and it goes stale
+    // fast: the long poll blocks for seconds, and each update handled before
+    // this one took time of its own. So it is redone immediately before each
+    // PLAIN REPLY is routed — not once per cycle, not once per batch, and
+    // not for commands or approvals, which cannot fork anything — on a clock
+    // read at that moment. If it cannot be done, that reply is not routed
+    // and the batch stops there: the prefix already handled keeps its
+    // offset, the rest comes back next time.
+    let sockets_before_routing = |now: u64| -> Result<()> {
+        let check_now = crate::now_millis().unwrap_or(now);
+        crate::claude::requeue_due_future_entries(check_now)?;
+        // Quarantine belongs HERE, not only once a cycle. The clock can step
+        // back during the poll or while an earlier update was being handled,
+        // and a sighting from before that step is then from the future — a
+        // route nothing has vouched for, which is exactly the one a silent
+        // socket must not be taken as proof about. Every failure is raised,
+        // because a picture that could not be taken is not a picture.
+        crate::state::quarantine_future_socket_sightings(conn, check_now)?;
+        crate::claude::clear_resolved_socket_quarantines(conn)?;
+        crate::claude::peek_session_sockets(conn, check_now)?;
+        Ok(())
+    };
+
+    let telegram_updates = {
+        match config.telegram.as_ref().filter(|_| lanes.telegram_updates) {
+            Some(telegram) => {
+                let mut result = match process_telegram_updates(
+                    conn,
+                    config,
+                    now,
+                    timeout,
+                    Some(deadline),
+                    Some(&|| sockets_before_routing(now)),
+                ) {
                     Ok(result) => result,
+                    // Including a socket picture that could not be taken:
+                    // nothing in the batch was acted on, and the offset did
+                    // not move, so it all comes back next cycle.
                     Err(error) => json!({
                         "ok": false,
                         "transport": "telegram",
                         "error": format!("{error:#}")
                     }),
                 };
-            let typing = if Instant::now() < deadline {
-                refresh_telegram_typing_indicators(conn, telegram, now, timeout).unwrap_or_else(
-                    |error| {
-                        json!({
-                            "ok": false,
-                            "transport": "telegram",
-                            "error": format!("{error:#}")
-                        })
-                    },
-                )
-            } else {
-                json!({
-                    "ok": true,
-                    "transport": "telegram",
-                    "skipped": "cycle_deadline"
-                })
-            };
-            if let Some(object) = result.as_object_mut() {
-                object.insert("typing".to_string(), typing);
+                let typing = if Instant::now() < deadline {
+                    refresh_telegram_typing_indicators(conn, telegram, now, timeout).unwrap_or_else(
+                        |error| {
+                            json!({
+                                "ok": false,
+                                "transport": "telegram",
+                                "error": format!("{error:#}")
+                            })
+                        },
+                    )
+                } else {
+                    json!({
+                        "ok": true,
+                        "transport": "telegram",
+                        "skipped": "cycle_deadline"
+                    })
+                };
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("typing".to_string(), typing);
+                }
+                result
             }
-            result
+            None => Value::Null,
         }
-        None => Value::Null,
     };
     // Notification enqueueing happens inside the sync (spool consumption and
     // notification persistence must be atomic from the caller's perspective).
     let (events, enqueued) = if lanes.full_sync {
-        match sync_state_from_sessions(conn, config, now, 50, true) {
+        // A FRESH reading of the clock, because `now` was taken at the top of
+        // the cycle and the reply lane above it does network I/O — seconds
+        // can pass. Hooks that land in that gap are stamped after `now` and
+        // look like they came from the future, so every one of them was
+        // parked, or before that written off entirely. Proven in production:
+        // seven real Stops and Notifications, from live sessions, sitting in
+        // the dead letter box with perfectly ordinary timestamps.
+        //
+        // AS IT READS, including backwards. Clamping it up to the cycle's
+        // `now` looked like prudence and was the opposite: the repair that
+        // rescues a session after a clock correction triggers on a stored
+        // high point being ahead of the clock, so holding the clock up hides
+        // the very condition it exists to notice. A step back would then
+        // leave every real hook judged against a mark from before it, with
+        // the status, the prompt and the route all stuck where the old clock
+        // left them — and the spool entries consumed on the way past.
+        let sync_now = crate::now_millis().unwrap_or(now);
+        match sync_state_from_sessions(conn, config, sync_now, 50, true) {
             Ok(sync_result) => {
                 end_sync_error_streak(conn)?;
                 (
@@ -2375,6 +2493,1312 @@ fn xml_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same claim as the AF_UNIX test below, pinned without a socket:
+    /// with the sync lane off, the ONLY thing that can put this route in the
+    /// table is the refresh done before the reply is routed. That it is
+    /// there at all is the ordering evidence.
+    ///
+    /// Kept separate on purpose. The test below needs `bind(AF_UNIX)`, which
+    /// some sandboxes refuse, and making it skip itself when the bind fails
+    /// would turn a missing capability into a silent pass. This one asks a
+    /// smaller question that any environment can answer; that one asks the
+    /// whole question where it can be asked.
+    #[test]
+    fn a_hook_from_mid_batch_is_read_before_the_reply_that_needs_it() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-midbatch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("events")).expect("spool");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        let projects = root.join("projects");
+        fs::create_dir_all(&projects).expect("projects");
+        let _projects_seam =
+            crate::state::EnvVarGuard::set("TINYCTB_CLAUDE_PROJECTS_DIR", &projects);
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        conn.execute(
+            "INSERT INTO telegram_message_routes(
+                chat_id, message_id, thread_id, event_id, created_at)
+             VALUES ('456', 6, 'sess-midbatch', 'evt-midbatch', 900)",
+            [],
+        )
+        .expect("route anchor");
+
+        // The first update talks to Telegram, and the session's first hook
+        // lands while it does.
+        let spool = root.join("events");
+        let landed = crate::now_millis().expect("clock");
+        let socket_path = root.join("mid.sock").display().to_string();
+        let hook_socket = socket_path.clone();
+        let _sends = crate::telegram::api::outbound_probe::arm_acting(move || {
+            let _ = fs::write(
+                spool.join(format!("{landed:015}-1-Notification.json")),
+                json!({
+                    "hookEventName": "Notification",
+                    "sessionId": "sess-midbatch",
+                    "receivedAt": landed,
+                    "messagingSocket": hook_socket,
+                    "payload": {"message": "Claude needs your permission to run ls"}
+                })
+                .to_string(),
+            );
+        });
+        let _probe = crate::telegram::update_fetch_probe::arm_polling(|| {
+            json!({
+                "ok": true,
+                "result": [
+                    {
+                        "update_id": 121,
+                        "message": {
+                            "message_id": 8,
+                            "chat": { "id": "456" },
+                            "from": { "id": "789" },
+                            "text": "/status"
+                        }
+                    },
+                    {
+                        "update_id": 122,
+                        "message": {
+                            "message_id": 9,
+                            "chat": { "id": "456" },
+                            "from": { "id": "789" },
+                            "text": "继续",
+                            "reply_to_message": { "message_id": 6 }
+                        }
+                    }
+                ]
+            })
+        });
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(crate::config::TelegramConfig {
+                bot_token: "test-token".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            }),
+            claude: Some(crate::config::ClaudeConfig::default()),
+            projects: vec![],
+        };
+
+        daemon_cycle_lanes(
+            &conn,
+            &config,
+            1_000,
+            Duration::from_secs(1),
+            CycleLanes {
+                telegram_updates: true,
+                // OFF: with the sync running, the route could have been
+                // learned afterwards and the ordering would prove nothing.
+                full_sync: false,
+            },
+        )
+        .expect("cycle");
+
+        assert_eq!(
+            crate::state::session_messaging_socket(&conn, "sess-midbatch")
+                .expect("route")
+                .map(|socket| socket.path),
+            Some(socket_path),
+            "the only thing that could have read this hook is the refresh before the reply"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// One refresh per BATCH is not enough either. The updates are handled
+    /// one after another, and handling one takes time — a command that talks
+    /// to Telegram, a reply that waits on a socket. A session's first hook
+    /// can land during the first update, and the second update can be the
+    /// reply for exactly that session; answered from the picture taken
+    /// before the batch, it finds no route and spawns a second session.
+    #[test]
+    fn a_reply_later_in_the_batch_sees_a_hook_that_landed_during_the_first() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-batchrace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("events")).expect("spool");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        let projects = root.join("projects");
+        fs::create_dir_all(&projects).expect("projects");
+        let _projects_seam =
+            crate::state::EnvVarGuard::set("TINYCTB_CLAUDE_PROJECTS_DIR", &projects);
+        let _ = crate::claude::test_spawn::take();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(crate::config::TelegramConfig {
+                bot_token: "test-token".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            }),
+            claude: Some(crate::config::ClaudeConfig::default()),
+            projects: vec![],
+        };
+        conn.execute(
+            "INSERT INTO telegram_message_routes(
+                chat_id, message_id, thread_id, event_id, created_at)
+             VALUES ('456', 6, 'sess-batch', 'evt-batch', 900)",
+            [],
+        )
+        .expect("route anchor");
+
+        let socket_path = root.join(format!("{}.sock", std::process::id()));
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind session socket");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let heard = std::sync::Arc::clone(&received);
+        let accepting = std::thread::spawn(move || {
+            use std::io::Read as _;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut text = String::new();
+                        let _ = stream.read_to_string(&mut text);
+                        heard.lock().expect("lock").push(text);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        let (inode, boot_id) = crate::claude::socket_identity(&socket_path.display().to_string());
+
+        // Handling the FIRST update talks to Telegram, and the session's
+        // first hook lands while that is happening.
+        let spool = root.join("events");
+        let landed = crate::now_millis().expect("clock");
+        let hook_socket = socket_path.display().to_string();
+        let _acting = crate::telegram::api::outbound_probe::arm_acting(move || {
+            let _ = fs::write(
+                spool.join(format!("{landed:015}-1-Notification.json")),
+                json!({
+                    "hookEventName": "Notification",
+                    "sessionId": "sess-batch",
+                    "receivedAt": landed,
+                    "messagingSocket": hook_socket,
+                    "socketInode": inode,
+                    "socketBootId": boot_id,
+                    "payload": {"message": "Claude needs your permission to run ls"}
+                })
+                .to_string(),
+            );
+        });
+
+        let _probe = crate::telegram::update_fetch_probe::arm_polling(|| {
+            json!({
+                "ok": true,
+                "result": [
+                    {
+                        "update_id": 81,
+                        "message": {
+                            "message_id": 8,
+                            "chat": { "id": "456" },
+                            "from": { "id": "789" },
+                            "text": "/status"
+                        }
+                    },
+                    {
+                        "update_id": 82,
+                        "message": {
+                            "message_id": 9,
+                            "chat": { "id": "456" },
+                            "from": { "id": "789" },
+                            "text": "继续",
+                            "reply_to_message": { "message_id": 6 }
+                        }
+                    }
+                ]
+            })
+        });
+
+        daemon_cycle_lanes(
+            &conn,
+            &config,
+            1_000,
+            Duration::from_secs(1),
+            CycleLanes {
+                telegram_updates: true,
+                full_sync: false,
+            },
+        )
+        .expect("cycle");
+
+        assert!(
+            !crate::telegram::api::outbound_probe::sent().is_empty(),
+            "the first update has to actually do something, or nothing lands during it"
+        );
+        assert_eq!(
+            crate::state::session_messaging_socket(&conn, "sess-batch")
+                .expect("route")
+                .map(|socket| socket.path),
+            Some(socket_path.display().to_string()),
+            "the route must be picked up before the SECOND update is routed"
+        );
+        assert!(
+            crate::claude::test_spawn::take().is_empty(),
+            "and the reply must not fork the session it was meant for"
+        );
+        let _ = accepting.join();
+        let delivered = received.lock().expect("lock").clone();
+        assert!(
+            delivered.iter().any(|text| text.contains("继续")),
+            "the reply must reach the live session itself: {delivered:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The long poll BLOCKS, sometimes for seconds, and the spool goes on
+    /// filling while it does. A socket picture taken before that wait
+    /// describes the moment before it — so a reply that comes back in the
+    /// same batch, for a session whose first hook landed during the wait,
+    /// was answered from a picture with no route in it, and no route means a
+    /// headless spawn that forks the session.
+    ///
+    /// The probe here does what a real poll does: the world moves while it
+    /// waits. Its predecessor returned an empty batch, which made every
+    /// assertion about what happens to the batch vacuously true — including
+    /// the one about not spawning anything.
+    #[test]
+    fn a_reply_fetched_alongside_a_sessions_first_hook_still_finds_its_route() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-pollrace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("events")).expect("spool");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        let projects = root.join("projects");
+        fs::create_dir_all(&projects).expect("projects");
+        let _projects_seam =
+            crate::state::EnvVarGuard::set("TINYCTB_CLAUDE_PROJECTS_DIR", &projects);
+        let _ = crate::claude::test_spawn::take();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(crate::config::TelegramConfig {
+                bot_token: "test-token".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            }),
+            claude: Some(crate::config::ClaudeConfig::default()),
+            projects: vec![],
+        };
+        // The message the reply hangs off, mapped to the session.
+        conn.execute(
+            "INSERT INTO telegram_message_routes(
+                chat_id, message_id, thread_id, event_id, created_at)
+             VALUES ('456', 6, 'sess-poll', 'evt-poll', 900)",
+            [],
+        )
+        .expect("route anchor");
+
+        // A socket somebody is actually listening on — named after a live
+        // pid, because that is what its identity is made of. Without a
+        // listener the injection could only fail, and "did not fork" would
+        // be true for the wrong reason.
+        let socket_path = root.join(format!("{}.sock", std::process::id()));
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind session socket");
+        // NONBLOCKING, with a deadline. A thread parked in `accept()` and a
+        // caller that joins it unconditionally is not a test — a regression
+        // that stops injecting would hang the whole suite instead of turning
+        // it red, which is the one thing a test must never do.
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let heard = std::sync::Arc::clone(&received);
+        let accepting = std::thread::spawn(move || {
+            use std::io::Read as _;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut text = String::new();
+                        let _ = stream.read_to_string(&mut text);
+                        heard.lock().expect("lock").push(text);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        let (inode, boot_id) = crate::claude::socket_identity(&socket_path.display().to_string());
+
+        // The poll drops the session's FIRST hook into the spool — the one
+        // carrying that socket — and hands back a reply for the session in
+        // the same breath.
+        let spool = root.join("events");
+        let landed = crate::now_millis().expect("clock");
+        let poll_spool = spool.clone();
+        let poll_socket = socket_path.display().to_string();
+        let _probe = crate::telegram::update_fetch_probe::arm_polling(move || {
+            let _ = fs::write(
+                poll_spool.join(format!("{landed:015}-1-Notification.json")),
+                json!({
+                    "hookEventName": "Notification",
+                    "sessionId": "sess-poll",
+                    "receivedAt": landed,
+                    "messagingSocket": poll_socket,
+                    "socketInode": inode,
+                    "socketBootId": boot_id,
+                    "payload": {"message": "Claude needs your permission to run ls"}
+                })
+                .to_string(),
+            );
+            json!({
+                "ok": true,
+                "result": [{
+                    "update_id": 77,
+                    "message": {
+                        "message_id": 9,
+                        "chat": { "id": "456" },
+                        "from": { "id": "789" },
+                        "text": "继续",
+                        "reply_to_message": { "message_id": 6 }
+                    }
+                }]
+            })
+        });
+
+        daemon_cycle_lanes(
+            &conn,
+            &config,
+            1_000,
+            Duration::from_secs(1),
+            CycleLanes {
+                telegram_updates: true,
+                // The sync would learn the route too, and far too late: the
+                // reply has already been answered by then.
+                full_sync: false,
+            },
+        )
+        .expect("cycle");
+
+        assert_eq!(
+            crate::state::session_messaging_socket(&conn, "sess-poll")
+                .expect("route")
+                .map(|socket| socket.path),
+            Some(socket_path.display().to_string()),
+            "the hook that landed during the poll must be read before the batch is acted on"
+        );
+        assert!(
+            crate::claude::test_spawn::take().is_empty(),
+            "and a reply must not fork the session it was meant for"
+        );
+        let _ = accepting.join();
+        let delivered = received.lock().expect("lock").clone();
+        assert!(
+            delivered.iter().any(|text| text.contains("继续")),
+            "the reply must reach the live session itself: {delivered:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The other direction of the same reading. Holding the fresh clock UP
+    /// to the cycle's `now` hides the one condition the watermark repair
+    /// fires on — a stored high point ahead of the clock — so after a step
+    /// back every real hook is judged against a mark from before it, and the
+    /// spool entry is consumed on the way past.
+    #[test]
+    fn a_cycle_that_started_before_a_step_back_still_lets_hooks_through() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-stepback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("events")).expect("spool");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        let projects = root.join("projects");
+        fs::create_dir_all(&projects).expect("projects");
+        let _projects_seam =
+            crate::state::EnvVarGuard::set("TINYCTB_CLAUDE_PROJECTS_DIR", &projects);
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+
+        // The cycle began while the clock still read a minute ahead, and the
+        // row carries a high point from that time.
+        let real_now = crate::now_millis().expect("clock");
+        let before_the_step_back = real_now + 60_000;
+        conn.execute(
+            "INSERT INTO threads_cache(
+                thread_id, status_type, status_flags_json, updated_at, last_seen_at,
+                last_turn_status, last_preview, last_observed_at)
+             VALUES ('sess-stepback', 'active', '[]', ?1, ?1, NULL, '回拨前', ?1)",
+            rusqlite::params![before_the_step_back as i64],
+        )
+        .expect("row");
+
+        // A real Stop, stamped by the corrected clock.
+        let landed_at = real_now - 100;
+        fs::write(
+            root.join("events")
+                .join(format!("{landed_at:015}-1-Stop.json")),
+            json!({
+                "hookEventName": "Stop",
+                "sessionId": "sess-stepback",
+                "receivedAt": landed_at,
+                "payload": {"last_assistant_message": "回拨后"}
+            })
+            .to_string(),
+        )
+        .expect("hook");
+
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(crate::config::ClaudeConfig::default()),
+            projects: vec![],
+        };
+        daemon_cycle_lanes(
+            &conn,
+            &config,
+            before_the_step_back,
+            Duration::from_secs(1),
+            CycleLanes {
+                telegram_updates: false,
+                full_sync: true,
+            },
+        )
+        .expect("cycle");
+
+        let (turn, preview, observed): (Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT last_turn_status, last_preview, last_observed_at FROM threads_cache
+                 WHERE thread_id = 'sess-stepback'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("row");
+        assert_eq!(
+            (turn.as_deref(), preview.as_deref()),
+            (Some("completed"), Some("回拨后")),
+            "a session must not stay stuck where the old clock left it"
+        );
+        assert_eq!(
+            observed,
+            Some(landed_at as i64),
+            "and the floor is rebuilt from the hook that actually arrived"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The cycle's `now` is taken at the top, and the reply lane below it
+    /// does network I/O — seconds pass. Every hook that lands in that gap is
+    /// stamped after `now` and looks like it came from the future.
+    ///
+    /// This is not hypothetical. Seven real Stops and Notifications from live
+    /// sessions were found in the dead letter box on the machine this runs
+    /// on, every one of them carrying an ordinary timestamp, put there for no
+    /// reason but that the clock they were compared against was stale.
+    #[test]
+    fn a_hook_that_lands_mid_cycle_is_not_treated_as_coming_from_the_future() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-midcycle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("events")).expect("spool");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        let projects = root.join("projects");
+        fs::create_dir_all(&projects).expect("projects");
+        let _projects_seam =
+            crate::state::EnvVarGuard::set("TINYCTB_CLAUDE_PROJECTS_DIR", &projects);
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+
+        // Stamped as the real clock reads it — which is what a hook process
+        // writes — while the cycle was handed a `now` from long before.
+        let landed_at = crate::now_millis().expect("clock");
+        fs::write(
+            root.join("events")
+                .join(format!("{landed_at:015}-1-Stop.json")),
+            json!({
+                "hookEventName": "Stop",
+                "sessionId": "sess-midcycle",
+                "receivedAt": landed_at,
+                "payload": {"last_assistant_message": "做完了"}
+            })
+            .to_string(),
+        )
+        .expect("hook");
+
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(crate::config::ClaudeConfig::default()),
+            projects: vec![],
+        };
+        daemon_cycle_lanes(
+            &conn,
+            &config,
+            1_000,
+            Duration::from_secs(1),
+            CycleLanes {
+                telegram_updates: false,
+                full_sync: true,
+            },
+        )
+        .expect("cycle");
+
+        assert!(
+            !crate::claude::spool_future_dir()
+                .expect("dir")
+                .join(format!("{landed_at:015}-1-Stop.json"))
+                .exists(),
+            "a hook that arrived while the cycle was running is not from the future"
+        );
+        let seen: Option<i64> = conn
+            .query_row(
+                "SELECT last_observed_at FROM threads_cache WHERE thread_id = 'sess-midcycle'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the hook must have been processed");
+        assert_eq!(seen, Some(landed_at as i64));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A believable timestamp over an unchecked path is not a repair — but
+    /// neither is holding every reply until some future hook vouches for the
+    /// route. That closed on exactly the session that needed the reply: one
+    /// stopped at a prompt sends no further hook until it is answered, so
+    /// the session waiting for an answer was the one guaranteeing it never
+    /// came, and the hold was global.
+    ///
+    /// The way out was already on the row. A recorded identity that the path
+    /// still answers to settles it with nobody having to speak — which is
+    /// what this checks, without anyone recording a sighting by hand.
+    #[test]
+    fn a_waiting_session_whose_socket_still_answers_frees_itself() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-waiting-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("events")).expect("spool");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        let projects = root.join("projects");
+        fs::create_dir_all(&projects).expect("projects");
+        let _projects_seam =
+            crate::state::EnvVarGuard::set("TINYCTB_CLAUDE_PROJECTS_DIR", &projects);
+        let _probe = crate::telegram::update_fetch_probe::arm();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+
+        // A session stopped at a prompt: its socket is there, its identity is
+        // what was recorded, and it will send nothing more until it is
+        // answered. Only the timestamp beside it was ever unbelievable.
+        // Named after a live pid, because that is what the identity is made
+        // of: the owner's start ticks, scoped by boot id.
+        let socket_path = root.join(format!("{}.sock", std::process::id()));
+        fs::write(&socket_path, "").expect("socket stand-in");
+        let path = socket_path.display().to_string();
+        let (inode, boot_id) = crate::claude::socket_identity(&path);
+        assert!(
+            inode.is_some() && boot_id.is_some(),
+            "the identity has to be readable for this to be the case under test"
+        );
+        // Ahead of the WALL CLOCK, which is what the check reads — the
+        // cycle's own `now` is taken before a poll that can block for
+        // seconds, so it is not what decides whether a stamp is impossible.
+        let ahead_of_the_clock = crate::now_millis().expect("clock") + 60_000;
+        conn.execute(
+            "INSERT INTO threads_cache(
+                thread_id, status_type, status_flags_json, updated_at, last_seen_at,
+                messaging_socket, socket_inode, socket_boot_id, socket_observed_at)
+             VALUES ('sess-waiting', 'active', '[]', 1000, 1000, ?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                path,
+                inode.map(|value| value as i64),
+                boot_id,
+                ahead_of_the_clock as i64
+            ],
+        )
+        .expect("row");
+
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(crate::config::TelegramConfig {
+                bot_token: "test-token".to_string(),
+                chat_id: "1".to_string(),
+                allowed_user_id: None,
+            }),
+            claude: Some(crate::config::ClaudeConfig::default()),
+            projects: vec![],
+        };
+        let result = daemon_cycle_lanes(
+            &conn,
+            &config,
+            1_000,
+            Duration::from_secs(1),
+            CycleLanes {
+                telegram_updates: true,
+                full_sync: false,
+            },
+        )
+        .expect("cycle");
+
+        assert_eq!(
+            result
+                .get("telegramUpdates")
+                .and_then(|lane| lane.get("ok"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "the reply this session is waiting for must not be held by its own silence"
+        );
+        assert_eq!(
+            crate::telegram::update_fetch_probe::calls(),
+            1,
+            "and updates must actually be collected"
+        );
+        let doubted: Option<i64> = conn
+            .query_row(
+                "SELECT socket_unverified_since FROM threads_cache WHERE thread_id = 'sess-waiting'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(
+            doubted, None,
+            "a path that answers to the identity recorded for it settles the only open question"
+        );
+        let seen: Option<i64> = conn
+            .query_row(
+                "SELECT socket_observed_at FROM threads_cache WHERE thread_id = 'sess-waiting'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert!(
+            seen.is_none_or(|at| (at as u64) < ahead_of_the_clock),
+            "and the unbelievable stamp is gone rather than made believable, got {seen:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The other way out, so the hold is bounded at both ends: a session that
+    /// will never speak again cannot leave every reply in the bridge waiting
+    /// on a socket nobody is listening to.
+    #[test]
+    fn an_unverified_route_that_is_gone_stops_holding_replies() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-gone-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("events")).expect("spool");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        let projects = root.join("projects");
+        fs::create_dir_all(&projects).expect("projects");
+        let _projects_seam =
+            crate::state::EnvVarGuard::set("TINYCTB_CLAUDE_PROJECTS_DIR", &projects);
+        let _probe = crate::telegram::update_fetch_probe::arm();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let ahead_of_the_clock = crate::now_millis().expect("clock") + 60_000;
+        conn.execute(
+            "INSERT INTO threads_cache(
+                thread_id, status_type, status_flags_json, updated_at, last_seen_at,
+                messaging_socket, socket_observed_at)
+             VALUES ('sess-vanished', 'active', '[]', 1000, 1000, ?1, ?2)",
+            rusqlite::params![
+                root.join("vanished.sock").display().to_string(),
+                ahead_of_the_clock as i64
+            ],
+        )
+        .expect("row");
+
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(crate::config::TelegramConfig {
+                bot_token: "test-token".to_string(),
+                chat_id: "1".to_string(),
+                allowed_user_id: None,
+            }),
+            claude: Some(crate::config::ClaudeConfig::default()),
+            projects: vec![],
+        };
+        let result = daemon_cycle_lanes(
+            &conn,
+            &config,
+            1_000,
+            Duration::from_secs(1),
+            CycleLanes {
+                telegram_updates: true,
+                full_sync: false,
+            },
+        )
+        .expect("cycle");
+        assert_eq!(
+            result
+                .get("telegramUpdates")
+                .and_then(|lane| lane.get("ok"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "a route that is not there cannot be the reason to keep holding replies"
+        );
+        let left: Option<String> = conn
+            .query_row(
+                "SELECT messaging_socket FROM threads_cache WHERE thread_id = 'sess-vanished'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(
+            left, None,
+            "and the dead route is forgotten rather than kept"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The preflight guards ONE thing: a plain reply, which can end in a
+    /// headless spawn. Commands reach nothing by that route, and blocking
+    /// them on an unreadable spool takes `/repair` offline at exactly the
+    /// moment it is the thing you need. So the same broken spool must stop
+    /// the reply and let the command through.
+    #[test]
+    fn an_unreadable_spool_stops_a_reply_and_lets_a_command_through() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-onlyreply-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("dir");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        // Something else sitting where the spool belongs.
+        fs::write(root.join("events"), "not a directory").expect("blocker");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_spawn::take();
+        conn.execute(
+            "INSERT INTO telegram_message_routes(
+                chat_id, message_id, thread_id, event_id, created_at)
+             VALUES ('456', 6, 'sess-blocked', 'evt-blocked', 900)",
+            [],
+        )
+        .expect("route anchor");
+        let _sends = crate::telegram::api::outbound_probe::arm_acting(|| {});
+        // The command comes FIRST, so it is handled before the reply stops
+        // the batch — and its offset is what proves it got through.
+        let _probe = crate::telegram::update_fetch_probe::arm_polling(|| {
+            json!({
+                "ok": true,
+                "result": [
+                    {
+                        "update_id": 101,
+                        "message": {
+                            "message_id": 8,
+                            "chat": { "id": "456" },
+                            "from": { "id": "789" },
+                            "text": "/status"
+                        }
+                    },
+                    {
+                        "update_id": 102,
+                        "message": {
+                            "message_id": 9,
+                            "chat": { "id": "456" },
+                            "from": { "id": "789" },
+                            "text": "继续",
+                            "reply_to_message": { "message_id": 6 }
+                        }
+                    }
+                ]
+            })
+        });
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(crate::config::TelegramConfig {
+                bot_token: "test-token".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            }),
+            claude: Some(crate::config::ClaudeConfig::default()),
+            projects: vec![],
+        };
+
+        daemon_cycle_lanes(
+            &conn,
+            &config,
+            1_000,
+            Duration::from_secs(1),
+            CycleLanes {
+                telegram_updates: true,
+                full_sync: false,
+            },
+        )
+        .expect("cycle");
+
+        let acked: Option<i64> = conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM settings
+                  WHERE key LIKE 'telegram_offset:%'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        assert_eq!(
+            acked,
+            Some(101),
+            "the command must be handled and acknowledged; the reply behind it must not"
+        );
+        assert!(
+            crate::claude::test_spawn::take().is_empty(),
+            "and the reply must not be answered by a second session"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The preflight is not only about reading the spool: a clock that
+    /// stepped back during the poll leaves a sighting from the future
+    /// standing, and a route nothing has vouched for is exactly the one a
+    /// silent socket must not be taken as proof about. If that check cannot
+    /// be made, the reply stops here rather than being answered from a
+    /// picture that could not be taken.
+    #[test]
+    fn a_quarantine_that_cannot_be_written_stops_the_reply() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-quarfail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("events")).expect("spool");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        let projects = root.join("projects");
+        fs::create_dir_all(&projects).expect("projects");
+        let _projects_seam =
+            crate::state::EnvVarGuard::set("TINYCTB_CLAUDE_PROJECTS_DIR", &projects);
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_spawn::take();
+        conn.execute(
+            "INSERT INTO telegram_message_routes(
+                chat_id, message_id, thread_id, event_id, created_at)
+             VALUES ('456', 6, 'sess-quar', 'evt-quar', 900)",
+            [],
+        )
+        .expect("route anchor");
+        // The quarantine write refuses, from underneath.
+        conn.execute_batch(
+            "CREATE TRIGGER no_quarantine BEFORE UPDATE OF socket_unverified_since
+             ON threads_cache
+             BEGIN SELECT RAISE(ABORT, 'quarantine refused'); END;",
+        )
+        .expect("trigger");
+        // A sighting from the future, so the quarantine actually has work.
+        let ahead = crate::now_millis().expect("clock") + 60_000;
+        conn.execute(
+            "INSERT INTO threads_cache(
+                thread_id, status_type, status_flags_json, updated_at, last_seen_at,
+                messaging_socket, socket_observed_at)
+             VALUES ('sess-quar', 'active', '[]', 1000, 1000, '/run/quar.sock', ?1)",
+            rusqlite::params![ahead as i64],
+        )
+        .expect("row");
+
+        let _probe = crate::telegram::update_fetch_probe::arm_polling(|| {
+            json!({
+                "ok": true,
+                "result": [{
+                    "update_id": 111,
+                    "message": {
+                        "message_id": 9,
+                        "chat": { "id": "456" },
+                        "from": { "id": "789" },
+                        "text": "继续",
+                        "reply_to_message": { "message_id": 6 }
+                    }
+                }]
+            })
+        });
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(crate::config::TelegramConfig {
+                bot_token: "test-token".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            }),
+            claude: Some(crate::config::ClaudeConfig::default()),
+            projects: vec![],
+        };
+
+        let result = daemon_cycle_lanes(
+            &conn,
+            &config,
+            1_000,
+            Duration::from_secs(1),
+            CycleLanes {
+                telegram_updates: true,
+                full_sync: false,
+            },
+        )
+        .expect("cycle");
+
+        assert_eq!(
+            result
+                .get("telegramUpdates")
+                .and_then(|lane| lane.get("stopped"))
+                .and_then(Value::as_str),
+            Some("session_sockets_unreadable"),
+            "a check that could not be made must stop the batch, not be skipped"
+        );
+        assert!(
+            crate::claude::test_spawn::take().is_empty(),
+            "and nothing may be spawned on the strength of it"
+        );
+        let offsets: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key LIKE 'telegram_offset:%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("offsets");
+        assert_eq!(offsets, 0, "and the update must come back next time");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The peek exists so a reply arriving in the same cycle as a session's
+    /// first hook already finds the socket. If the peek FAILS, the honest
+    /// state is "unknown" — and handling replies on an unknown mapping means
+    /// a headless `--resume` that forks the session, before the sync that
+    /// would have found the socket ever runs. A deferred reply is still on
+    /// Telegram's side and arrives next cycle; a forked session is forever.
+    #[test]
+    fn a_cycle_that_cannot_see_the_sockets_does_not_handle_replies() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-nopeek-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("dir");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        // Something else sitting where the spool belongs: the listing fails,
+        // so this cycle cannot know where anyone is listening.
+        fs::write(root.join("events"), "not a directory").expect("blocker");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let _ = crate::claude::test_spawn::take();
+        // A reply has to actually be waiting: the check runs where a reply
+        // would be ROUTED, so a batch with nothing in it has nothing to
+        // check and is not the case under test.
+        conn.execute(
+            "INSERT INTO telegram_message_routes(
+                chat_id, message_id, thread_id, event_id, created_at)
+             VALUES ('456', 6, 'sess-blind', 'evt-blind', 900)",
+            [],
+        )
+        .expect("route anchor");
+        let _probe = crate::telegram::update_fetch_probe::arm_polling(|| {
+            json!({
+                "ok": true,
+                "result": [{
+                    "update_id": 91,
+                    "message": {
+                        "message_id": 9,
+                        "chat": { "id": "456" },
+                        "from": { "id": "789" },
+                        "text": "继续",
+                        "reply_to_message": { "message_id": 6 }
+                    }
+                }]
+            })
+        });
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(crate::config::TelegramConfig {
+                bot_token: "test-token".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            }),
+            claude: Some(crate::config::ClaudeConfig::default()),
+            projects: vec![],
+        };
+
+        let result = daemon_cycle_lanes(
+            &conn,
+            &config,
+            1_000,
+            Duration::from_secs(1),
+            CycleLanes {
+                telegram_updates: true,
+                // The sync would fail on the same blocked spool; this test is
+                // about the reply lane's decision, made before it.
+                full_sync: false,
+            },
+        )
+        .expect("cycle");
+
+        // The socket picture could not be taken, so the batch is not acted
+        // on at all: the lane reports the failure and the offset stays put,
+        // which is what makes Telegram deliver it again.
+        assert_eq!(
+            result
+                .get("telegramUpdates")
+                .and_then(|lane| lane.get("ok"))
+                .and_then(Value::as_bool),
+            Some(false),
+            "the reply lane must stand down, and say that it did"
+        );
+        assert!(
+            crate::claude::test_spawn::take().is_empty(),
+            "and above all must not answer from a picture it could not take"
+        );
+        let offsets: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key LIKE 'telegram_offset:%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("offsets");
+        assert_eq!(
+            offsets, 0,
+            "nothing may be acknowledged that was never acted on"
+        );
+        // The fetch DOES happen — it has to, since the picture is taken
+        // after it — but nothing that came back is acted on.
+        assert_eq!(crate::telegram::update_fetch_probe::calls(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Two WRITERS, racing for one debt. The sequential test below pins the
+    /// outcome but cannot prove the race: both completions go through one
+    /// connection, one after the other. This one uses a file database, two
+    /// connections and two threads calling the production function at the
+    /// same time — exactly the shape the daemon and a CLI invocation make.
+    #[test]
+    fn two_writers_racing_for_one_debt_produce_exactly_one_bridge_push() {
+        let _guard = crate::state::test_env_lock();
+        let root = std::env::temp_dir().join(format!("tinyctb-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("dir");
+        let _state = crate::state::EnvVarGuard::set("TINYCTB_STATE_DIR", &root);
+        let db = root.join("state.db");
+
+        let setup = crate::state::create_state_db(&db).expect("db");
+        // away = FALSE: without a debt claim there is no reason to push at
+        // all, so "bridge" is the only way either of these gets out.
+        crate::state::set_setting_text(&setup, "away", "false").expect("home");
+        crate::state::record_live_injection(&setup, "sess-race", 1_000).expect("debt");
+        drop(setup);
+
+        let completion = |key: &str, at: u64| {
+            json!({
+                "type": "thread_completed",
+                "threadId": "sess-race",
+                "eventKey": key,
+                "observedAt": at,
+                "lastPreview": format!("答案 {key}")
+            })
+        };
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for index in 0..2 {
+            let db = db.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            let event = completion(
+                &format!("thread_completed:sess-race:{index}"),
+                2_000 + index,
+            );
+            handles.push(std::thread::spawn(move || {
+                let conn = crate::state::create_state_db(&db).expect("db");
+                // Line them up so both are inside the call together.
+                barrier.wait();
+                enqueue_daemon_notification_events(&conn, std::slice::from_ref(&event), 3_000)
+            }));
+        }
+        let pushed: usize = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread").expect("enqueue"))
+            .sum();
+
+        let conn = crate::state::create_state_db(&db).expect("db");
+        let bridges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events WHERE origin = 'bridge'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        let open: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM live_injections WHERE claimed_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            bridges, 1,
+            "one debt, one promised answer — whatever order the two writers land in"
+        );
+        assert_eq!(pushed, 1, "and the other has no reason to push at all");
+        assert_eq!(open, 0, "the debt is settled exactly once");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// One injection debt answers ONE completion. Both used to read "an
+    /// answer is owed" before the transaction that settles it, so each
+    /// declared itself the promised reply and the user was pushed the same
+    /// answer twice. The claim is the question now.
+    #[test]
+    fn two_completions_cannot_both_claim_one_injection_debt() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::set_setting_text(&conn, "away", "true").expect("away");
+        crate::state::record_live_injection(&conn, "sess-debt", 1_000).expect("debt");
+        let completion = |key: &str, at: u64| {
+            json!({
+                "type": "thread_completed",
+                "threadId": "sess-debt",
+                "eventKey": key,
+                "observedAt": at,
+                "lastPreview": format!("答案 {key}")
+            })
+        };
+
+        let events = vec![
+            completion("thread_completed:sess-debt:1", 2_000),
+            completion("thread_completed:sess-debt:2", 2_500),
+        ];
+        assert_eq!(
+            enqueue_daemon_notification_events(&conn, &events, 3_000).expect("enqueue"),
+            2,
+            "both completions are real events"
+        );
+        let mut origins: Vec<String> = conn
+            .prepare("SELECT origin FROM outbound_events")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .expect("rows");
+        origins.sort();
+        assert_eq!(
+            origins,
+            vec!["away".to_string(), "bridge".to_string()],
+            "exactly one of them is the promised answer"
+        );
+        let open: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM live_injections WHERE claimed_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(open, 0, "and the debt is settled exactly once");
+    }
+
+    /// A session that owes an answer bypasses the away gate for EVERY event
+    /// it sends, not only completions. Asked something from the phone, a
+    /// session may answer with a question of its own — and a rule that only
+    /// let completions through would strand the user mid-conversation
+    /// whenever away mode happened to be off.
+    #[test]
+    fn a_question_from_a_session_that_owes_an_answer_still_reaches_the_phone() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::set_setting_text(&conn, "away", "false").expect("home");
+        crate::state::record_live_injection(&conn, "sess-asks", 1_000).expect("debt");
+        let question = json!({
+            "type": "thread_waiting",
+            "threadId": "sess-asks",
+            "eventKey": "thread_waiting:sess-asks:1",
+            "observedAt": 2_000,
+            "promptKind": "reply",
+            "lastPreview": "你要哪个?"
+        });
+
+        assert_eq!(
+            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&question), 3_000)
+                .expect("enqueue"),
+            1,
+            "the question must reach the phone"
+        );
+        let (origin, open): (String, i64) = conn
+            .query_row(
+                "SELECT origin, (SELECT COUNT(*) FROM live_injections WHERE claimed_at IS NULL)
+                 FROM outbound_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(origin, "bridge", "and as bridge traffic, so /back keeps it");
+        assert_eq!(
+            open, 1,
+            "but a question is not the promised answer: the debt stays open"
+        );
+    }
+
+    /// The marker and the row are ONE decision. Written apart — the marker
+    /// during the sync, the row at enqueue time — a failure in between left
+    /// the marker standing and the row missing, and the marker then silenced
+    /// every retry: the notification was lost for good, not delayed.
+    #[test]
+    fn a_failed_enqueue_leaves_no_delivery_marker_to_silence_the_retry() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::set_setting_text(&conn, "away", "true").expect("away");
+        let event = json!({
+            "type": "thread_completed",
+            "threadId": "sess-mark",
+            "eventKey": "thread_completed:sess-mark:1",
+            "observedAt": 1_000,
+            "lastPreview": "答案"
+        });
+
+        // A deterministic failure INSIDE the transaction, after the marker:
+        // the outbound insert aborts (a full disk, a failing statement).
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_outbound BEFORE INSERT ON outbound_events
+             BEGIN SELECT RAISE(ABORT, 'no space left on device'); END;",
+        )
+        .expect("trigger");
+        assert!(
+            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&event), 2_000).is_err(),
+            "the enqueue must report its failure"
+        );
+        let markers: i64 = conn
+            .query_row("SELECT COUNT(*) FROM delivery_log", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(
+            markers, 0,
+            "a marker for a row that was never written must roll back with it"
+        );
+
+        // With the fault cleared the retry still works — which it cannot if
+        // a marker survived the failure.
+        conn.execute_batch("DROP TRIGGER refuse_outbound;")
+            .expect("clear the fault");
+        assert_eq!(
+            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&event), 3_000)
+                .expect("retry"),
+            1,
+            "the retry must still be able to push it"
+        );
+        let (rows, markers): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM outbound_events),
+                        (SELECT COUNT(*) FROM delivery_log)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("count");
+        assert_eq!((rows, markers), (1, 1), "both, or neither");
+
+        // And the same event is never pushed twice.
+        conn.execute("DELETE FROM outbound_events", [])
+            .expect("deliver and prune");
+        assert_eq!(
+            enqueue_daemon_notification_events(&conn, &[event], 4_000).expect("replay"),
+            0,
+            "an event already delivered must not be pushed again"
+        );
+    }
     use crate::claude::set_away_mode;
     use crate::state::{create_state_db_in_memory, pending_outbound_count};
 
