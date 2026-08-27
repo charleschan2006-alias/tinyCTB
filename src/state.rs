@@ -617,13 +617,61 @@ pub(crate) fn create_state_db_in_memory() -> Result<Connection> {
     Ok(conn)
 }
 
+/// What the migration clamp compares against when the clock cannot be read
+/// (a system clock before the Unix epoch). Zero matches no stored stamp, so
+/// the backfill DEFERS — neither failing the open nor adopting stamps
+/// nothing could judge — and runs on the next open with a working clock.
+const MIGRATION_CLOCK_FALLBACK: u64 = 0;
+
+/// One-time recovery of the observed floor for rows v0.2.7 wrote before the
+/// column existed. Re-entrant by construction: it only touches rows whose
+/// `last_observed_at` is still NULL, so an open that could not run it (or
+/// ran it with the zero fallback above) leaves it armed for the next one.
+///
+/// Guarded on every side, because this runs while the database is being
+/// OPENED: one malformed historical payload must not be able to stop
+/// tinyctb from starting. `json_valid` before `json_extract`, an integer
+/// type check rather than a CAST that would silently turn "soon" into 0,
+/// and a clamp — an absurd future value written by anything at all would
+/// otherwise become a permanent floor no measurement could ever correct.
+fn backfill_observed_floor(conn: &Connection, migration_now: u64) -> Result<()> {
+    conn.execute(
+        "UPDATE threads_cache
+            SET last_observed_at = (
+                SELECT MAX(json_extract(e.payload_json, '$.updatedAt'))
+                  FROM thread_events e
+                 WHERE e.thread_id = threads_cache.thread_id
+                   AND json_valid(e.payload_json)
+                   AND json_type(e.payload_json, '$.updatedAt') = 'integer'
+                   AND json_extract(e.payload_json, '$.updatedAt') <= ?1
+            )
+          WHERE last_observed_at IS NULL
+            AND EXISTS (
+                SELECT 1 FROM thread_events e
+                 WHERE e.thread_id = threads_cache.thread_id
+                   AND json_valid(e.payload_json)
+                   AND json_type(e.payload_json, '$.updatedAt') = 'integer'
+                   AND json_extract(e.payload_json, '$.updatedAt') <= ?1
+            )",
+        params![to_sql_i64(migration_now)?],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     // The clock the one-time backfill below clamps against. Taken here so a
-    // database that cannot read a clock still opens.
+    // database that cannot read a clock still opens. The stand-in for an
+    // unreadable clock is ZERO, not a maximum: the clamp exists to keep
+    // stamps no measurement could correct out of the floor, and with no
+    // clock there is no judging any stamp — so none qualifies, the backfill
+    // matches nothing, and `last_observed_at IS NULL` keeps it armed for
+    // the next open under a working clock. (`u64::MAX` was the first
+    // stand-in; `to_sql_i64` rejects it, so the one open this fallback
+    // existed to protect was the one it prevented.)
     let migration_now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_millis() as u64)
-        .unwrap_or(u64::MAX);
+        .unwrap_or(MIGRATION_CLOCK_FALLBACK);
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS settings (
@@ -859,32 +907,7 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     //     against a measurement read before the transcript was flushed, and
     //     the measurement itself is the ground truth for when a session
     //     last spoke.
-    // Guarded on every side, because this runs while the database is being
-    // OPENED: one malformed historical payload must not be able to stop
-    // tinyctb from starting. `json_valid` before `json_extract`, an integer
-    // type check rather than a CAST that would silently turn "soon" into 0,
-    // and a clamp — an absurd future value written by anything at all would
-    // otherwise become a permanent floor no measurement could ever correct.
-    conn.execute(
-        "UPDATE threads_cache
-            SET last_observed_at = (
-                SELECT MAX(json_extract(e.payload_json, '$.updatedAt'))
-                  FROM thread_events e
-                 WHERE e.thread_id = threads_cache.thread_id
-                   AND json_valid(e.payload_json)
-                   AND json_type(e.payload_json, '$.updatedAt') = 'integer'
-                   AND json_extract(e.payload_json, '$.updatedAt') <= ?1
-            )
-          WHERE last_observed_at IS NULL
-            AND EXISTS (
-                SELECT 1 FROM thread_events e
-                 WHERE e.thread_id = threads_cache.thread_id
-                   AND json_valid(e.payload_json)
-                   AND json_type(e.payload_json, '$.updatedAt') = 'integer'
-                   AND json_extract(e.payload_json, '$.updatedAt') <= ?1
-            )",
-        params![to_sql_i64(migration_now)?],
-    )?;
+    backfill_observed_floor(conn, migration_now)?;
     ensure_column(conn, "telegram_command_routes", "payload_json", "TEXT")?;
     ensure_column(conn, "telegram_callback_routes", "approval_id", "TEXT")?;
     ensure_column(conn, "pending_questions", "multi_select", "INTEGER")?;
@@ -2129,6 +2152,7 @@ pub(crate) fn reconcile_thread_snapshots(
     let away_started_at = get_setting_number(conn, "away_started_at")?;
     let mut events = Vec::new();
     let mut threads = Vec::new();
+    let mut overtaken = Vec::new();
 
     // The newest observation this cycle holds per session. It is what
     // re-establishes a damaged floor: not the clock, and not whichever entry
@@ -2156,10 +2180,17 @@ pub(crate) fn reconcile_thread_snapshots(
         )?;
         debug_assert_ne!(write, SnapshotWrite::RejectedStale);
         // A hook a NEWER one already overtook describes the past, not the
-        // present. Its row was left alone; handing it back here would put
-        // the same stale state in front of the reader by another door.
+        // present. Its row was left alone, and `threads` must not hand the
+        // same stale state to the reader by another door. But the events it
+        // still emits below render from a snapshot, and that snapshot must
+        // be THIS one: paired with a same-session sibling instead, a
+        // finished turn's notification once showed the next question as its
+        // answer. So an overtaken snapshot rides along under its own name —
+        // for pairing by event uid only, never as current state.
         let superseded = write == SnapshotWrite::Superseded;
-        if !superseded {
+        if superseded {
+            overtaken.push(thread_snapshot_json(snapshot));
+        } else {
             threads.push(thread_snapshot_json(snapshot));
         }
 
@@ -2259,8 +2290,12 @@ pub(crate) fn reconcile_thread_snapshots(
     }
 
     Ok(json!({
-        "synced": snapshots.len(),
+        // What was RECONCILED, not what arrived: an overtaken snapshot's row
+        // was left alone, and a write that did not happen is not a synced
+        // thread (the scan path already counts a refused write the same way).
+        "synced": threads.len(),
         "threads": threads,
+        "overtaken": overtaken,
         "events": events,
         "away": away
     }))
@@ -8910,5 +8945,117 @@ mod tests {
 
         assert_eq!(summary.attempted, 0);
         assert_eq!(pending_outbound_count(&conn).expect("pending"), 1);
+    }
+
+    /// The migration clamp's stand-in for an unreadable clock must DEFER the
+    /// backfill, not fail the open (u64::MAX did — `to_sql_i64` rejects it)
+    /// and not adopt stamps nothing could judge. Deferred means still armed:
+    /// the next open under a working clock completes the recovery.
+    #[test]
+    fn an_unreadable_clock_defers_the_floor_backfill() {
+        let conn = create_state_db_in_memory().expect("db");
+        let snapshot = BridgeThreadSnapshot {
+            thread_id: "s-defer".to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(4_321),
+            status_type: "idle".to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: None,
+            last_preview: None,
+            pending_prompt: None,
+            event_uid: None,
+        };
+        // A Guessed write never touches the observed floor, so the row
+        // starts exactly like one v0.2.7 left behind: floor NULL, history
+        // in thread_events.
+        assert_eq!(
+            upsert_thread_snapshot(
+                &conn,
+                &snapshot,
+                5_000,
+                UpdatedAt::Guessed,
+                None,
+                None,
+                None,
+            )
+            .expect("seed row"),
+            SnapshotWrite::Applied
+        );
+        record_thread_event(
+            &conn,
+            "k-defer",
+            "s-defer",
+            "thread_completed",
+            5_000,
+            &json!({ "updatedAt": 4_321 }),
+        )
+        .expect("seed event");
+        let floor = |conn: &Connection| -> Option<i64> {
+            conn.query_row(
+                "SELECT last_observed_at FROM threads_cache WHERE thread_id = 's-defer'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row")
+        };
+        assert_eq!(floor(&conn), None, "seed must start unfilled");
+
+        // The open under a broken clock: the clamp admits nothing.
+        backfill_observed_floor(&conn, MIGRATION_CLOCK_FALLBACK).expect("open with broken clock");
+        assert_eq!(
+            floor(&conn),
+            None,
+            "an unjudgeable stamp must not become the floor"
+        );
+
+        // The next open under a working clock finds the backfill still armed.
+        backfill_observed_floor(&conn, 10_000).expect("open with working clock");
+        assert_eq!(floor(&conn), Some(4_321));
+    }
+
+    /// An overtaken snapshot must leave `threads` (it is not current state)
+    /// without vanishing: its own events still render from it, and enriched
+    /// from a same-session sibling instead, a finished turn's notification
+    /// shows the next question as its answer.
+    #[test]
+    fn an_overtaken_snapshot_is_carried_for_its_events_only() {
+        let conn = create_state_db_in_memory().expect("db");
+        let snapshot = |uid: &str, at: u64, completed: bool| BridgeThreadSnapshot {
+            thread_id: "s-1".to_string(),
+            name: None,
+            cwd: None,
+            updated_at: Some(at),
+            status_type: "idle".to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: completed.then(|| "completed".to_string()),
+            last_preview: Some(format!("preview {uid}")),
+            pending_prompt: None,
+            event_uid: Some(uid.to_string()),
+        };
+        // Cycle N: a hook at 5000 lands normally; the floor moves past 4000.
+        reconcile_thread_snapshots(&conn, 5_000, vec![snapshot("b-1", 5_000, false)], false)
+            .expect("cycle n");
+        // Cycle M: a delayed completion shares the batch with a fresh hook.
+        let sync = reconcile_thread_snapshots(
+            &conn,
+            6_000,
+            vec![snapshot("a-1", 4_000, true), snapshot("c-1", 6_000, false)],
+            false,
+        )
+        .expect("cycle m");
+        let uids = |key: &str| {
+            sync[key]
+                .as_array()
+                .expect(key)
+                .iter()
+                .map(|thread| thread["eventUid"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(uids("threads"), vec!["c-1"], "sync: {sync}");
+        assert_eq!(uids("overtaken"), vec!["a-1"], "sync: {sync}");
+        // An overtaken snapshot's row was left alone; a write that did not
+        // happen must not be counted as a synced thread either.
+        assert_eq!(sync["synced"], 1, "sync: {sync}");
     }
 }

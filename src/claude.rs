@@ -1972,6 +1972,10 @@ pub(crate) fn sync_state_from_sessions(
     let mut result = json!({
         "synced": threads.len(),
         "threads": threads,
+        // Not part of the synced state: snapshots a newer hook overtook,
+        // carried solely so their own events enrich from the snapshot they
+        // came from (see `reconcile_thread_snapshots`).
+        "overtaken": reconcile.get("overtaken").cloned().unwrap_or_else(|| json!([])),
         "events": reconcile.get("events").cloned().unwrap_or_else(|| json!([])),
         "away": reconcile.get("away").cloned().unwrap_or(Value::Bool(false)),
         "spoolConsumed": consumed
@@ -2078,7 +2082,7 @@ pub(crate) fn watch_thread_error_event(error: &anyhow::Error, now: u64) -> Value
     })
 }
 
-fn enrich_event_with_thread(event: Value, threads: &[Value]) -> Value {
+fn enrich_event_with_thread(event: Value, threads: &[Value], overtaken: &[Value]) -> Value {
     let Some(thread_id) = event.get("threadId").and_then(Value::as_str) else {
         return event;
     };
@@ -2092,19 +2096,26 @@ fn enrich_event_with_thread(event: Value, threads: &[Value]) -> Value {
     let matches_id = |thread: &&Value| -> bool {
         thread.get("threadId").and_then(Value::as_str) == Some(thread_id)
     };
-    let Some(thread) = threads
-        .iter()
-        .find(|thread| {
-            matches_id(thread)
-                && match event_uid {
-                    Some(uid) => thread.get("eventUid") == Some(uid),
-                    None => {
-                        updated_at.map_or(true, |updated| thread.get("updatedAt") == Some(updated))
-                    }
-                }
-        })
-        .or_else(|| threads.iter().find(matches_id))
-    else {
+    let found = match event_uid {
+        // A uid names exactly one hook. Its snapshot may sit in the current
+        // state or among the overtaken (a late completion whose row a newer
+        // hook already owns) — and a same-session SIBLING is no substitute
+        // in either case: rendered from one, a finished turn's notification
+        // shows the next question as its answer. No match, no enrichment;
+        // the event still carries its own preview.
+        Some(uid) => threads
+            .iter()
+            .chain(overtaken.iter())
+            .find(|thread| matches_id(thread) && thread.get("eventUid") == Some(uid)),
+        None => threads
+            .iter()
+            .find(|thread| {
+                matches_id(thread)
+                    && updated_at.map_or(true, |updated| thread.get("updatedAt") == Some(updated))
+            })
+            .or_else(|| threads.iter().find(matches_id)),
+    };
+    let Some(thread) = found else {
         return event;
     };
     let mut enriched = event;
@@ -2123,13 +2134,18 @@ pub(crate) fn watch_events_from_sync_result(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let overtaken = sync_result
+        .get("overtaken")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let events = sync_result
         .get("events")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
         .into_iter()
-        .map(|event| enrich_event_with_thread(event, &threads))
+        .map(|event| enrich_event_with_thread(event, &threads, &overtaken))
         .collect::<Vec<_>>();
     filter_watch_events(events, filter)
 }
@@ -7200,6 +7216,141 @@ mod tests {
                 "message must not show the other snapshot's answer: {text}"
             );
         }
+    }
+
+    /// A completion the floor already overtook (a delayed spool entry, a
+    /// dead-letter replay) is still owed — and it must render ITS OWN
+    /// answer. Before the `overtaken` carry, its snapshot was dropped from
+    /// `threads`, enrichment fell back to the fresh same-session snapshot,
+    /// and the "finished" notification showed the next question instead.
+    #[test]
+    fn a_late_completion_renders_its_own_answer() {
+        let _guard = crate::state::test_env_lock();
+        let temp = TempDirGuard::new("late-completion");
+        std::env::set_var("TINYCTB_STATE_DIR", &temp.path);
+        let projects_root = temp.path.join("projects");
+        fs::create_dir_all(projects_root.join("-home-user-project")).expect("projects dir");
+        std::env::set_var(
+            "TINYCTB_CLAUDE_PROJECTS_DIR",
+            projects_root.display().to_string(),
+        );
+        let conn = create_state_db_in_memory().expect("db");
+        let config = DaemonConfig {
+            version: 1,
+            bridge_command: "tinyctb".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            claude: Some(ClaudeConfig::default()),
+            projects: vec![],
+        };
+        set_away_mode(&conn, true, 500).expect("away on");
+        let spool = events_spool_dir().expect("spool dir");
+        fs::create_dir_all(&spool).expect("create spool");
+        let write_hook = |received_at: u64, pid: u32, event: &str, payload: Value| {
+            let envelope = json!({
+                "receivedAt": received_at,
+                "hookEventName": event,
+                "sessionId": "sess-late",
+                "payload": payload
+            });
+            fs::write(
+                spool.join(format!("{received_at:015}-{pid}-{event}.json")),
+                envelope.to_string(),
+            )
+            .expect("write spool file");
+        };
+
+        // Cycle N: a hook at 5000 lands normally; the observed floor moves
+        // past 4000.
+        write_hook(
+            5_000,
+            999,
+            "SessionStart",
+            json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sess-late",
+                "cwd": "/home/user/project"
+            }),
+        );
+        sync_state_from_sessions(&conn, &config, 5_000, 50, true).expect("cycle n");
+
+        // Cycle M: the delayed completion finally arrives, sharing the batch
+        // with a fresh hook of the same session.
+        write_hook(
+            4_000,
+            111,
+            "Stop",
+            json!({
+                "hook_event_name": "Stop",
+                "session_id": "sess-late",
+                "cwd": "/home/user/project",
+                "last_assistant_message": "the real delayed answer"
+            }),
+        );
+        write_hook(
+            6_000,
+            333,
+            "Notification",
+            json!({
+                "hook_event_name": "Notification",
+                "session_id": "sess-late",
+                "cwd": "/home/user/project",
+                "message": "the next question",
+                "notification_type": "agent_needs_input"
+            }),
+        );
+        let result = sync_state_from_sessions(&conn, &config, 6_000, 50, true).expect("cycle m");
+        std::env::remove_var("TINYCTB_STATE_DIR");
+        std::env::remove_var("TINYCTB_CLAUDE_PROJECTS_DIR");
+
+        let enriched = watch_events_from_sync_result(&result, None);
+        let completed = enriched
+            .iter()
+            .find(|event| event["type"] == "thread_completed")
+            .expect("the late completion is still owed");
+        // Paired with the snapshot it came from, not the fresh sibling.
+        assert_eq!(
+            completed
+                .pointer("/thread/eventUid")
+                .and_then(Value::as_str),
+            Some("000000000004000-111-Stop"),
+            "event: {completed}"
+        );
+        let prepared = crate::telegram::render::prepare_telegram_delivery("999", completed)
+            .expect("prepared delivery");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+        assert!(text.contains("the real delayed answer"), "text: {text}");
+        assert!(
+            !text.contains("the next question"),
+            "a finished turn must not render the fresh question as its answer: {text}"
+        );
+    }
+
+    /// A uid names exactly one hook. When neither the current nor the
+    /// overtaken snapshots carry it, the event stays unenriched — a
+    /// same-session sibling is no substitute.
+    #[test]
+    fn an_event_without_its_snapshot_stays_unenriched() {
+        let sync = json!({
+            "threads": [
+                { "threadId": "s-1", "eventUid": "sibling", "lastPreview": "sibling preview" }
+            ],
+            "overtaken": [],
+            "events": [{
+                "type": "thread_completed",
+                "threadId": "s-1",
+                "eventUid": "mine",
+                "lastPreview": "my answer",
+                "eventKey": "k-1"
+            }]
+        });
+        let events = watch_events_from_sync_result(&sync, None);
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].get("thread").is_none(),
+            "a sibling snapshot is no substitute: {}",
+            events[0]
+        );
     }
 
     /// P1 regression: a spawned process whose identity write fails must be
