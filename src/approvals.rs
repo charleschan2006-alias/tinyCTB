@@ -49,32 +49,19 @@ use crate::state::{
     state_db_path, TelegramCallbackAction, TelegramCallbackRoute,
 };
 
-/// How often a blocked gate re-reads its answer row AND the keypress
-/// record. Measured 2026-08-17 on a waiting gate: 500ms cost 0.17 ms/s of
-/// CPU, 100ms costs 1.50 ms/s — and
-/// the process only exists while an approval is actually pending, so even an
-/// hour-long wait totals a few seconds of CPU. Worth it for a Telegram tap
-/// and `/back` landing in a tenth of a second instead of half of one.
-///
-/// This is NOT what bounds the terminal side. Claude Code renders its own
-/// permission dialog while the hook blocks (verified 2026-08-17 with a
-/// sleeping hook under a pty capture: the dialog appeared at hook start, not
-/// at hook return), so the machine in front of the user is answerable the
-/// whole time no matter what this interval says. Handing the remote window
-/// back is bounded by this interval alone — the daemon's keyboard listener
-/// stamps its record as the keypress happens, so there is no probe cadence
-/// left in the path.
+/// How often a blocked gate re-reads its answer row and the away marker.
+/// Measured 2026-08-17 on a waiting gate: 500ms cost 0.17 ms/s of CPU,
+/// 100ms costs 1.50 ms/s — and the process only exists while an approval is
+/// actually pending, so even an hour-long wait totals a few seconds of CPU.
+/// Worth it for a Telegram tap and `/back` landing in a tenth of a second
+/// instead of half of one. (Under the current TUI nothing renders in the
+/// terminal while the hook blocks — verified 2026-08-22 under a pty
+/// capture — so this interval bounds every exit the gate has.)
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// If the machine saw a KEYPRESS this recently when the gate fires, the
-/// user is sitting right there: show the terminal dialog immediately
-/// instead of detouring through Telegram. Pointer motion is deliberately
-/// excluded — see `user_is_present`.
-const ACTIVELY_PRESENT_WINDOW: Duration = Duration::from_millis(15_000);
 
 /// How long a gate waits when its session has NO terminal window (Claude
 /// Code's background pty host). Every "hand it back to the terminal" exit —
-/// the presence check, `/back`, the configured timeout — assumes a dialog
+/// `/back`, the configured timeout — assumes a dialog
 /// the user can see. A background session has none, so those exits do not
 /// resolve the prompt, they hide it: the tool stays blocked and the only
 /// remedy is walking to the machine and attaching (measured 2026-08-17:
@@ -88,328 +75,21 @@ const ACTIVELY_PRESENT_WINDOW: Duration = Duration::from_millis(15_000);
 /// exactly this.
 pub(crate) const WINDOWLESS_APPROVAL_WAIT: Duration = Duration::from_secs(86_400);
 
-/// Presence, as the gates see it. Holds no state of its own any more: the
-/// signal is a timestamp file the daemon's keyboard listener maintains, so a
-/// gate just reads it. The old design — one gdbus probe per gate, coordinated
-/// through a shared state file with an flock lease, a cadence and a backoff —
-/// is gone along with the desktop-idle signal it existed to sample.
-struct PresenceProbe;
-
-/// How long ago the machine last saw a KEYPRESS, per the record the
-/// daemon's listener keeps. `None` when there is no usable record.
-fn last_keypress_age() -> Option<Duration> {
-    #[cfg(test)]
-    if let Ok(raw) = std::env::var("TINYCTB_TEST_IDLE_MS") {
-        return raw.parse::<u64>().ok().map(Duration::from_millis);
-    }
-    let path = crate::state::state_dir_path()
-        .ok()?
-        .join(crate::daemon::INPUT_ACTIVITY_FILE);
-    let stamp = serde_json::from_str::<Value>(&std::fs::read_to_string(path).ok()?)
-        .ok()?
-        .get("lastInputAtMs")
-        .and_then(Value::as_u64)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_millis() as u64;
-    // A stamp from the FUTURE is not "just pressed" — it is a clock that
-    // moved. `saturating_sub` would read it as an age of zero and hand every
-    // prompt to the terminal on the first poll, which is precisely the
-    // button-vanishes-instantly bug this whole change exists to kill. No
-    // usable reading means not present, so the prompt stays on the phone.
-    now.checked_sub(stamp).map(Duration::from_millis)
-}
+// PRESENCE DETECTION IS GONE — deliberately, and it must not come back.
+// Keyboard activity used to hand a waiting prompt to the terminal within a
+// poll tick ("the machine in front of them wins over the phone in their
+// pocket"). The user overruled that design outright (2026-08-27): "我需要
+// 双向推送，不管人是否在电脑前，只要 away 开着，就双向推送。谁先抢答算谁的。"
+// And the same day's production log showed why: pressing Yes on one terminal
+// dialog was itself the keystroke that killed the NEXT approval's phone
+// buttons seconds after they were delivered. Away mode is the one
+// declaration; desktop activity decides nothing. The daemon's keyboard
+// listener still maintains its activity file, unconsumed — removing the
+// producer rides the xinput-orphan cleanup (v0.2.9 backlog).
 
 /// Left only so `reset` can sweep files an older build wrote.
 pub(crate) const PRESENCE_STATE_FILE: &str = "presence-probe.json";
 pub(crate) const PRESENCE_LOCK_FILE: &str = "presence-probe.lock";
-
-impl PresenceProbe {
-    fn new() -> Self {
-        PresenceProbe
-    }
-
-    /// Is the user at the machine right now?
-    ///
-    /// KEYSTROKES ONLY, never pointer motion. The desktop idle timer counts
-    /// both, and a mouse with a drifting sensor emits motion continuously —
-    /// measured 2026-08-17, ~600 phantom events a second holding idle at
-    /// 1-48ms for hours with nobody home. Every approval was therefore ruled
-    /// "user is at the keyboard" and handed to the terminal one poll tick
-    /// after its buttons reached the phone, leaving /threads nothing to
-    /// offer. Drift cannot fake a keypress.
-    ///
-    /// No record at all — no X session, listener not running, SSH only —
-    /// reads as NOT present: away mode was a declaration, and a guard that
-    /// cannot see must not overrule it.
-    fn user_is_present(&mut self) -> bool {
-        last_keypress_age().is_some_and(|age| age <= ACTIVELY_PRESENT_WINDOW)
-    }
-
-    /// Should a blocked interactive gate hand its prompt to the terminal?
-    /// `/back` is checked FIRST: it is the deterministic path (works with no
-    /// desktop session at all, e.g. over SSH) and must never queue behind a
-    /// wedged probe.
-    fn terminal_reclaimed(&mut self) -> bool {
-        !away_mode_active() || self.user_is_present()
-    }
-}
-
-struct ResolutionWatch {
-    transcript: Option<std::path::PathBuf>,
-    /// Next byte to read. Starts at the size the transcript had when the
-    /// request was raised and only ever moves forward, so each check reads
-    /// what arrived since the last one.
-    ///
-    /// Re-reading from the original boundary every second (the first cut of
-    /// this) was quadratic in the tail: a session with a 5MiB sidechain tail
-    /// re-read those 5MiB 3600 times an hour, and the cost grew with the
-    /// conversation. An hour-long windowless wait made that ~18GiB of
-    /// pointless I/O.
-    offset: std::cell::Cell<u64>,
-    /// (device, inode) of the file the offset refers to. A transcript that
-    /// is rotated or replaced gets a new identity, and an offset carried
-    /// across that boundary would point into unrelated bytes — history read
-    /// as if it had just arrived.
-    identity: std::cell::Cell<Option<(u64, u64)>>,
-    /// The bytes immediately BEFORE the offset. Identity alone misses an
-    /// in-place rewrite (same inode, same length); if these no longer match,
-    /// the file underneath us is not the one we were reading.
-    fingerprint: std::cell::RefCell<Vec<u8>>,
-    /// The trailing bytes of a line that had not finished being written when
-    /// the last read stopped. Without carrying it, the two halves would be
-    /// parsed separately and both discarded as malformed.
-    partial: std::cell::RefCell<Vec<u8>>,
-    last_checked: std::cell::Cell<std::time::Instant>,
-    #[cfg(test)]
-    bytes_read: std::cell::Cell<u64>,
-}
-
-/// How many bytes before the offset are kept as the continuity check.
-const FINGERPRINT_BYTES: usize = 64;
-
-const RESOLUTION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-
-impl ResolutionWatch {
-    fn new(payload: &Value, _now: u64) -> Self {
-        let transcript = payload
-            .get("transcript_path")
-            .and_then(Value::as_str)
-            .map(std::path::PathBuf::from)
-            .filter(|path| path.is_file());
-        // A transcript we cannot stat has no trustworthy boundary, so the
-        // watcher is disabled outright rather than starting from zero and
-        // reading the whole history as if it were new.
-        // One handle for stat AND fingerprint. A transcript we cannot open
-        // or stat has no trustworthy boundary, so the watcher is disabled
-        // outright rather than starting from zero and reading the whole
-        // history as if it had just arrived.
-        let opened = transcript.as_ref().and_then(|path| {
-            let file = std::fs::File::open(path).ok()?;
-            let meta = file.metadata().ok()?;
-            Some((path.clone(), file, meta))
-        });
-        let Some((path, mut file, meta)) = opened else {
-            return Self::disabled();
-        };
-        let watch = Self {
-            transcript: Some(path),
-            offset: std::cell::Cell::new(meta.len()),
-            identity: std::cell::Cell::new(Some(file_identity(&meta))),
-            fingerprint: std::cell::RefCell::new(Vec::new()),
-            partial: std::cell::RefCell::new(Vec::new()),
-            last_checked: std::cell::Cell::new(std::time::Instant::now()),
-            #[cfg(test)]
-            bytes_read: std::cell::Cell::new(0),
-        };
-        if !watch.reseat_fingerprint(&mut file) {
-            return Self::disabled();
-        }
-        watch
-    }
-
-    /// A watcher that never fires: used whenever the transcript cannot be
-    /// read reliably, because a guard that cannot verify must not vouch.
-    fn disabled() -> Self {
-        Self {
-            transcript: None,
-            offset: std::cell::Cell::new(0),
-            identity: std::cell::Cell::new(None),
-            fingerprint: std::cell::RefCell::new(Vec::new()),
-            partial: std::cell::RefCell::new(Vec::new()),
-            last_checked: std::cell::Cell::new(std::time::Instant::now()),
-            #[cfg(test)]
-            bytes_read: std::cell::Cell::new(0),
-        }
-    }
-
-    /// Re-read the bytes just before the offset FROM THE HANDLE WE JUST
-    /// READ, so identity, fingerprint and payload all describe one file at
-    /// one instant. Reopening by path between those steps is a TOCTOU hole:
-    /// the file can be swapped in between and the guard then vouches for
-    /// bytes that came from something else.
-    ///
-    /// Returns false if the fingerprint could not be taken — an empty guard
-    /// that lets the watcher keep running would vouch for everything.
-    fn reseat_fingerprint(&self, file: &mut std::fs::File) -> bool {
-        use std::io::{Read as _, Seek as _};
-        let mut print = self.fingerprint.borrow_mut();
-        print.clear();
-        let offset = self.offset.get();
-        if offset == 0 {
-            return true; // nothing behind us to vouch for yet
-        }
-        let want = FINGERPRINT_BYTES.min(offset as usize);
-        if file
-            .seek(std::io::SeekFrom::Start(offset - want as u64))
-            .is_err()
-        {
-            return false;
-        }
-        let mut buf = vec![0u8; want];
-        if file.read_exact(&mut buf).is_err() {
-            return false;
-        }
-        *print = buf;
-        true
-    }
-
-    /// Forget everything carried between checks. Called on ANY I/O failure:
-    /// a guard that cannot verify must not vouch, and the next successful
-    /// check syncs to the current end rather than resuming blind.
-    fn invalidate(&self) {
-        self.identity.set(None);
-        self.partial.borrow_mut().clear();
-        self.fingerprint.borrow_mut().clear();
-    }
-
-    /// Drop everything carried across and resync to the current end: the
-    /// file we were reading is gone, and nothing already in the new one is
-    /// evidence about a request raised against the old one.
-    fn resync(&self, file: &mut std::fs::File, len: u64, identity: Option<(u64, u64)>) {
-        self.offset.set(len);
-        self.identity.set(identity);
-        self.partial.borrow_mut().clear();
-        if !self.reseat_fingerprint(file) {
-            self.invalidate();
-        }
-    }
-
-    /// Has a main-chain assistant record been written since the last look?
-    ///
-    /// Deliberately NOT tool_result records: with parallel tool calls another
-    /// already-allowed tool returning first would frame this one as decided
-    /// while it still waits. Sidechain records are skipped for the same
-    /// reason — a subagent talking to itself is not this turn moving on.
-    fn decided_elsewhere(&self) -> bool {
-        let Some(transcript) = self.transcript.as_deref() else {
-            return false;
-        };
-        if self.last_checked.get().elapsed() < RESOLUTION_CHECK_INTERVAL {
-            return false;
-        }
-        self.last_checked.set(std::time::Instant::now());
-
-        use std::io::{Read as _, Seek as _};
-        // EVERY I/O failure below invalidates the carried state. Keeping a
-        // stale identity/offset/partial across a failed read is fail-open:
-        // the next check would resume from a position it can no longer
-        // vouch for, and an inode reused at that path would have its history
-        // read as new evidence.
-        let Ok(mut file) = std::fs::File::open(transcript) else {
-            self.invalidate();
-            return false;
-        };
-        let Ok(meta) = file.metadata() else {
-            self.invalidate();
-            return false;
-        };
-        let len = meta.len();
-        let identity = Some(file_identity(&meta));
-
-        // Rotated / replaced, truncated below where we were reading, or
-        // resuming after an invalidation — all resync to the current end.
-        if self.identity.get().is_none()
-            || identity != self.identity.get()
-            || len < self.offset.get()
-        {
-            self.resync(&mut file, len, identity);
-            return false;
-        }
-        if len == self.offset.get() {
-            return false;
-        }
-        // Same file, same length or longer — but an in-place rewrite leaves
-        // both of those intact, so the bytes behind the offset must still be
-        // the ones we read.
-        let want = self.fingerprint.borrow().len();
-        if want > 0 {
-            let mut seen = vec![0u8; want];
-            let ok = file
-                .seek(std::io::SeekFrom::Start(self.offset.get() - want as u64))
-                .is_ok()
-                && file.read_exact(&mut seen).is_ok()
-                && seen == *self.fingerprint.borrow();
-            if !ok {
-                self.resync(&mut file, len, identity);
-                return false;
-            }
-        }
-        if file
-            .seek(std::io::SeekFrom::Start(self.offset.get()))
-            .is_err()
-        {
-            self.invalidate();
-            return false;
-        }
-        let mut fresh = Vec::new();
-        let Ok(read) = file.read_to_end(&mut fresh) else {
-            self.invalidate();
-            return false;
-        };
-        self.offset.set(self.offset.get() + read as u64);
-        #[cfg(test)]
-        self.bytes_read.set(self.bytes_read.get() + read as u64);
-        if !self.reseat_fingerprint(&mut file) {
-            self.invalidate();
-        }
-
-        let mut buf = self.partial.borrow_mut();
-        buf.extend_from_slice(&fresh);
-        let mut decided = false;
-        let mut consumed = 0usize;
-        for line in buf.split_inclusive(|byte| *byte == b'\n') {
-            if !line.ends_with(b"\n") {
-                break; // still being written; keep it for next time
-            }
-            consumed += line.len();
-            let text = String::from_utf8_lossy(line);
-            let Ok(entry) = serde_json::from_str::<Value>(text.trim()) else {
-                continue;
-            };
-            if entry.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-                continue;
-            }
-            if entry.get("type").and_then(Value::as_str) == Some("assistant") {
-                decided = true;
-            }
-        }
-        buf.drain(..consumed);
-        decided
-    }
-}
-
-#[cfg(unix)]
-fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt as _;
-    (meta.dev(), meta.ino())
-}
-
-#[cfg(not(unix))]
-fn file_identity(_meta: &std::fs::Metadata) -> (u64, u64) {
-    (0, 0)
-}
 
 /// "No opinion": the normal permission flow decides. This is the answer for
 /// every path that is not an explicit remote allow/deny.
@@ -590,28 +270,12 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
     // turn has no terminal wherever the user is sitting — Telegram can start
     // one with away off (`/new`, or a Reply while present) — so its gate
     // must not depend on away at all.
-    // Two things are settled before any other work, in this order.
     //
-    // 1. The transcript boundary, because it is a race: it must be the size
-    //    BEFORE the request could possibly be answered. Anything taken later
-    //    — after the windowless probe walks /proc, after config load, the
-    //    database open, the auto-allow lookup — lets a fast terminal answer
-    //    land INSIDE the boundary, where the watcher can never see it, and
-    //    the gate then sits out its whole window for a settled call.
-    //
-    // 2. `windowless`, which must precede the away shortcut below: a
-    //    background session has no terminal dialog anyone can see, so "the
-    //    user is at the keyboard" is not a reason to route the request
-    //    there. Computing it after the shortcut meant a bg-pty session with
-    //    away off fell straight into the trap this path exists to prevent.
-    // The boundary is frozen FIRST — before the windowless `/proc` walk,
-    // before config, before the database. Every one of those takes time in
-    // which a terminal answer can land, and anything that lands before the
-    // stat is inside the boundary where the watcher can never see it.
-    let resolution_watch = ResolutionWatch::new(payload, now);
-    // A headless turn never runs the probe: it has no terminal AT ALL, which
-    // its own `headless` flag already says, and claiming a measurement it
-    // never took would put a fabricated fact in the ledger.
+    // `windowless` must precede the away shortcut below: a background
+    // session has no terminal dialog anyone can see, so away-off is not a
+    // reason to route the request there. Computing it after the shortcut
+    // meant a bg-pty session with away off fell straight into the trap this
+    // path exists to prevent.
     let session_window =
         (kind == GateKind::Interactive).then(crate::claude::current_session_window);
     let windowless = session_window == Some(crate::claude::SessionWindow::Background);
@@ -735,9 +399,8 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
         Some(conn) => conn,
         None => create_state_db(&state_db_path()?)?,
     };
-    // Session-scoped auto-allow comes BEFORE any presence check: the user
-    // already granted this, and presence must never resurrect a prompt they
-    // paid a tap to silence.
+    // Session-scoped auto-allow first: the user already granted this, and
+    // nothing downstream may resurrect a prompt they paid a tap to silence.
     if approval_auto_allowed(&conn, &thread_id, &tool_name)? {
         // The session grant is standing, but its CONSUMPTION still passes
         // the final owner re-check: a `/stop` that already committed must
@@ -752,36 +415,18 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
             "{tool_name} was approved for this session from Telegram"
         )));
     }
-    // A user at the machine gets the dialog THERE, immediately — no phone
-    // detour. (Headless turns have no terminal to hand anything to, and
-    // neither do background sessions: for them "there" is a pty nobody is
-    // watching, so the detour is the only route that reaches a human.)
-    // PUSH FIRST, hand over second. While away is on, every gated call gets
-    // its buttons pushed to Telegram no matter what the desktop is doing;
-    // only after the request exists does desktop activity decide who ends up
-    // answering it (see the wait loop below).
-    //
-    // The order is the whole point. This check used to sit BEFORE the push
-    // and skip it whenever the desktop had seen input in the last 15s, which
-    // meant a wrong presence reading produced no message at all — a silent
-    // failure the user could not even see happening. Measured 2026-08-17: a
-    // mouse with sensor drift emitted ~600 phantom motion events per second
-    // and pinned the idle timer near zero, so every approval would have been
-    // ruled "user is present" and routed to a terminal nobody sat at, with
-    // nothing on the phone. Pushing first makes the worst case a message
-    // that gets superseded instead of a message that never existed.
-    //
-    // Away OFF still means the terminal owns it outright — that is the user
-    // saying they are here. Windowless sessions push either way: they have
-    // no terminal dialog anyone could see.
+    // While away is on, EVERY gated call gets its buttons pushed to
+    // Telegram, and they stay live for the whole hold — desktop activity
+    // decides nothing (see the presence-removal note at the top of this
+    // file). Away OFF means the terminal owns it outright — that is the
+    // user saying they are here. Windowless sessions push either way: they
+    // have no terminal dialog anyone could see.
 
-    let mut presence = PresenceProbe::new();
     // Monotonic gate age for settle stamps — see `settle_stamp_ms`.
     let gate_clock = std::time::Instant::now();
-    // Where the transcript stood when this gate started. Anything written
-    // past this point is what happened SINCE the request — the evidence for
-    // noticing that the call was already decided without us.
-
+    // A stable id exists only for `PreToolUse` (headless): a real
+    // `PermissionRequest` payload carries no tool_use_id, so an interactive
+    // gate mints a fresh UUID on every run.
     let approval_id = payload
         .get("tool_use_id")
         .and_then(Value::as_str)
@@ -794,46 +439,181 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
         Duration::from_secs(claude.approval_timeout_seconds.clamp(5, 86_400))
     };
     let owning_turn = std::env::var(crate::claude::BRIDGE_TURN_ENV).ok();
-    match publish_approval_request(
-        &conn,
-        &telegram.chat_id,
-        &approval_id,
-        &thread_id,
-        &tool_name,
-        &summary,
-        kind == GateKind::Headless,
-        session_window,
-        owning_turn.as_deref(),
-        payload.get("cwd").and_then(Value::as_str),
-        now,
-        now + wait.as_millis() as u64,
-    )? {
-        // Fresh, or already open from an interrupted run of this same
-        // gate: either way the row is live and the wait below owns it.
-        Publication::Published | Publication::AlreadyPublished => {}
-        // Republished after an answer: honour it, never re-ask — reopening
-        // is how a stale sibling button once flipped a deny into an allow.
-        Publication::AlreadyDecided(decision) => {
-            return apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now);
+    // A windowed interactive gate whose hour runs out while away is still on
+    // has NOT been answered — it has been ignored by a phone whose buttons
+    // then died. Going quiet at that point wedged a session for seven hours
+    // (measured 2026-08-27: dialog raised 03:07, buttons dead 04:07, user
+    // back 11:18, zero messages in between). So the window RENEWS: each
+    // round settles atomically — a tap that landed wins — and an unanswered
+    // round while away is still on publishes a fresh request with live
+    // buttons, which doubles as the periodic "this session is still blocked"
+    // reminder that was missing. The overall budget matches the installed
+    // hook timeout; past it the hook dies anyway and silence is honest.
+    let renewal_deadline = std::time::Instant::now() + WINDOWLESS_APPROVAL_WAIT;
+    // The hold can now last hours (renewals), and while a hook blocks the
+    // TUI paints nothing but a spinner — so the terminal must be told what
+    // is waiting and that /back is the way to answer here. Same law, same
+    // paint machinery as the question gate.
+    let banner = QuestionBanner::for_session(windowless);
+    let mut round: u32 = 0;
+    loop {
+        // Round 0 keeps the bare id (the tool_use_id, so a hook re-run is
+        // idempotent); every renewal gets a fresh `:rN` so its Telegram
+        // message carries live buttons while the lapsed round's report as
+        // expired.
+        // Round 0 keeps the bare id (the tool_use_id, so a hook re-run is
+        // idempotent); every renewal gets a fresh `:rN` so its Telegram
+        // message carries live buttons while the lapsed rounds report as
+        // expired.
+        let round_id = if round == 0 {
+            approval_id.clone()
+        } else {
+            format!("{approval_id}:r{round}")
+        };
+        let round_summary = if round == 0 {
+            summary.clone()
+        } else {
+            format!("{summary}\n（第 {} 次提醒，此前的按钮已过期）", round + 1)
+        };
+        let round_now = settle_stamp_ms(now, gate_clock.elapsed());
+        match publish_approval_request(
+            &conn,
+            &telegram.chat_id,
+            &round_id,
+            &thread_id,
+            &tool_name,
+            &round_summary,
+            kind == GateKind::Headless,
+            session_window,
+            owning_turn.as_deref(),
+            payload.get("cwd").and_then(Value::as_str),
+            round_now,
+            round_now + wait.as_millis() as u64,
+        )? {
+            // Fresh, or already open from an interrupted run of this same
+            // gate: either way the row is live and the wait below owns it.
+            Publication::Published | Publication::AlreadyPublished => {}
+            // Republished after a settled row: hand the decision to the
+            // per-kind interpreter — a real answer is honoured (never
+            // re-asked: reopening is how a stale sibling button once flipped
+            // a deny into an allow), and `expired` resolves the way a
+            // timeout does (headless: deny; interactive: the terminal's own
+            // prompt). Only a re-run can land here, and only a HEADLESS
+            // re-run can in practice: `PreToolUse` carries a stable
+            // tool_use_id, while a real `PermissionRequest` payload has
+            // none, so an interactive gate mints a fresh UUID every run and
+            // never collides. (An earlier revision "advanced the renewal
+            // chain" here instead — built on the wrong premise that
+            // interactive re-runs share an id, and worse, its bail-out
+            // returned `{}` even for headless, which bypassPermissions reads
+            // as run-it.)
+            Publication::AlreadyDecided(decision) => {
+                return apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now);
+            }
+            // The admission check saw `running`, but `/stop` committed in
+            // between: publication re-verifies the owner INSIDE its
+            // transaction, and a refusal means the stop won.
+            Publication::OwnerNotRunning => {
+                return Ok(kind.deny(&format!(
+                    "this bridge turn is being stopped, so its approval window is closed and \
+                     {tool_name} was not run. Do not retry; stop."
+                )));
+            }
         }
-        // The admission check saw `running`, but `/stop` committed in
-        // between: publication re-verifies the owner INSIDE its
-        // transaction, and a refusal means the stop won.
-        Publication::OwnerNotRunning => {
-            return Ok(kind.deny(&format!(
-                "this bridge turn is being stopped, so its approval window is closed and \
-                 {tool_name} was not run. Do not retry; stop."
-            )));
+        if round == 0 {
+            banner.paint_note(&format!(
+                "🔐 {tool_name} 等待 Telegram 审批（away 开启；要在终端作答请先 /back）"
+            ));
+        } else {
+            banner.paint_note(&format!("🔁 审批续期第 {} 轮，手机按钮已更新", round + 1));
+        }
+        match wait_out_approval_window(
+            &conn,
+            kind,
+            &thread_id,
+            &tool_name,
+            &round_id,
+            wait,
+            renewal_deadline,
+            now,
+            &gate_clock,
+            windowless,
+        )? {
+            WindowOutcome::Settled(value) => {
+                banner.paint_note(if value == json!({}) {
+                    "↩ 已交还本终端，对话框即将弹出"
+                } else {
+                    "✔ 审批已由手机作答"
+                });
+                return Ok(value);
+            }
+            // This round ran out with nobody answering. Renewal is for the
+            // one configuration that would otherwise go silent while its
+            // terminal dialog blocks unseen: a WINDOWED INTERACTIVE session
+            // with away still on. Everything else keeps its single window —
+            // windowless already waits the whole budget, a headless timeout
+            // must deny, and away-off means the terminal owns the prompt.
+            WindowOutcome::Unanswered => {
+                let renewable = kind == GateKind::Interactive
+                    && !windowless
+                    && away_mode_active()
+                    && std::time::Instant::now() < renewal_deadline;
+                if !renewable {
+                    banner.paint_note("⌛ 手机未作答，交还本终端对话框");
+                    return Ok(match kind {
+                        // An interactive session still has its own prompt to
+                        // fall back on, which is exactly what "no opinion"
+                        // hands it.
+                        GateKind::Interactive => no_opinion(),
+                        // A headless turn (proved running by the admission
+                        // check) has no dialog behind it and
+                        // `bypassPermissions` underneath: falling through
+                        // would RUN the call. Silence has to deny outright.
+                        GateKind::Headless => kind.deny(&format!(
+                            "Nobody approved this from Telegram in time, so {tool_name} was \
+                             not run. Do not retry it; tell the user what you were about to \
+                             do and stop."
+                        )),
+                    });
+                }
+                round += 1;
+            }
         }
     }
+}
 
-    // --- wait for the answer ----------------------------------------------
-    let deadline = std::time::Instant::now() + wait;
+/// What one approval window came to.
+enum WindowOutcome {
+    /// The gate is finished: a decision was applied, or `/back` handed the
+    /// prompt to the terminal. The value is the hook's reply.
+    Settled(Value),
+    /// The window expired with no answer anywhere. The caller decides
+    /// whether that ends the gate or renews the request.
+    Unanswered,
+}
+
+/// Poll out one approval window. Every early exit settles atomically — a tap
+/// that already landed always wins over the exit that raced it.
+#[allow(clippy::too_many_arguments)]
+fn wait_out_approval_window(
+    conn: &rusqlite::Connection,
+    kind: GateKind,
+    thread_id: &str,
+    tool_name: &str,
+    approval_id: &str,
+    wait: Duration,
+    renewal_deadline: std::time::Instant,
+    now: u64,
+    gate_clock: &std::time::Instant,
+    windowless: bool,
+) -> Result<WindowOutcome> {
+    let deadline = (std::time::Instant::now() + wait).min(renewal_deadline);
     while std::time::Instant::now() < deadline {
         std::thread::sleep(POLL_INTERVAL);
-        if let Some(decision) = approval_decision(&conn, &approval_id)? {
+        if let Some(decision) = approval_decision(conn, approval_id)? {
             if decision != "expired" {
-                return apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now);
+                return apply_decision(conn, kind, thread_id, tool_name, &decision, now)
+                    .map(WindowOutcome::Settled);
             }
             // Someone else closed this window — for a headless turn that is
             // `/stop` sweeping the dialogs the turn owns. Polling out the
@@ -841,95 +621,51 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
             // for a turn the user already ended; the honest ending is the
             // same one a timeout reaches, now.
             if kind == GateKind::Headless {
-                return Ok(kind.deny(&format!(
+                return Ok(WindowOutcome::Settled(kind.deny(&format!(
                     "this approval was closed by the bridge (the turn is being \
                      stopped), so {tool_name} was not run. Do not retry; stop."
-                )));
+                ))));
             }
         }
-        // The user is back — input devices woke up, or `/back` arrived. Hand
-        // the prompt to the terminal RIGHT NOW so the machine in front of
-        // them wins over the phone in their pocket. Settling is atomic with
-        // any in-flight tap: a tap that already landed still wins.
-        //
-        // A false positive here (a drifting mouse, a screensaver twitch)
-        // costs a prompt that moves to the terminal early — recoverable, and
-        // the user still got the Telegram message telling them it happened.
-        // That is why the push above is unconditional: this check is allowed
-        // to be wrong, the push is not.
+        // The ONE hand-back: the user declared themselves back (`/back`
+        // turned away off). Nothing else releases the phone — the user's
+        // law (2026-08-27): "只要 away 开着，就双向推送，谁先抢答算谁的。"
+        // Keyboard activity used to hand the prompt over here, and it
+        // backfired in production the same day: the user pressed Yes on one
+        // terminal dialog, and that very keystroke killed the NEXT
+        // approval's phone buttons seconds after they were pushed. Desktop
+        // activity is not a declaration; away is. Settling stays atomic —
+        // a tap that already landed still wins.
         //
         // A windowless session is excluded on purpose: there is no terminal
-        // dialog to be "back" at, so handing it over would close the only
-        // channel that can answer while the tool stays blocked regardless.
-        // The dialog Claude Code renders in the terminal runs CONCURRENTLY
-        // with this hook (verified 2026-08-17 under a pty capture), so the
-        // call can be decided over there while we are still polling. Nothing
-        // tells us when that happens — the hook is simply left running. Left
-        // unchecked it polls out its whole window, holding a dead button on
-        // the user's phone for an already-executed command (measured: 21
-        // orphaned gates, 58 stale pushes in one afternoon).
-        // INTERACTIVE ONLY. Under `bypassPermissions` a headless turn reads
-        // `{}` as "nobody objected" and runs the tool, so letting transcript
-        // evidence produce a no-opinion here would execute an unapproved
-        // call. A headless gate has exactly two honest endings: an explicit
-        // Telegram decision, or a timeout that denies.
-        if kind == GateKind::Interactive && resolution_watch.decided_elsewhere() {
-            // Same atomic rule as every other exit: a tap that already landed
-            // WINS. Discarding what `expire_or_take_decision` hands back
-            // would throw away a decision the user paid a tap for and show
-            // them "已允许" while the session quietly did its own thing.
-            //
-            // Settling and cancelling the unsent push are ONE transaction: a
-            // crash between them would leave a settled request whose button
-            // still ships minutes later on the retry schedule.
-            return match crate::state::settle_expired_and_cancel_push(
-                &conn,
-                crate::state::SettleTarget::Approval(&approval_id),
-                settle_stamp_ms(now, gate_clock.elapsed()),
-            )? {
-                crate::state::SettleOutcome::Answered(decision) => {
-                    apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now)
-                }
-                crate::state::SettleOutcome::Expired => Ok(no_opinion()),
-            };
-        }
-        if kind == GateKind::Interactive && !windowless && presence.terminal_reclaimed() {
+        // dialog to hand anything to, so the phone stays the only channel
+        // that can answer while the tool blocks regardless.
+        if kind == GateKind::Interactive && !windowless && !away_mode_active() {
             return match crate::state::expire_or_take_decision(
-                &conn,
-                &approval_id,
+                conn,
+                approval_id,
                 settle_stamp_ms(now, gate_clock.elapsed()),
             )? {
-                Some(decision) => {
-                    apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now)
-                }
-                None => Ok(no_opinion()),
+                Some(decision) => apply_decision(conn, kind, thread_id, tool_name, &decision, now)
+                    .map(WindowOutcome::Settled),
+                None => Ok(WindowOutcome::Settled(no_opinion())),
             };
         }
     }
-    // Timed out. Settling the record and taking a decision is one atomic
-    // step: if a tap landed in the instant between the last poll and here,
-    // that answer wins and must be honoured — otherwise Telegram would show
-    // "已允许" while the session quietly fell back to its own prompt.
+    // The window ran out. Settling the record and taking a decision is one
+    // atomic step: if a tap landed in the instant between the last poll and
+    // here, that answer wins and must be honoured — otherwise Telegram would
+    // show "已允许" while the session quietly fell back to its own prompt.
     match crate::state::expire_or_take_decision(
-        &conn,
-        &approval_id,
+        conn,
+        approval_id,
         settle_stamp_ms(now, gate_clock.elapsed()),
     )? {
-        Some(decision) => apply_decision(&conn, kind, &thread_id, &tool_name, &decision, now),
-        // Nobody answered. Never an approval — but "not an approval" resolves
-        // differently depending on what is downstream of this hook.
-        None => match kind {
-            // An interactive session still has its own prompt to fall back
-            // on, which is exactly what "no opinion" hands it.
-            GateKind::Interactive => Ok(no_opinion()),
-            // A headless turn (proved running by the admission check) has no
-            // dialog behind it and `bypassPermissions` underneath: falling
-            // through would RUN the call. Silence has to deny outright.
-            GateKind::Headless => Ok(kind.deny(&format!(
-                "Nobody approved this from Telegram in time, so {tool_name} was not run. \
-                 Do not retry it; tell the user what you were about to do and stop."
-            ))),
-        },
+        Some(decision) => apply_decision(conn, kind, thread_id, tool_name, &decision, now)
+            .map(WindowOutcome::Settled),
+        // Nobody answered anywhere. Whether that ends the gate or renews the
+        // request is the caller's ruling, not this window's.
+        None => Ok(WindowOutcome::Unanswered),
     }
 }
 
@@ -957,9 +693,7 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         serde_json::from_str(raw.trim()).context("PreToolUse payload is not valid JSON")?;
 
     // Same ordering rule as the approval gate: a windowless session is not
-    // covered by the away shortcut (its terminal dialog is invisible), and
-    // the transcript boundary must predate any chance of an answer.
-    let resolution_watch = ResolutionWatch::new(&payload, now);
+    // covered by the away shortcut (its terminal dialog is invisible).
     let session_window = crate::claude::current_session_window();
     let windowless = session_window == crate::claude::SessionWindow::Background;
     if !windowless && !away_mode_active() {
@@ -1036,12 +770,11 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         Duration::from_secs(claude.approval_timeout_seconds.clamp(5, 86_400))
     };
     // Same rule as the approval gate: away on means the question is pushed
-    // to Telegram whatever the desktop looks like (activity decides who
-    // answers, not whether it is sent), away off means the terminal owns it,
-    // and a windowless background session has no terminal dialog to own it
-    // so it asks remotely either way.
+    // to Telegram and its buttons stay live for the whole hold — desktop
+    // activity decides nothing. Away off means the terminal owns it, and a
+    // windowless background session has no terminal dialog to own it so it
+    // asks remotely either way.
 
-    let mut presence = PresenceProbe::new();
     // Monotonic gate age for settle stamps — see `settle_stamp_ms`.
     let gate_clock = std::time::Instant::now();
     let conn = create_state_db(&state_db_path()?)?;
@@ -1114,29 +847,12 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
                 return Ok(phone_answered(&answer));
             }
         }
-        // Transcript evidence that the call was decided without us. While
-        // the hook blocks, Claude Code renders no dialog at all (verified
-        // 2026-08-22 — an earlier revision of this comment claimed the
-        // dialog ran alongside the hook, which a pty capture and a blank
-        // production terminal both falsified), so under the current TUI
-        // this arm should never fire before a hand-back. It stays as a
-        // belt-and-braces exit: a future Claude Code that does render
-        // concurrently would otherwise hold a dead button for the rest of
-        // the window — a full day for a windowless session.
-        if resolution_watch.decided_elsewhere() {
-            return match crate::state::settle_expired_and_cancel_push(
-                &conn,
-                crate::state::SettleTarget::Question(&question_id),
-                settle_stamp_ms(now, gate_clock.elapsed()),
-            )? {
-                crate::state::SettleOutcome::Answered(answer) => Ok(phone_answered(&answer)),
-                crate::state::SettleOutcome::Expired => Ok(no_opinion()),
-            };
-        }
-        // The user is back (keyboard activity or /back): exit with no
-        // opinion so Claude Code renders the real dialog right here,
-        // honouring any answer that raced in first.
-        if !windowless && presence.terminal_reclaimed() {
+        // The ONE hand-back: `/back` turned away off. Keyboard activity no
+        // longer releases anything (the user's law, 2026-08-27: away on
+        // means both channels stay live and the first answer wins), so the
+        // exit honours any answer that raced in first and only then hands
+        // the dialog to the terminal.
+        if !windowless && !away_mode_active() {
             return match crate::state::expire_or_take_answer(
                 &conn,
                 &question_id,
@@ -1241,7 +957,7 @@ impl QuestionBanner {
         if multi_select {
             lines.push_str("\x1b[36m┃ 多选：手机端以逗号分隔回复\x1b[0m\r\n");
         }
-        lines.push_str("\x1b[2m┃ 按任意键在本终端唤出对话框作答\x1b[0m\r\n");
+        lines.push_str("\x1b[2m┃ 手机作答，或 /back 收回到本终端作答\x1b[0m\r\n");
         self.write(&lines);
     }
 
@@ -1581,16 +1297,43 @@ pub(crate) fn publish_approval_request(
             return Ok(Publication::OwnerNotRunning);
         }
     }
-    let existing: Option<Option<String>> = tx
+    let existing: Option<(Option<String>, i64)> = tx
         .query_row(
-            "SELECT decision FROM pending_approvals WHERE approval_id = ?1",
+            "SELECT decision, expires_at FROM pending_approvals WHERE approval_id = ?1",
             rusqlite::params![approval_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    if let Some(decision) = existing {
+    if let Some((decision, expires_at)) = existing {
         return Ok(match decision {
             Some(decision) => Publication::AlreadyDecided(decision),
+            // Un-decided, but only LIVE if its deadline has not passed. An
+            // interrupted gate leaves its row NULL with a lapsed expires_at;
+            // waiting on that row again would hold the tool a full window
+            // behind buttons whose taps already report "已过期". Settle it
+            // here, inside the same transaction, and let the caller resolve
+            // it the way any expired row resolves.
+            None if (expires_at as u64) < now => {
+                // Settling and withdrawing its queued push are ONE step (the
+                // shared helper): the raw UPDATE that stood here settled the
+                // row but left the interrupted run's push on the retry
+                // schedule, so buttons already known to be dead could still
+                // ship minutes later.
+                let outcome =
+                    crate::state::settle_expired_and_cancel_push_inner(&tx, approval_id, now)?;
+                let decision = match outcome {
+                    // No answer can have landed — the row was NULL a moment
+                    // ago inside this same IMMEDIATE transaction — but if
+                    // one somehow did, it is the truth to hand back.
+                    crate::state::SettleOutcome::Answered => {
+                        crate::state::approval_decision(&tx, approval_id)?
+                            .unwrap_or_else(|| "expired".to_string())
+                    }
+                    crate::state::SettleOutcome::Expired => "expired".to_string(),
+                };
+                tx.commit()?;
+                return Ok(Publication::AlreadyDecided(decision));
+            }
             None => Publication::AlreadyPublished,
         });
     }
@@ -1948,8 +1691,6 @@ mod tests {
                 // A leftover turn token from a previous test would make this
                 // one look like a bridge process; every test starts tokenless.
                 crate::state::EnvVarGuard::clear(crate::claude::BRIDGE_TURN_ENV),
-                // No leftover fake idle: presence is opt-in per test.
-                crate::state::EnvVarGuard::clear("TINYCTB_TEST_IDLE_MS"),
                 // The window probe is PINNED, never left to the host: a test
                 // process inherits the developer's own CLAUDE_CODE_MESSAGING_
                 // SOCKET, so an unset seam reads whatever session happens to
@@ -1997,6 +1738,21 @@ mod tests {
         run_approval_gate(&mut reader, 1000).expect("gate")
     }
 
+    /// `gate`, but a hang is a clean FAILED instead of a wedged suite. Used
+    /// by the renewal tests, whose revert-verification mutations can turn
+    /// the renewal loop into an infinite spin — measured 2026-08-27: one
+    /// such mutation held three overlapping verification runs and a full
+    /// suite hostage for hours. The spinning thread is leaked on timeout;
+    /// libtest's process exit sweeps it.
+    fn gate_with_timeout(payload: Value, limit: Duration) -> Value {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(gate(payload));
+        });
+        rx.recv_timeout(limit)
+            .expect("the gate must return within the harness limit, not spin")
+    }
+
     /// The real `PermissionRequest` input shape: no `tool_use_id` (that is a
     /// PreToolUse field), and it carries permission suggestions instead.
     fn bash_payload() -> Value {
@@ -2010,16 +1766,6 @@ mod tests {
             "tool_input": { "command": "rm -rf build/" },
             "permission_suggestions": []
         })
-    }
-
-    /// The gate mints its own approval id, so tests look it up.
-    fn pending_approval_id(conn: &rusqlite::Connection) -> String {
-        conn.query_row(
-            "SELECT approval_id FROM pending_approvals ORDER BY created_at DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .expect("an approval row")
     }
 
     #[test]
@@ -2501,509 +2247,62 @@ mod tests {
         assert!(context.contains("列出编号选项"), "{context}");
     }
 
-    /// A user at the machine when the prompt fires gets the dialog in the
-    /// terminal, instantly — the push still goes out; presence only decides who ends up answering.
+    /// The user's law (2026-08-27): while away is on, keyboard activity
+    /// decides NOTHING — the buttons stay live and the first answer wins.
+    /// The old design handed the prompt to the terminal within a poll tick
+    /// of a keystroke, and pressing Yes on one dialog was itself the
+    /// keystroke that killed the next approval's buttons. This test writes
+    /// the REAL activity file — fresh at gate start and refreshed mid-wait —
+    /// and the phone tap must still be the answer that lands.
     #[test]
-    fn gate_steps_aside_for_a_present_user_but_still_pushes() {
+    fn keystrokes_never_take_the_buttons_away() {
         let _guard = crate::state::test_env_lock();
-        let _env = GateEnv::new("present-user", true, 30);
-        std::env::set_var("TINYCTB_TEST_IDLE_MS", "500");
-
-        let started = std::time::Instant::now();
-        let result = gate(bash_payload());
-        std::env::remove_var("TINYCTB_TEST_IDLE_MS");
-        assert_eq!(
-            result,
-            json!({}),
-            "a user at the machine still gets the dialog in the terminal"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "and immediately"
-        );
-        // ...but the phone was told regardless. The push is unconditional
-        // while away is on precisely because THIS check can be wrong: a
-        // mouse with sensor drift reads as "present" forever, and the old
-        // order (presence decides whether to send) turned that into total
-        // silence on the phone. Now the worst case is a message that gets
-        // superseded, which the user can see and act on.
-        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
-        let pushed: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM outbound_events WHERE event_type = 'approval_request'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count");
-        assert_eq!(
-            pushed, 1,
-            "away mode owes the phone a message even when the desktop looks busy"
-        );
-    }
-
-    /// The terminal dialog runs alongside this hook, so a request can be
-    /// settled over there while the gate is still polling — and nothing tells
-    /// the gate. Without an exit condition it polls out its whole window,
-    /// leaving a dead button on the phone for a command that already ran
-    /// (measured 2026-08-17: 21 orphaned gates, 58 stale pushes).
-    #[test]
-    fn gate_stops_when_the_call_is_decided_in_the_terminal() {
-        let _guard = crate::state::test_env_lock();
-        let _env = GateEnv::new("decided-elsewhere", true, 120);
-        let transcript = std::env::temp_dir().join(format!(
-            "tinyctb-gate-transcript-{}.jsonl",
-            std::process::id()
-        ));
-        // Real shape at gate time: the transcript already ends with the
-        // assistant record carrying THIS tool_use. Seeding only a user line
-        // made the test easier than production, where the boundary always
-        // has an assistant record immediately behind it.
-        fs::write(
-            &transcript,
-            format!(
-                "{}\n{}\n",
-                json!({"type": "user", "message": {"role": "user", "content": "go"}}),
-                json!({"type": "assistant", "message": {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "toolu_probe", "name": "Bash",
-                     "input": {"command": "rm -rf build/"}}
-                ]}})
-            ),
-        )
-        .expect("seed transcript");
-        let mut payload = bash_payload();
-        payload["transcript_path"] = json!(transcript.display().to_string());
-
-        let writer = {
-            let transcript = transcript.clone();
-            std::thread::spawn(move || {
-                // The user answers in the terminal; the tool runs and the
-                // turn moves on, appending a main-chain assistant record.
-                std::thread::sleep(Duration::from_millis(1500));
-                use std::io::Write as _;
-                let mut file = fs::OpenOptions::new()
-                    .append(true)
-                    .open(&transcript)
-                    .expect("append");
-                writeln!(
-                    file,
-                    "{}",
-                    json!({"type": "assistant", "message": {"role": "assistant",
-                            "content": [{"type": "text", "text": "done"}]}})
-                )
-                .expect("write");
-            })
-        };
-        let started = std::time::Instant::now();
-        let mut reader = std::io::Cursor::new(payload.to_string());
-        let result = run_approval_gate(&mut reader, 1000).expect("gate");
-        writer.join().expect("writer");
-        let _ = fs::remove_file(&transcript);
-
-        assert_eq!(result, json!({}), "the terminal already decided it");
-        assert!(
-            started.elapsed() < Duration::from_secs(15),
-            "the gate must give up on the evidence, not sit out its 120s window: {:?}",
-            started.elapsed()
-        );
-        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
-        let decision: Option<String> = conn
-            .query_row("SELECT decision FROM pending_approvals", [], |row| {
-                row.get(0)
-            })
-            .expect("row");
-        assert_eq!(
-            decision.as_deref(),
-            Some("expired"),
-            "and it must settle the row so /threads stops offering a dead button"
-        );
-    }
-
-    /// The boundary is a race, and this pins which side must win. A terminal
-    /// answer that lands while the gate is still starting up (config load,
-    /// database open, auto-allow lookup) must still be VISIBLE to the
-    /// watcher — i.e. the boundary has to predate it. Freeze the boundary
-    /// late and the assistant record falls inside it, invisible forever,
-    /// and the gate waits out its whole window for a settled call.
-    ///
-    /// Each check must read only what ARRIVED SINCE THE LAST CHECK. The big
-    /// sidechain is appended AFTER the watcher exists, so it sits past the
-    /// boundary where the old implementation genuinely did re-read it every
-    /// second — that is what made the cost quadratic (~18GiB/h on a 5MiB
-    /// tail). Also pins the half-line carry across checks, and that a file
-    /// rewritten underneath us never passes off history as new evidence.
-    #[test]
-    fn the_watcher_reads_only_what_arrived_since_last_time() {
-        let transcript =
-            std::env::temp_dir().join(format!("tinyctb-incremental-{}.jsonl", std::process::id()));
-        fs::write(&transcript, "").expect("seed");
-        let watch = ResolutionWatch::new(
-            &json!({ "transcript_path": transcript.display().to_string() }),
-            1000,
-        );
-        use std::io::Write as _;
-        let append = |text: &str| {
-            let mut file = fs::OpenOptions::new()
-                .append(true)
-                .open(&transcript)
-                .expect("append");
-            write!(file, "{text}").expect("write");
-        };
-
-        // A large sidechain tail lands past the boundary.
-        let bulk = json!({"type": "user", "isSidechain": true,
-                          "message": {"role": "user", "content": "x".repeat(200_000)}})
-        .to_string();
-        append(&format!("{bulk}\n"));
-        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
-        assert!(
-            !watch.decided_elsewhere(),
-            "sidechain noise is not evidence"
-        );
-        let after_bulk = watch.bytes_read.get();
-        assert!(
-            after_bulk > 100_000,
-            "the first look must actually read the new tail: {after_bulk}"
-        );
-
-        // Nothing new: not one byte more.
-        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
-        assert!(!watch.decided_elsewhere());
-        assert_eq!(
-            watch.bytes_read.get(),
-            after_bulk,
-            "an unchanged transcript must cost no reads at all"
-        );
-
-        // A record arrives in two writes; the first half is not yet a line.
-        let record = json!({"type": "assistant", "message": {"role": "assistant",
-                             "content": [{"type": "text", "text": "done"}]}})
-        .to_string();
-        let (head, tail) = record.split_at(record.len() / 2);
-        append(head);
-        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
-        assert!(
-            !watch.decided_elsewhere(),
-            "half a record is not evidence yet"
-        );
-        append(&format!("{tail}\n"));
-        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
-        assert!(
-            watch.decided_elsewhere(),
-            "the carried half-line must be joined and parsed once complete"
-        );
-        assert!(
-            watch.bytes_read.get() - after_bulk < 10_000,
-            "only the delta may be read, never the 200KiB tail again: {}",
-            watch.bytes_read.get() - after_bulk
-        );
-        let _ = fs::remove_file(&transcript);
-    }
-
-    /// A transcript replaced underneath the watcher must never have its
-    /// history mistaken for new evidence. Each half isolates ONE guard by
-    /// making the other one blind to the change:
-    ///  - rotation keeps the prefix byte-identical, so only the inode says
-    ///    anything;
-    ///  - the in-place rewrite keeps the inode, so only the prefix does.
-    ///
-    /// In both cases an assistant record sits PAST the old offset — exactly
-    /// where an unguarded reader would find it and close the prompt.
-    #[test]
-    fn a_rewritten_transcript_is_resynced_not_replayed() {
-        let dir = std::env::temp_dir().join(format!("tinyctb-rewrite-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("dir");
-        let transcript = dir.join("t.jsonl");
-        let assistant = json!({"type": "assistant", "message": {"role": "assistant",
-                                "content": [{"type": "text", "text": "history"}]}})
-        .to_string();
-        let filler =
-            json!({"type": "user", "message": {"role": "user", "content": "pad"}}).to_string();
-        let prefix = format!("{filler}\n{filler}\n");
-
-        // 1. Replaced by a DIFFERENT file (different bytes behind the
-        //    offset) with an assistant record right after where we stopped.
-        //    Note: an identical-prefix replacement is deliberately NOT a
-        //    violation — appending through a rename is indistinguishable
-        //    from appending in place, and the record really is new.
-        let other =
-            json!({"type": "user", "message": {"role": "user", "content": "PAD"}}).to_string();
-        let other_prefix = format!("{other}\n{other}\n");
-        assert_eq!(other_prefix.len(), prefix.len());
-        fs::write(&transcript, &prefix).expect("seed");
-        let watch = ResolutionWatch::new(
-            &json!({ "transcript_path": transcript.display().to_string() }),
-            1000,
-        );
-        fs::remove_file(&transcript).expect("rotate");
-        fs::write(&transcript, format!("{other_prefix}{assistant}\n")).expect("replace");
-        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
-        assert!(
-            !watch.decided_elsewhere(),
-            "a different file's records must not be read through a stale offset"
-        );
-
-        // 2. Rewritten in place: same inode, different bytes behind the
-        //    offset, assistant record after it.
-        fs::write(&transcript, &prefix).expect("reset");
-        let watch = ResolutionWatch::new(
-            &json!({ "transcript_path": transcript.display().to_string() }),
-            1000,
-        );
-        let other =
-            json!({"type": "user", "message": {"role": "user", "content": "PAD"}}).to_string();
-        let rewritten_prefix = format!("{other}\n{other}\n");
-        assert_eq!(
-            rewritten_prefix.len(),
-            prefix.len(),
-            "the rewrite must keep the length so only the fingerprint can tell"
-        );
-        {
-            use std::io::Write as _;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .open(&transcript)
-                .expect("open for rewrite");
-            file.write_all(format!("{rewritten_prefix}{assistant}\n").as_bytes())
-                .expect("rewrite in place");
-        }
-        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
-        assert!(
-            !watch.decided_elsewhere(),
-            "an in-place rewrite must be resynced, not replayed"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// An I/O failure must not leave the watcher resuming from a position
-    /// it can no longer vouch for. The contract is: once a check cannot
-    /// read, forget everything and resync on the next one — because during
-    /// the blind window anything may have happened to that file.
-    ///
-    /// The file is renamed ASIDE and BACK, so its inode never changes and
-    /// the bytes behind the offset stay identical. Neither the identity
-    /// guard nor the fingerprint can notice — only having invalidated on the
-    /// failed open makes the difference, which is exactly what this pins.
-    /// (Deleting and recreating instead would usually hand the file a new
-    /// inode and let the identity guard pass the test on its own.)
-    #[test]
-    fn an_io_failure_invalidates_instead_of_resuming_blind() {
-        let dir = std::env::temp_dir().join(format!("tinyctb-iofail-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("dir");
-        let transcript = dir.join("t.jsonl");
-        let sidecar = dir.join("moved.jsonl");
-        let filler =
-            json!({"type": "user", "message": {"role": "user", "content": "pad"}}).to_string();
-        let assistant = json!({"type": "assistant", "message": {"role": "assistant",
-                                "content": [{"type": "text", "text": "written while blind"}]}})
-        .to_string();
-        fs::write(&transcript, format!("{filler}\n{filler}\n")).expect("seed");
-        let watch = ResolutionWatch::new(
-            &json!({ "transcript_path": transcript.display().to_string() }),
-            1000,
-        );
-        let inode_before = fs::metadata(&transcript)
-            .map(|meta| file_identity(&meta))
-            .expect("identity before");
-
-        // 1. Moved aside: the watched path cannot be opened at all.
-        fs::rename(&transcript, &sidecar).expect("rename aside");
-        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
-        assert!(
-            !watch.decided_elsewhere(),
-            "an unreadable transcript is not evidence"
-        );
-
-        // 2. History grows while we are blind to it.
-        {
-            use std::io::Write as _;
-            let mut file = fs::OpenOptions::new()
-                .append(true)
-                .open(&sidecar)
-                .expect("append");
-            writeln!(file, "{assistant}").expect("write");
-        }
-
-        // 3. Moved back: SAME inode, same bytes behind the old offset.
-        fs::rename(&sidecar, &transcript).expect("rename back");
-        let inode_after = fs::metadata(&transcript)
-            .map(|meta| file_identity(&meta))
-            .expect("identity after");
-        assert_eq!(
-            inode_before, inode_after,
-            "the round trip must preserve the inode, or this proves nothing"
-        );
-
-        // 4. Only the invalidation from step 1 can hold the line here.
-        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
-        assert!(
-            !watch.decided_elsewhere(),
-            "records written while the watcher was blind must not be replayed \
-             through a stale offset"
-        );
-
-        // And it still tracks the file normally afterwards.
-        {
-            use std::io::Write as _;
-            let mut file = fs::OpenOptions::new()
-                .append(true)
-                .open(&transcript)
-                .expect("append");
-            writeln!(file, "{assistant}").expect("write");
-        }
-        std::thread::sleep(RESOLUTION_CHECK_INTERVAL);
-        assert!(
-            watch.decided_elsewhere(),
-            "a genuinely new record after resync must still be seen"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// The REAL presence path: an actual `input-activity.json`, read by the
-    /// production reader with the test seam removed. Everything the seam
-    /// normally hides — the file name, the JSON shape, the arithmetic —
-    /// is exercised here.
-    #[test]
-    fn keypress_age_reads_the_real_record_and_distrusts_bad_clocks() {
-        let _guard = crate::state::test_env_lock();
-        let temp = std::env::temp_dir().join(format!("tinyctb-keyage-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp);
-        fs::create_dir_all(&temp).expect("dir");
-        let previous = std::env::var("TINYCTB_STATE_DIR").ok();
-        std::env::set_var("TINYCTB_STATE_DIR", &temp);
-        // The seam must be OFF or none of this proves anything.
-        std::env::remove_var("TINYCTB_TEST_IDLE_MS");
-        let path = temp.join(crate::daemon::INPUT_ACTIVITY_FILE);
-        let now = || {
-            std::time::SystemTime::now()
+        let env = GateEnv::new("present-user", true, 30);
+        let activity = env.root.join(crate::daemon::INPUT_ACTIVITY_FILE);
+        let stamp = |path: &std::path::Path| {
+            let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
-                .as_millis() as u64
+                .as_millis() as u64;
+            fs::write(path, json!({ "lastInputAtMs": now }).to_string()).expect("stamp");
         };
+        stamp(&activity);
 
-        // No record at all: unknown, therefore NOT present.
-        assert!(
-            last_keypress_age().is_none(),
-            "a missing record is not presence"
-        );
-
-        // A keypress a moment ago: present.
-        fs::write(&path, json!({ "lastInputAtMs": now() - 500 }).to_string()).expect("write");
-        let age = last_keypress_age().expect("a fresh record must read");
-        assert!(age < Duration::from_secs(5), "age was {age:?}");
-
-        // A keypress long ago: not present.
-        fs::write(
-            &path,
-            json!({ "lastInputAtMs": now() - 600_000 }).to_string(),
-        )
-        .expect("write");
-        assert!(
-            last_keypress_age().expect("old record") > ACTIVELY_PRESENT_WINDOW,
-            "an old keypress must not count as presence"
-        );
-
-        // A stamp from the FUTURE — the shape a clock jump leaves behind.
-        // Subtracting saturatingly would read it as age zero and hand every
-        // prompt to the terminal on the first poll.
-        fs::write(
-            &path,
-            json!({ "lastInputAtMs": now() + 3_600_000 }).to_string(),
-        )
-        .expect("write");
-        assert!(
-            last_keypress_age().is_none(),
-            "a future timestamp must be distrusted, not read as 'just pressed'"
-        );
-
-        // Garbage and wrong-shaped JSON are equally not presence.
-        for content in ["{not json", "{}", "{\"lastInputAtMs\": \"soon\"}"] {
-            fs::write(&path, content).expect("write");
-            assert!(
-                last_keypress_age().is_none(),
-                "unusable record must not read as presence: {content}"
-            );
-        }
-
-        match previous {
-            Some(value) => std::env::set_var("TINYCTB_STATE_DIR", value),
-            None => std::env::remove_var("TINYCTB_STATE_DIR"),
-        }
-        let _ = fs::remove_dir_all(&temp);
-    }
-
-    /// The boundary race, pinned by a production seam rather than a sleep.
-    /// The writer is released at the exact instant `ResolutionWatch` has
-    /// stat'd the transcript, and the seam then holds the gate inside its
-    /// remaining startup — so an answer that lands during config load, the
-    /// database open and the auto-allow lookup MUST still be visible. Move
-    /// the boundary back behind any of that and the record falls inside it,
-    /// invisible forever, and the gate sits out its whole window.
-    #[test]
-    fn a_fast_terminal_answer_is_not_swallowed_by_the_boundary() {
-        let _guard = crate::state::test_env_lock();
-        let _env = GateEnv::new("fast-answer", true, 120);
-        let transcript =
-            std::env::temp_dir().join(format!("tinyctb-fast-answer-{}.jsonl", std::process::id()));
-        // Real shape at gate time: the transcript already ends with the
-        // assistant record carrying THIS tool_use. Seeding only a user line
-        // made the test easier than production, where the boundary always
-        // has an assistant record immediately behind it.
-        fs::write(
-            &transcript,
-            format!(
-                "{}\n{}\n",
-                json!({"type": "user", "message": {"role": "user", "content": "go"}}),
-                json!({"type": "assistant", "message": {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "toolu_probe", "name": "Bash",
-                     "input": {"command": "rm -rf build/"}}
-                ]}})
-            ),
-        )
-        .expect("seed transcript");
-        let mut payload = bash_payload();
-        payload["transcript_path"] = json!(transcript.display().to_string());
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        *crate::claude::WINDOWLESS_PROBE_SEAM
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(tx);
-        let writer = {
-            let transcript = transcript.clone();
+        let tapper = {
+            let activity = activity.clone();
             std::thread::spawn(move || {
-                let ack = rx.recv().expect("windowless probe signal");
-                use std::io::Write as _;
-                let mut file = fs::OpenOptions::new()
-                    .append(true)
-                    .open(&transcript)
-                    .expect("append");
-                writeln!(
-                    file,
-                    "{}",
-                    json!({"type": "assistant", "message": {"role": "assistant",
-                            "content": [{"type": "text", "text": "answered at the terminal"}]}})
-                )
-                .expect("write");
-                // Only now may the probe (and the rest of startup) proceed.
-                let _ = ack.send(());
+                let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                loop {
+                    // Typing continues the whole time the gate waits.
+                    stamp(&activity);
+                    if let Ok(id) = conn.query_row(
+                        "SELECT approval_id FROM pending_approvals WHERE decision IS NULL",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    ) {
+                        // Hold the buttons through a few more keystrokes
+                        // before tapping — under the old design they would
+                        // already be dead by now.
+                        std::thread::sleep(Duration::from_millis(1500));
+                        stamp(&activity);
+                        crate::state::record_approval_decision(&conn, &id, "allow", 2000)
+                            .expect("tap");
+                        return;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "approval row never appeared"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             })
         };
-
-        let started = std::time::Instant::now();
-        let mut reader = std::io::Cursor::new(payload.to_string());
-        let result = run_approval_gate(&mut reader, 1000).expect("gate");
-        writer.join().expect("writer");
-        *crate::claude::WINDOWLESS_PROBE_SEAM
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        let _ = fs::remove_file(&transcript);
-
-        assert_eq!(result, json!({}));
-        assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "an answer landing right after the boundary must be seen: {:?}",
-            started.elapsed()
+        let result = gate(bash_payload());
+        tapper.join().expect("tapper");
+        assert_eq!(
+            result["hookSpecificOutput"]["decision"]["behavior"], "allow",
+            "the tap must decide it — keystrokes are not a declaration: {result}"
         );
     }
 
@@ -3075,6 +2374,240 @@ mod tests {
         );
     }
 
+    /// Regression for the 2026-08-27 production bug: an active interactive
+    /// session keeps writing main-chain assistant records (it is talking to
+    /// its user while a background tool's approval waits). The removed
+    /// transcript-`decided_elsewhere` heuristic read that growth as "the
+    /// call was decided" and settled the approval to `expired` within
+    /// seconds — killing the phone buttons before the user ever saw them
+    /// (measured: a 1-hour window closed at 6 seconds). The gate must ignore
+    /// transcript movement entirely: away on means the buttons stay live
+    /// until a real answer or `/back`.
+    #[test]
+    fn transcript_growth_does_not_close_a_waiting_approval() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("transcript-growth", true, 30);
+        let transcript =
+            std::env::temp_dir().join(format!("tinyctb-growth-{}.jsonl", std::process::id()));
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                json!({"type": "user", "message": {"role": "user", "content": "go"}}),
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_probe", "name": "Bash",
+                     "input": {"command": "rm -rf build/"}}
+                ]}})
+            ),
+        )
+        .expect("seed transcript");
+        let mut payload = bash_payload();
+        payload["transcript_path"] = json!(transcript.display().to_string());
+
+        let driver = {
+            let transcript = transcript.clone();
+            std::thread::spawn(move || {
+                use std::io::Write as _;
+                // The session keeps talking: main-chain assistant records
+                // land past the approval boundary, again and again.
+                for i in 0..8 {
+                    std::thread::sleep(Duration::from_millis(400));
+                    let mut file = fs::OpenOptions::new()
+                        .append(true)
+                        .open(&transcript)
+                        .expect("append");
+                    writeln!(
+                        file,
+                        "{}",
+                        json!({"type": "assistant", "message": {"role": "assistant",
+                                "content": [{"type": "text", "text": format!("chatter {i}")}]}})
+                    )
+                    .expect("write");
+                }
+                // The buttons must STILL be live after all that growth — a
+                // premature close would have settled the row to `expired`.
+                let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+                let live: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM pending_approvals WHERE decision IS NULL",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("query");
+                assert_eq!(
+                    live, 1,
+                    "the approval row must still be un-decided (live buttons) despite \
+                     transcript growth"
+                );
+                // Only now does the real answer arrive — from the phone.
+                let id: String = conn
+                    .query_row(
+                        "SELECT approval_id FROM pending_approvals WHERE decision IS NULL",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("live approval row");
+                crate::state::record_approval_decision(&conn, &id, "allow", 9000).expect("tap");
+            })
+        };
+        let mut reader = std::io::Cursor::new(payload.to_string());
+        let result = run_approval_gate(&mut reader, 1000).expect("gate");
+        driver.join().expect("driver");
+        let _ = fs::remove_file(&transcript);
+
+        assert_eq!(
+            result["hookSpecificOutput"]["decision"]["behavior"], "allow",
+            "transcript growth must not close the gate; only the tap decides: {result}"
+        );
+    }
+
+    /// An interrupted gate leaves its row un-decided with a lapsed
+    /// expires_at. A re-run (only headless re-runs share an id — PreToolUse
+    /// carries tool_use_id, PermissionRequest does not) must NOT sit out a
+    /// fresh window waiting behind buttons whose taps already report
+    /// "已过期": publication settles the lapsed row in its own transaction
+    /// and the gate resolves it the way a timeout does — for headless, an
+    /// immediate deny.
+    #[test]
+    fn a_rerun_onto_a_lapsed_row_denies_immediately() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("lapsed-rerun", true, 30);
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        enter_bridge_turn(&conn, "sess-headless");
+        // The row a killed gate left behind: same tool_use_id, never
+        // decided, deadline long past.
+        crate::state::create_pending_approval(
+            &conn,
+            "toolu_headless_1",
+            "sess-headless",
+            "Bash",
+            "Bash: rm -rf build/",
+            true,
+            10,
+            20,
+        )
+        .expect("stale row");
+        // …and its push still sitting on the retry schedule. Settling the
+        // row without withdrawing this would ship buttons already known to
+        // be dead.
+        assert!(crate::state::enqueue_outbound_event(
+            &conn,
+            &json!({
+                "type": "approval_request",
+                "threadId": "sess-headless",
+                "eventKey": "approval:toolu_headless_1",
+                "lastPreview": "Bash: rm -rf build/"
+            }),
+            15,
+            "bridge",
+        )
+        .expect("stale push"));
+        drop(conn);
+
+        let started = std::time::Instant::now();
+        let result = headless_gate(headless_payload());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a lapsed row must resolve immediately, not hold a fresh window: {:?}",
+            started.elapsed()
+        );
+        let out = &result["hookSpecificOutput"];
+        assert_eq!(out["permissionDecision"], "deny", "{result}");
+        // And the row is now settled, so its buttons answer honestly.
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        assert_eq!(
+            crate::state::approval_decision(&conn, "toolu_headless_1")
+                .expect("decision")
+                .as_deref(),
+            Some("expired"),
+            "publication must settle the lapsed row"
+        );
+        let stale_pushes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events
+                 WHERE json_extract(payload_json, '$.eventKey') = 'approval:toolu_headless_1'
+                   AND status IN ('pending', 'failed')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            stale_pushes, 0,
+            "settling the lapsed row must also withdraw its queued push"
+        );
+    }
+
+    /// A windowed interactive gate whose window lapses while away is still
+    /// on must stay LOUD, not go quiet: the lapsed request settles, a fresh
+    /// one is published with live buttons, the dead button honestly reports
+    /// expired, and the fresh button still decides the tool. (Measured
+    /// 2026-08-27 before this: buttons died after one hour and the blocked
+    /// session then sat silent for seven.)
+    #[test]
+    fn a_lapsed_window_renews_and_the_fresh_button_decides() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("renewal", true, 5);
+        let tapper = std::thread::spawn(move || {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            // The first window is 5 seconds; wait for the renewal to appear.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let (lapsed_id, renewed_id) = loop {
+                let mut stmt = conn
+                    .prepare("SELECT approval_id FROM pending_approvals ORDER BY created_at")
+                    .expect("prepare");
+                let ids = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .expect("query")
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .expect("ids");
+                if ids.len() >= 2 {
+                    break (ids[0].clone(), ids[1].clone());
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no renewed approval appeared; rows: {ids:?}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            assert_eq!(
+                renewed_id,
+                format!("{lapsed_id}:r1"),
+                "the renewal must be a fresh round of the same request"
+            );
+            // The dead button from the lapsed window must not decide anything.
+            assert_eq!(
+                crate::state::record_approval_decision(&conn, &lapsed_id, "allow", 9000)
+                    .expect("dead tap"),
+                crate::state::ApprovalAnswer::Expired,
+                "a lapsed round's button must report expired"
+            );
+            // The fresh button is live and decides the tool.
+            assert_eq!(
+                crate::state::record_approval_decision(&conn, &renewed_id, "allow", 9000)
+                    .expect("live tap"),
+                crate::state::ApprovalAnswer::Recorded,
+                "the renewed round's button must accept the answer"
+            );
+        });
+        let result = gate_with_timeout(bash_payload(), Duration::from_secs(60));
+        tapper.join().expect("tapper");
+
+        assert_eq!(
+            result["hookSpecificOutput"]["decision"]["behavior"], "allow",
+            "the answer given on the renewed buttons must decide the tool: {result}"
+        );
+        // Each round shipped its own message: two pushes, not one.
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let pushes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events WHERE event_type = 'approval_request'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(pushes, 2, "the renewal must publish a fresh push");
+    }
+
     /// A HEADLESS turn must never be waved through by transcript evidence.
     /// Under `bypassPermissions` a `{}` reply means "run it", so a foreign
     /// assistant record — a parallel branch, a subagent's parent turn moving
@@ -3137,75 +2670,75 @@ mod tests {
         let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("windowless-away-off", false, 5);
         std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
-        // A windowless gate waits a DAY, so each half needs the transcript
-        // evidence that ends it — the configured 5s never applies here.
-        let transcript = std::env::temp_dir().join(format!(
-            "tinyctb-windowless-away-off-{}.jsonl",
-            std::process::id()
-        ));
-        let release = |delay_ms: u64| {
-            let transcript = transcript.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(delay_ms));
-                use std::io::Write as _;
-                let mut file = fs::OpenOptions::new()
-                    .append(true)
-                    .open(&transcript)
-                    .expect("append");
-                writeln!(
-                    file,
-                    "{}",
-                    json!({"type": "assistant", "message": {"role": "assistant",
-                            "content": [{"type": "text", "text": "handled locally"}]}})
-                )
-                .expect("write");
-            })
-        };
-
-        fs::write(&transcript, "").expect("seed");
-        let mut approval_payload = bash_payload();
-        approval_payload["transcript_path"] = json!(transcript.display().to_string());
-        let writer = release(800);
+        // A windowless gate waits a DAY (the configured 5s never applies),
+        // and with the transcript watcher gone the ONLY thing that ends the
+        // wait is the phone. Each half is answered there — which is itself
+        // the point: away off must not stop a windowless session from being
+        // answerable remotely.
+        let approval_tap = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Ok(id) = conn.query_row(
+                    "SELECT approval_id FROM pending_approvals WHERE decision IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) {
+                    if matches!(
+                        crate::state::record_approval_decision(&conn, &id, "deny", 2000),
+                        Ok(crate::state::ApprovalAnswer::Recorded)
+                    ) {
+                        return;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "approval row never appeared"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
         let approval = {
-            let mut reader = std::io::Cursor::new(approval_payload.to_string());
+            let mut reader = std::io::Cursor::new(bash_payload().to_string());
             run_approval_gate(&mut reader, 1000).expect("gate")
         };
-        writer.join().expect("writer");
-        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
-        // The request was MINTED remotely rather than waved through to a
-        // terminal nobody can see. (The push itself is withdrawn again when
-        // the evidence lands — that is the self-settle contract — so the row
-        // is what proves the gate engaged.)
-        let minted: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pending_approvals", [], |row| {
-                row.get(0)
-            })
-            .expect("count");
-        drop(conn);
-        assert_eq!(approval, json!({}), "the terminal resolved it in the end");
+        approval_tap.join().expect("approval tap");
         assert_eq!(
-            minted, 1,
-            "a windowless approval must be raised remotely even with away off"
+            approval["hookSpecificOutput"]["decision"]["behavior"], "deny",
+            "a windowless approval must be raised AND answerable remotely even with away \
+             off: {approval}"
         );
 
-        fs::write(&transcript, "").expect("reseed");
-        let mut q_payload = question_payload();
-        q_payload["transcript_path"] = json!(transcript.display().to_string());
-        let writer = release(800);
-        let question = question_gate(q_payload);
-        writer.join().expect("writer");
-        let _ = fs::remove_file(&transcript);
-        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
-        let asked: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pending_questions", [], |row| {
-                row.get(0)
-            })
-            .expect("count");
+        let question_answerer = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Ok(id) = conn.query_row(
+                    "SELECT question_id FROM pending_questions WHERE answer IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) {
+                    if matches!(
+                        crate::state::record_question_answer(&conn, &id, "SQLite", 2000),
+                        Ok(crate::state::ApprovalAnswer::Recorded)
+                    ) {
+                        return;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "question row never appeared"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let question = question_gate(question_payload());
+        question_answerer.join().expect("question answerer");
         std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "0");
-        assert_eq!(question, json!({}));
         assert_eq!(
-            asked, 1,
-            "a windowless question must be raised remotely even with away off"
+            question["hookSpecificOutput"]["hookEventName"], "PreToolUse",
+            "a windowless question must be raised AND answerable remotely even with away \
+             off: {question}"
         );
     }
 
@@ -3234,49 +2767,52 @@ mod tests {
     }
 
     /// The question gate's two windowless behaviours, together: the row gets
-    /// the day-long window (not the configured 30s), and a terminal answer
-    /// still ends the wait early through the transcript watcher.
+    /// the day-long window (not the configured 30s), and the phone answer is
+    /// what ends the wait. (This wait used to also exit on transcript
+    /// evidence; that watcher was removed with presence detection — under
+    /// the current TUI no dialog renders while the hook blocks, so nothing
+    /// legitimate can decide the call behind the gate's back.)
     #[test]
-    fn windowless_question_gets_the_long_window_and_still_exits_on_evidence() {
+    fn windowless_question_gets_the_long_window_and_the_phone_decides() {
         let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("windowless-question", true, 30);
         std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
-        let transcript = std::env::temp_dir().join(format!(
-            "tinyctb-windowless-question-{}.jsonl",
-            std::process::id()
-        ));
-        fs::write(&transcript, "").expect("seed");
-        let mut payload = question_payload();
-        payload["transcript_path"] = json!(transcript.display().to_string());
 
-        let writer = {
-            let transcript = transcript.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(1200));
-                use std::io::Write as _;
-                let mut file = fs::OpenOptions::new()
-                    .append(true)
-                    .open(&transcript)
-                    .expect("append");
-                writeln!(
-                    file,
-                    "{}",
-                    json!({"type": "assistant", "message": {"role": "assistant",
-                            "content": [{"type": "text", "text": "answered in the terminal"}]}})
-                )
-                .expect("write");
-            })
-        };
+        let answerer = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Ok(question_id) = conn.query_row(
+                    "SELECT question_id FROM pending_questions WHERE answer IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) {
+                    if matches!(
+                        crate::state::record_question_answer(&conn, &question_id, "SQLite", 2000),
+                        Ok(crate::state::ApprovalAnswer::Recorded)
+                    ) {
+                        return;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "question row never appeared"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
         let started = std::time::Instant::now();
-        let result = question_gate(payload);
-        writer.join().expect("writer");
+        let result = question_gate(question_payload());
+        answerer.join().expect("answerer");
         std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "0");
-        let _ = fs::remove_file(&transcript);
 
-        assert_eq!(result, json!({}));
+        assert_eq!(
+            result["hookSpecificOutput"]["hookEventName"], "PreToolUse",
+            "the phone answer must complete the call: {result}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(20),
-            "the terminal answer must end the wait, not the 24h window: {:?}",
+            "the phone answer must end the wait, not the 24h window: {:?}",
             started.elapsed()
         );
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
@@ -3295,19 +2831,16 @@ mod tests {
     }
 
     /// A session with NO terminal window (background pty host) has nowhere
-    /// to step aside TO: the dialog would land in a pty nobody is watching
-    /// and the tool would stay blocked. Measured 2026-08-17: exactly this
-    /// froze a cchess session for 7h09m. So presence must not divert it —
-    /// the push goes out and the remote window stays open for a full day,
-    /// which is also what makes /threads able to re-offer the buttons.
+    /// to hand anything TO: the dialog would land in a pty nobody is
+    /// watching and the tool would stay blocked. Measured 2026-08-17:
+    /// exactly this froze a cchess session for 7h09m. The push goes out and
+    /// the remote window stays open for a full day, which is also what
+    /// makes /threads able to re-offer the buttons.
     #[test]
     fn windowless_session_keeps_the_remote_window_open() {
         let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("windowless-present", true, 30);
         std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
-        // User is at the keyboard — for a windowed session this alone would
-        // hand the dialog straight to the terminal.
-        std::env::set_var("TINYCTB_TEST_IDLE_MS", "0");
 
         let answerer = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(1500));
@@ -3316,12 +2849,11 @@ mod tests {
                 .query_row("SELECT approval_id FROM pending_approvals", [], |row| {
                     row.get(0)
                 })
-                .expect("an approval row must exist despite the present user");
+                .expect("an approval row");
             crate::state::record_approval_decision(&conn, &id, "allow", 1000).expect("tap");
         });
         let result = gate(bash_payload());
         answerer.join().expect("answerer");
-        std::env::remove_var("TINYCTB_TEST_IDLE_MS");
         std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "0");
 
         assert_eq!(
@@ -3343,89 +2875,44 @@ mod tests {
         );
     }
 
-    /// The mirror of `gate_releases_to_the_terminal_when_the_user_returns`:
-    /// for a windowless session the returning user must NOT take the prompt
-    /// away, because "the terminal" is a pty with no window on it. The tool
-    /// stays blocked either way — the difference is whether the phone can
-    /// still clear it.
+    /// Session-scoped auto-allow: a grant the user paid a tap for keeps
+    /// firing without a fresh prompt anywhere.
     #[test]
-    fn returning_user_does_not_steal_a_windowless_prompt() {
-        let _guard = crate::state::test_env_lock();
-        let _env = GateEnv::new("windowless-returns", true, 30);
-        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
-        std::env::set_var("TINYCTB_TEST_IDLE_MS", "3600000");
-
-        let script = std::thread::spawn(|| {
-            // The user comes back to the machine...
-            std::thread::sleep(Duration::from_millis(800));
-            std::env::set_var("TINYCTB_TEST_IDLE_MS", "50");
-            // ...and only later answers from the phone. If the return had
-            // released the prompt, the gate would already have returned {}.
-            std::thread::sleep(Duration::from_millis(1200));
-            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
-            let id: String = conn
-                .query_row("SELECT approval_id FROM pending_approvals", [], |row| {
-                    row.get(0)
-                })
-                .expect("approval row");
-            crate::state::record_approval_decision(&conn, &id, "deny", 1000).expect("tap");
-        });
-        let result = gate(bash_payload());
-        script.join().expect("script");
-        std::env::remove_var("TINYCTB_TEST_IDLE_MS");
-        std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "0");
-
-        assert_eq!(
-            result["hookSpecificOutput"]["decision"]["behavior"], "deny",
-            "the phone answer must still be the one that lands: {result}"
-        );
-    }
-
-    /// Session-scoped auto-allow outranks presence: a grant the user paid a
-    /// tap for must not resurface as a terminal dialog just because they
-    /// are at the keyboard now.
-    #[test]
-    fn auto_allow_beats_presence() {
+    fn auto_allow_short_circuits_the_gate() {
         let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("auto-allow-present", true, 30);
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
         crate::state::set_approval_auto_allow(&conn, "sess-gate", "Bash", 900).expect("auto allow");
         drop(conn);
-        std::env::set_var("TINYCTB_TEST_IDLE_MS", "0");
 
         let result = gate(bash_payload());
-        std::env::remove_var("TINYCTB_TEST_IDLE_MS");
         assert_eq!(
             result["hookSpecificOutput"]["decision"]["behavior"], "allow",
-            "the existing session grant must fire, not the presence bypass: {result}"
+            "the existing session grant must fire: {result}"
         );
     }
 
-    /// The user comes BACK mid-wait: fresh input on the machine hands the
-    /// prompt to the terminal within a poll tick instead of holding it for
-    /// the rest of the remote window. This is what makes a long remote
-    /// window safe to configure.
+    /// `/back` mid-wait hands the prompt to the terminal within a poll tick
+    /// instead of holding it for the rest of the remote window. This is the
+    /// ONE hand-back left — the user's declaration, not a guess — and it is
+    /// what makes a long remote window safe to configure.
     #[test]
-    fn gate_releases_to_the_terminal_when_the_user_returns() {
+    fn gate_releases_to_the_terminal_on_back() {
         let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("user-returns", true, 30);
-        // Idle for an hour when the gate fires.
-        std::env::set_var("TINYCTB_TEST_IDLE_MS", "3600000");
 
         let returner = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(1200));
-            // Mouse moved / key pressed.
-            std::env::set_var("TINYCTB_TEST_IDLE_MS", "50");
+            write_away_marker_for_test(false).expect("back");
         });
         let started = std::time::Instant::now();
         let result = gate(bash_payload());
         returner.join().expect("returner");
-        std::env::remove_var("TINYCTB_TEST_IDLE_MS");
 
         assert_eq!(result, json!({}), "the prompt must fall to the terminal");
         assert!(
             started.elapsed() < Duration::from_secs(10),
-            "released by the returning user, not the 30s window: {:?}",
+            "released by /back, not the 30s window: {:?}",
             started.elapsed()
         );
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
@@ -3442,37 +2929,14 @@ mod tests {
         );
     }
 
-    /// `/back` is the deterministic release — it needs no desktop session at
-    /// all (SSH included): declaring yourself back hands every waiting
-    /// prompt to its terminal.
+    /// A tap that lands just before `/back` still wins — the settle is
+    /// atomic, not a blind expiry. Telegram already told the user the tap
+    /// was accepted, so discarding it at the hand-back would show "已允许"
+    /// while the session quietly re-asked in the terminal.
     #[test]
-    fn gate_releases_to_the_terminal_on_back() {
-        let _guard = crate::state::test_env_lock();
-        let _env = GateEnv::new("back-release", true, 30);
-        // No desktop signal at all: presence unknown.
-        let returner = std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(1200));
-            write_away_marker_for_test(false).expect("back");
-        });
-        let started = std::time::Instant::now();
-        let result = gate(bash_payload());
-        returner.join().expect("returner");
-
-        assert_eq!(result, json!({}), "the prompt must fall to the terminal");
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "released by /back, not the 30s window: {:?}",
-            started.elapsed()
-        );
-    }
-
-    /// A tap that lands before the returning user still wins — the settle is
-    /// atomic, not a blind expiry.
-    #[test]
-    fn a_tap_racing_the_returning_user_still_wins() {
+    fn a_tap_racing_the_hand_back_still_wins() {
         let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("tap-vs-return", true, 30);
-        std::env::set_var("TINYCTB_TEST_IDLE_MS", "3600000");
 
         let worker = std::thread::spawn(|| {
             let conn = create_state_db(&state_db_path().expect("path")).expect("db");
@@ -3485,12 +2949,12 @@ mod tests {
                 ) else {
                     continue;
                 };
-                // Tap first, the user walks in right after.
+                // Tap first, /back right after.
                 if matches!(
                     record_approval_decision(&conn, &approval_id, "allow", 2000),
                     Ok(crate::state::ApprovalAnswer::Recorded)
                 ) {
-                    std::env::set_var("TINYCTB_TEST_IDLE_MS", "50");
+                    write_away_marker_for_test(false).expect("back");
                     return;
                 }
             }
@@ -3498,10 +2962,9 @@ mod tests {
         });
         let result = gate(bash_payload());
         worker.join().expect("worker");
-        std::env::remove_var("TINYCTB_TEST_IDLE_MS");
         assert_eq!(
             result["hookSpecificOutput"]["decision"]["behavior"], "allow",
-            "the recorded tap must be honoured, not discarded by the return: {result}"
+            "the recorded tap must be honoured, not discarded by the hand-back: {result}"
         );
     }
 
@@ -3511,8 +2974,47 @@ mod tests {
         let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("timeout", true, 5); // clamped minimum
         let started = std::time::Instant::now();
-        let result = gate(bash_payload());
-        assert_eq!(result, json!({}), "timeout must yield no opinion");
+        // While away stays on, an unanswered window RENEWS instead of ending
+        // the gate (silence once wedged a session for seven hours), so the
+        // test observes the first window lapse — never allowing — and then
+        // turns away off, which is one of the endings a real gate has.
+        let watcher = std::thread::spawn(move || {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let rows: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM pending_approvals", [], |row| {
+                        row.get(0)
+                    })
+                    .expect("count");
+                if rows >= 2 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the lapsed window must renew, not end the gate"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            // The first round lapsed with nobody answering — and settled as
+            // exactly that, never as any form of allow.
+            let first: Option<String> = conn
+                .query_row(
+                    "SELECT decision FROM pending_approvals ORDER BY created_at LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("first round");
+            assert_eq!(first.as_deref(), Some("expired"));
+            write_away_marker_for_test(false).expect("away off");
+        });
+        let result = gate_with_timeout(bash_payload(), Duration::from_secs(60));
+        watcher.join().expect("watcher");
+        assert_eq!(
+            result,
+            json!({}),
+            "an unanswered gate must yield no opinion"
+        );
         assert!(
             started.elapsed() >= Duration::from_secs(4),
             "the gate must actually wait for an answer"
@@ -3523,7 +3025,7 @@ mod tests {
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
         let (payload_json, origin): (String, String) = conn
             .query_row(
-                "SELECT payload_json, origin FROM outbound_events",
+                "SELECT payload_json, origin FROM outbound_events ORDER BY created_at LIMIT 1",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -3583,11 +3085,42 @@ mod tests {
     fn late_tap_after_timeout_is_refused() {
         let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("late-tap", true, 5);
-        let result = gate(bash_payload());
-        assert_eq!(result, json!({}), "timeout yields no opinion");
+        // Same ending as `gate_timeout_never_allows`: observe the first
+        // window lapse (and renew), then end the gate by turning away off.
+        let watcher = std::thread::spawn(move || {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let rows: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM pending_approvals", [], |row| {
+                        row.get(0)
+                    })
+                    .expect("count");
+                if rows >= 2 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the lapsed window must renew, not end the gate"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            write_away_marker_for_test(false).expect("away off");
+        });
+        let result = gate_with_timeout(bash_payload(), Duration::from_secs(60));
+        watcher.join().expect("watcher");
+        assert_eq!(result, json!({}), "an unanswered gate yields no opinion");
 
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
-        let approval_id = pending_approval_id(&conn);
+        // The LAPSED round is the one whose buttons the phone has been
+        // holding the longest — the late taps below all land on it.
+        let approval_id: String = conn
+            .query_row(
+                "SELECT approval_id FROM pending_approvals ORDER BY created_at LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("first round");
         let decision_now: Option<String> =
             crate::state::approval_decision(&conn, &approval_id).expect("decision");
         assert_eq!(
@@ -3776,7 +3309,6 @@ mod tests {
         let watched = [
             "TINYCTB_STATE_DIR",
             crate::claude::BRIDGE_TURN_ENV,
-            "TINYCTB_TEST_IDLE_MS",
             "TINYCTB_TEST_SESSION_WINDOWLESS",
             "TINYCTB_TEST_SESSION_TTY",
         ];
@@ -3855,8 +3387,8 @@ mod tests {
         );
     }
 
-    /// A keyboard reclaim hands the window back with no opinion; the banner
-    /// must close on the hand-over rather than a still-waiting promise.
+    /// A `/back` hand-over exits with no opinion; the banner must close on
+    /// the hand-over rather than a still-waiting promise.
     #[test]
     fn a_reclaimed_question_paints_a_handover_note() {
         let _guard = crate::state::test_env_lock();
@@ -3864,11 +3396,26 @@ mod tests {
         let tty = _env.root.join("fake-tty.txt");
         fs::write(&tty, "").expect("fake tty");
         std::env::set_var("TINYCTB_TEST_SESSION_TTY", &tty);
-        // A keypress just happened: the first poll tick reclaims.
-        std::env::set_var("TINYCTB_TEST_IDLE_MS", "0");
+        let returner = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(1200));
+            write_away_marker_for_test(false).expect("back");
+        });
+        let started = std::time::Instant::now();
         let result = question_gate(question_payload());
-        std::env::remove_var("TINYCTB_TEST_IDLE_MS");
-        assert_eq!(result, json!({}), "reclaim must exit with no opinion");
+        // Capture the gate's OWN duration before joining the returner — the
+        // join would otherwise fold the returner's 1200ms sleep into the
+        // measurement and make the timing assertion below vacuous.
+        let gate_elapsed = started.elapsed();
+        returner.join().expect("returner");
+        assert_eq!(result, json!({}), "the hand-over must exit with no opinion");
+        // It must have WAITED for /back, not handed over on the first poll.
+        // With away still on and nobody answering, the gate holds; only the
+        // /back at 1200ms releases it. A gate that handed back unconditionally
+        // (the pre-2026-08-27 behavior) would return within a poll tick.
+        assert!(
+            gate_elapsed >= Duration::from_millis(1000),
+            "the gate must hold until /back, not hand over while away is on: {gate_elapsed:?}"
+        );
         let painted = fs::read_to_string(&tty).expect("painted tty");
         assert!(painted.contains("有提问待作答"), "{painted}");
         assert!(painted.contains("已交还本终端"), "{painted}");

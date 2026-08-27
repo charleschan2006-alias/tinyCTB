@@ -3698,7 +3698,7 @@ pub(crate) fn settle_prompts_for_turn(conn: &Connection, turn_id: &str, now: u64
     for (approval_id, decision) in &rows {
         if decision.is_none() {
             // Still open: settle it AND withdraw its push, atomically.
-            settle_expired_and_cancel_push_inner(conn, SettleTarget::Approval(approval_id), now)?;
+            settle_expired_and_cancel_push_inner(conn, approval_id, now)?;
             settled += 1;
         } else {
             // Already decided; only the queued button is still a hazard.
@@ -4350,19 +4350,16 @@ pub(crate) fn pending_outbound_count(conn: &Connection) -> Result<u64> {
 /// /back clears the away-notification backlog only. Answers to turns the user
 /// started from Telegram (origin 'bridge') stay queued: they were explicitly
 /// requested and must survive a delivery failure followed by /back.
-/// What settling a prompt from inside the gate actually found.
+/// What settling an approval from inside the gate actually found.
 pub(crate) enum SettleOutcome {
     /// A Telegram answer had already landed. It stands — the phone showed
-    /// the user "已接受" and the hook must honour exactly that.
-    Answered(String),
+    /// the user "已接受" and the hook must honour exactly that. Callers read
+    /// the decision itself back from `pending_approvals`; this only reports
+    /// which branch the race took.
+    Answered,
     /// Nobody answered remotely; the request is now expired and any unsent
     /// push was withdrawn.
     Expired,
-}
-
-pub(crate) enum SettleTarget<'a> {
-    Approval(&'a str),
-    Question(&'a str),
 }
 
 /// Settle a prompt the gate has decided it no longer owns, and withdraw its
@@ -4418,40 +4415,38 @@ pub(crate) fn cancel_pending_push_inner(
     Ok(())
 }
 
+// The standalone transaction-wrapping form is exercised only by the state
+// tests now. Production callers hold their own transaction and drive
+// `_inner` directly: the stop path sweeping a turn's dialogs, and the
+// approval gate's publication settling a lapsed leftover row.
+#[cfg(test)]
 pub(crate) fn settle_expired_and_cancel_push(
     conn: &Connection,
-    target: SettleTarget<'_>,
+    approval_id: &str,
     now: u64,
 ) -> Result<SettleOutcome> {
     let tx = conn.unchecked_transaction()?;
-    let outcome = settle_expired_and_cancel_push_inner(conn, target, now)?;
+    let outcome = settle_expired_and_cancel_push_inner(conn, approval_id, now)?;
     tx.commit()?;
     Ok(outcome)
 }
 
 /// The body of `settle_expired_and_cancel_push` WITHOUT its own transaction,
 /// for callers already holding one — SQLite has no nested transactions, so
-/// settling several rows atomically has to drive this directly.
+/// settling several approvals atomically has to drive this directly. Only
+/// approvals settle this way now: the question gate's transcript-evidence
+/// exit was removed with presence detection.
 pub(crate) fn settle_expired_and_cancel_push_inner(
     conn: &Connection,
-    target: SettleTarget<'_>,
+    approval_id: &str,
     now: u64,
 ) -> Result<SettleOutcome> {
-    let (answer, event_key) = match target {
-        SettleTarget::Approval(id) => (
-            expire_or_take_decision(conn, id, now)?,
-            format!("approval:{id}"),
-        ),
-        SettleTarget::Question(id) => (
-            expire_or_take_answer(conn, id, now)?,
-            format!("question:{id}"),
-        ),
-    };
-    if let Some(answer) = answer {
+    let answer = expire_or_take_decision(conn, approval_id, now)?;
+    if answer.is_some() {
         // A tap won the race. Keep its push exactly as it is.
-        return Ok(SettleOutcome::Answered(answer));
+        return Ok(SettleOutcome::Answered);
     }
-    cancel_pending_push_inner(conn, &event_key, now)?;
+    cancel_pending_push_inner(conn, &format!("approval:{approval_id}"), now)?;
     Ok(SettleOutcome::Expired)
 }
 
@@ -8400,11 +8395,15 @@ mod tests {
         open_approval(&conn, "a1");
         seed(&conn, "approval:a1", None, false);
         record_approval_decision(&conn, "a1", "allow", 1500).expect("tap");
-        let outcome = settle_expired_and_cancel_push(&conn, SettleTarget::Approval("a1"), 2000)
-            .expect("settle");
+        let outcome = settle_expired_and_cancel_push(&conn, "a1", 2000).expect("settle");
         assert!(
-            matches!(outcome, SettleOutcome::Answered(ref d) if d == "allow"),
-            "a tap the user already saw accepted must be returned, never discarded"
+            matches!(outcome, SettleOutcome::Answered),
+            "a tap the user already saw accepted must be reported, never discarded"
+        );
+        assert_eq!(
+            approval_decision(&conn, "a1").expect("decision").as_deref(),
+            Some("allow"),
+            "and the landed decision itself must stand, not be overwritten by expiry"
         );
         let kept: i64 = conn
             .query_row("SELECT COUNT(*) FROM outbound_events", [], |row| row.get(0))
@@ -8415,8 +8414,7 @@ mod tests {
         let conn = create_state_db_in_memory().expect("db");
         open_approval(&conn, "a2");
         seed(&conn, "approval:a2", None, false);
-        let outcome = settle_expired_and_cancel_push(&conn, SettleTarget::Approval("a2"), 2000)
-            .expect("settle");
+        let outcome = settle_expired_and_cancel_push(&conn, "a2", 2000).expect("settle");
         assert!(matches!(outcome, SettleOutcome::Expired));
         let left: i64 = conn
             .query_row("SELECT COUNT(*) FROM outbound_events", [], |row| row.get(0))
@@ -8428,7 +8426,7 @@ mod tests {
         let conn = create_state_db_in_memory().expect("db");
         open_approval(&conn, "a3");
         seed(&conn, "approval:a3", Some(1234), false);
-        settle_expired_and_cancel_push(&conn, SettleTarget::Approval("a3"), 2000).expect("settle");
+        settle_expired_and_cancel_push(&conn, "a3", 2000).expect("settle");
         let left: i64 = conn
             .query_row("SELECT COUNT(*) FROM outbound_events", [], |row| row.get(0))
             .expect("count");
@@ -8438,7 +8436,7 @@ mod tests {
         let conn = create_state_db_in_memory().expect("db");
         open_approval(&conn, "a4");
         seed(&conn, "approval:a4", None, true);
-        settle_expired_and_cancel_push(&conn, SettleTarget::Approval("a4"), 2000).expect("settle");
+        settle_expired_and_cancel_push(&conn, "a4", 2000).expect("settle");
         let left: i64 = conn
             .query_row("SELECT COUNT(*) FROM outbound_events", [], |row| row.get(0))
             .expect("count");
@@ -8491,8 +8489,7 @@ mod tests {
         assert_eq!(claimed, None, "a failed send must release its claim");
 
         // The terminal answers it; the gate settles and withdraws the push.
-        let outcome = settle_expired_and_cancel_push(&conn, SettleTarget::Approval("ap1"), 2000)
-            .expect("settle");
+        let outcome = settle_expired_and_cancel_push(&conn, "ap1", 2000).expect("settle");
         assert!(matches!(outcome, SettleOutcome::Expired));
 
         // The retry cycle must find nothing to send.
@@ -8561,7 +8558,7 @@ mod tests {
         );
 
         // The terminal answers it while the orphaned lease is still live.
-        settle_expired_and_cancel_push(&conn, SettleTarget::Approval("ap"), 1500).expect("settle");
+        settle_expired_and_cancel_push(&conn, "ap", 1500).expect("settle");
 
         // Lease lapses; a later real cycle reclaims and must send nothing.
         let sent = std::cell::Cell::new(0usize);
@@ -8605,8 +8602,7 @@ mod tests {
             }
 
             // Terminal settles while the (dead) owner still holds the lease.
-            settle_expired_and_cancel_push(&conn, SettleTarget::Approval("ap"), 2000)
-                .expect("settle");
+            settle_expired_and_cancel_push(&conn, "ap", 2000).expect("settle");
             let flagged: i64 = conn
                 .query_row(
                     "SELECT cancel_requested FROM outbound_events WHERE event_id = 'evt'",
