@@ -4415,11 +4415,12 @@ pub(crate) fn cancel_pending_push_inner(
     Ok(())
 }
 
-// The standalone transaction-wrapping form is exercised only by the state
-// tests now. Production callers hold their own transaction and drive
-// `_inner` directly: the stop path sweeping a turn's dialogs, and the
-// approval gate's publication settling a lapsed leftover row.
-#[cfg(test)]
+// Production again: the approval gate's terminal-answer exit settles with
+// this (the concurrent permission dialog was answered at the terminal, so
+// the phone side must fold — atomically with any in-flight tap). Callers
+// already holding a transaction drive `_inner` directly instead: the stop
+// path sweeping a turn's dialogs, and publication settling a lapsed
+// leftover row.
 pub(crate) fn settle_expired_and_cancel_push(
     conn: &Connection,
     approval_id: &str,
@@ -4448,6 +4449,24 @@ pub(crate) fn settle_expired_and_cancel_push_inner(
     }
     cancel_pending_push_inner(conn, &format!("approval:{approval_id}"), now)?;
     Ok(SettleOutcome::Expired)
+}
+
+/// The question-side twin: settle the question row and withdraw its queued
+/// push as one transaction. Question pushes also ride origin="bridge" (the
+/// /back sweep leaves them alone), so a hand-back that only settled the row
+/// let an unsent retry deliver dead buttons after away turned off.
+pub(crate) fn settle_expired_question_and_cancel_push(
+    conn: &Connection,
+    question_id: &str,
+    now: u64,
+) -> Result<Option<String>> {
+    let tx = conn.unchecked_transaction()?;
+    let answer = expire_or_take_answer(conn, question_id, now)?;
+    if answer.is_none() {
+        cancel_pending_push_inner(conn, &format!("question:{question_id}"), now)?;
+    }
+    tx.commit()?;
+    Ok(answer)
 }
 
 pub(crate) fn clear_pending_outbound_events(conn: &Connection) -> Result<usize> {

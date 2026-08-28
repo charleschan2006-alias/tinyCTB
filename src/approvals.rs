@@ -54,19 +54,21 @@ use crate::state::{
 /// 100ms costs 1.50 ms/s — and the process only exists while an approval is
 /// actually pending, so even an hour-long wait totals a few seconds of CPU.
 /// Worth it for a Telegram tap and `/back` landing in a tenth of a second
-/// instead of half of one. (Under the current TUI nothing renders in the
-/// terminal while the hook blocks — verified 2026-08-22 under a pty
-/// capture — so this interval bounds every exit the gate has.)
+/// instead of half of one. (What renders during the block differs by hook:
+/// the PERMISSION dialog runs concurrently with `PermissionRequest` —
+/// re-verified 2026-08-28 under a pty capture — while `PreToolUse` shows
+/// only a spinner, verified 2026-08-22. The terminal-side answer path each
+/// gate has follows from that split.)
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How long a gate waits when its session has NO terminal window (Claude
-/// Code's background pty host). Every "hand it back to the terminal" exit —
-/// `/back`, the configured timeout — assumes a dialog
-/// the user can see. A background session has none, so those exits do not
-/// resolve the prompt, they hide it: the tool stays blocked and the only
-/// remedy is walking to the machine and attaching (measured 2026-08-17:
-/// 7h09m of a blocked cchess session). For those sessions the Telegram
-/// window IS the dialog, so it stays open for a day rather than an hour.
+/// Code's background pty host). While AWAY IS ON, nobody is assumed to be
+/// at any screen, and a background session's dialog is the easiest of all
+/// to lose track of (measured 2026-08-17: 7h09m of a blocked cchess
+/// session) — so its Telegram window stays open for a day rather than an
+/// hour. `/back` is unaffected: it hands background gates over immediately
+/// like everyone else's, and the dialog then renders on the bg pty where
+/// the parent session's task panel surfaces it.
 ///
 /// Not literally forever: the hook it runs inside has a timeout, so an
 /// unbounded wait would be a fiction the harness overrules. A day is the
@@ -90,6 +92,355 @@ pub(crate) const WINDOWLESS_APPROVAL_WAIT: Duration = Duration::from_secs(86_400
 /// Left only so `reset` can sweep files an older build wrote.
 pub(crate) const PRESENCE_STATE_FILE: &str = "presence-probe.json";
 pub(crate) const PRESENCE_LOCK_FILE: &str = "presence-probe.lock";
+
+/// How much of the transcript tail is scanned at gate start for the pending
+/// tool_use this approval is about. The record is normally the LAST line;
+/// the margin covers a burst of parallel calls and sidechain noise.
+const TERMINAL_ANSWER_TAIL_BYTES: u64 = 512 * 1024;
+
+const TERMINAL_ANSWER_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Watches the transcript for THE tool_result that settles THIS approval.
+///
+/// The terminal's permission dialog renders CONCURRENTLY with a blocking
+/// `PermissionRequest` hook (re-verified 2026-08-28 under a pty capture: a
+/// 60s sleeping hook, dialog on screen at 40s with `hook.end` never
+/// written), so the user can answer at the terminal while the phone holds
+/// live buttons. Without this watch the gate never learns that — it holds,
+/// and RENEWS, dead buttons for a command that already ran (the original
+/// 2026-08-17 measurement: 21 orphaned gates, 58 stale pushes in one
+/// afternoon; renewal would now multiply that hourly).
+///
+/// An earlier watcher was removed for a false positive: it fired on ANY
+/// main-chain assistant record, so an actively-talking session closed a
+/// fresh approval within seconds (measured 2026-08-27: a 1-hour window
+/// dead at 6 seconds). This one is precise — it fires only when a
+/// tool_result arrives for a tool_use whose name AND input match the gated
+/// call, pending at (or appearing after) the moment the gate started.
+struct TerminalAnswerWatch {
+    transcript: Option<std::path::PathBuf>,
+    tool_name: String,
+    tool_input: Value,
+    /// When the gate started (wall clock, ms). A matching tool_use only
+    /// counts as THIS call if its record timestamp is within
+    /// `TERMINAL_ANSWER_MATCH_WINDOW_MS` of this — the discriminator that
+    /// keeps a HISTORIC identical call in the tail from being adopted (and
+    /// its long-settled result from folding a fresh gate).
+    gate_now_ms: u64,
+    /// The one tool_use this gate is about. Adopted once — the newest
+    /// recent pending match at seed, or the first recent match to appear in
+    /// the increments — and never re-bound after that: re-binding to a
+    /// later overlapping identical call was how gate A ended up folding on
+    /// call B's result.
+    tracked_id: Option<String>,
+    /// Sticky: the tracked tool_use got its tool_result. Consulted (and the
+    /// gate folded) on the next poll.
+    answered: bool,
+    /// Next byte to read. Failure handling is fail-closed throughout: a
+    /// failed SEED read disables the watch loudly, a rotation/truncation
+    /// resyncs to the end, and a transient incremental read error just
+    /// skips that poll — the watch never reads bytes it cannot vouch for.
+    offset: u64,
+    identity: Option<(u64, u64)>,
+    partial: Vec<u8>,
+    last_checked: std::time::Instant,
+}
+
+#[cfg(unix)]
+fn watch_file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    (meta.dev(), meta.ino())
+}
+
+#[cfg(not(unix))]
+fn watch_file_identity(_meta: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+/// How far back a matching tool_use may be stamped and still count as the
+/// call this gate is about. Generous: the hook fires within milliseconds of
+/// the tool_use record; two minutes absorbs clock skew and slow flushes
+/// while still excluding yesterday's identical command.
+const TERMINAL_ANSWER_MATCH_WINDOW_MS: u64 = 120_000;
+
+/// What one bounded seed read yields: (file length, identity, complete
+/// lines, trailing partial line).
+type SeedRead = (u64, (u64, u64), Vec<Vec<u8>>, Vec<u8>);
+
+impl TerminalAnswerWatch {
+    fn new(payload: &Value, gate_now_ms: u64) -> Self {
+        let tool_name = payload
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let tool_input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
+        let mut watch = Self {
+            transcript: payload
+                .get("transcript_path")
+                .and_then(Value::as_str)
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_file()),
+            tool_name,
+            tool_input,
+            gate_now_ms,
+            tracked_id: None,
+            answered: false,
+            offset: 0,
+            identity: None,
+            partial: Vec::new(),
+            last_checked: std::time::Instant::now(),
+        };
+        // Seed from the tail. The read is BOUNDED to the length just
+        // measured: `read_to_end` would swallow bytes appended during the
+        // read while `offset` stayed at the old length, so those bytes
+        // would be consumed once here and then re-read as garbage.
+        //
+        // The seed BINDS ONLY A PENDING candidate. A recent matching call
+        // that already has its result is ambiguous — it could be this call
+        // answered impossibly fast, or simply the previous identical call —
+        // and binding it once folded a fresh gate on a 30-second-old
+        // answer. An unbound seed loses only the vanishing case where the
+        // dialog was answered before this constructor ran; the reviewer
+        // ruled that the acceptable residue.
+        if let Some(path) = watch.transcript.clone() {
+            use std::io::{Read as _, Seek as _};
+            let seeded = (|| -> std::io::Result<SeedRead> {
+                let mut file = std::fs::File::open(&path)?;
+                let meta = file.metadata()?;
+                let len = meta.len();
+                let start = len.saturating_sub(TERMINAL_ANSWER_TAIL_BYTES);
+                let mut tail = vec![0u8; (len - start) as usize];
+                file.seek(std::io::SeekFrom::Start(start))?;
+                file.read_exact(&mut tail)?;
+                let mut skip_first = start > 0;
+                let mut complete = Vec::new();
+                let mut partial = Vec::new();
+                for line in tail.split_inclusive(|byte| *byte == b'\n') {
+                    if skip_first {
+                        skip_first = false;
+                        continue; // partial first line
+                    }
+                    if line.ends_with(b"\n") {
+                        complete.push(line.to_vec());
+                    } else {
+                        partial = line.to_vec();
+                    }
+                }
+                Ok((len, watch_file_identity(&meta), complete, partial))
+            })();
+            match seeded {
+                Ok((len, identity, complete, partial)) => {
+                    // Candidates in tail order: (id, answered-yet).
+                    let mut candidates: Vec<(String, bool)> = Vec::new();
+                    for line in &complete {
+                        watch.scan_seed_line(line, &mut candidates);
+                    }
+                    // Newest PENDING match wins; an answered one binds nothing.
+                    watch.tracked_id = candidates
+                        .iter()
+                        .rev()
+                        .find(|(_, answered)| !answered)
+                        .map(|(id, _)| id.clone());
+                    watch.partial = partial;
+                    watch.offset = len;
+                    watch.identity = Some(identity);
+                }
+                Err(error) => {
+                    // LOUD and fail-closed: pretending to watch a transcript
+                    // that could not be read would silently swallow the
+                    // terminal answer; the log line is the difference
+                    // between "no fold happened" and "the watch was blind".
+                    eprintln!(
+                        "tinyctb approval-gate: transcript seed read failed for {} ({error}); \
+                         terminal-answer detection is OFF for this gate",
+                        path.display()
+                    );
+                    watch.transcript = None;
+                }
+            }
+        }
+        watch
+    }
+
+    /// Seed-phase line scan: collect matching tool_use candidates and mark
+    /// the ones whose tool_result is already present. No binding happens
+    /// here — the caller decides from the full picture.
+    fn scan_seed_line(&self, line: &[u8], candidates: &mut Vec<(String, bool)>) {
+        let text = String::from_utf8_lossy(line);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(trimmed) else {
+            return;
+        };
+        if entry.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            return;
+        }
+        let record_ts_ms = entry
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(crate::claude::transcript_timestamp_ms);
+        let Some(content) = entry.pointer("/message/content").and_then(Value::as_array) else {
+            return;
+        };
+        for item in content {
+            match item.get("type").and_then(Value::as_str) {
+                Some("tool_use") => {
+                    if self.matches_this_call(item, record_ts_ms) {
+                        if let Some(id) = item.get("id").and_then(Value::as_str) {
+                            if !candidates.iter().any(|(known, _)| known == id) {
+                                candidates.push((id.to_string(), false));
+                            }
+                        }
+                    }
+                }
+                Some("tool_result") => {
+                    if let Some(id) = item.get("tool_use_id").and_then(Value::as_str) {
+                        for (known, answered) in candidates.iter_mut() {
+                            if known == id {
+                                *answered = true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Is this tool_use item the call this gate is about? Name, input AND
+    /// recency must all agree.
+    fn matches_this_call(&self, item: &Value, record_ts_ms: Option<u64>) -> bool {
+        if item.get("name").and_then(Value::as_str) != Some(self.tool_name.as_str())
+            || item.get("input") != Some(&self.tool_input)
+        {
+            return false;
+        }
+        // No readable stamp: not adoptable. A guard that cannot date the
+        // record must not bind the gate's fate to it.
+        let Some(ts) = record_ts_ms else {
+            return false;
+        };
+        ts.abs_diff(self.gate_now_ms) <= TERMINAL_ANSWER_MATCH_WINDOW_MS
+    }
+
+    /// Feed one incremental transcript line. Adoption is once-only: the
+    /// first recent match binds an unbound gate, and the binding is final —
+    /// a later overlapping identical call must not steal a bound gate.
+    fn consume_line(&mut self, line: &[u8]) {
+        let text = String::from_utf8_lossy(line);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(trimmed) else {
+            return;
+        };
+        if entry.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            return;
+        }
+        let record_ts_ms = entry
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(crate::claude::transcript_timestamp_ms);
+        let Some(content) = entry.pointer("/message/content").and_then(Value::as_array) else {
+            return;
+        };
+        for item in content {
+            match item.get("type").and_then(Value::as_str) {
+                Some("tool_use") => {
+                    if self.matches_this_call(item, record_ts_ms) {
+                        if let Some(id) = item.get("id").and_then(Value::as_str) {
+                            if self.tracked_id.is_none() {
+                                self.tracked_id = Some(id.to_string());
+                                self.answered = false;
+                            }
+                        }
+                    }
+                }
+                Some("tool_result") => {
+                    if let (Some(id), Some(tracked)) = (
+                        item.get("tool_use_id").and_then(Value::as_str),
+                        self.tracked_id.as_deref(),
+                    ) {
+                        if id == tracked {
+                            self.answered = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Sticky once true: the tracked tool_use has its tool_result — set by
+    /// `consume_line` DIRECTLY in the increments (the seed only collects
+    /// candidates and binds a pending one; it never sets sticky state, so a
+    /// finished historic call cannot fold a fresh gate). Never inferred
+    /// from before/after set comparisons: a tool_use and its result
+    /// arriving in one batch left those empty-to-empty and the fold was
+    /// missed forever.
+    fn answered_in_terminal(&mut self) -> bool {
+        if self.answered {
+            return true;
+        }
+        let Some(path) = self.transcript.clone() else {
+            return false;
+        };
+        if self.last_checked.elapsed() < TERMINAL_ANSWER_CHECK_INTERVAL {
+            return false;
+        }
+        self.last_checked = std::time::Instant::now();
+
+        use std::io::{Read as _, Seek as _};
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            return false;
+        };
+        let Ok(meta) = file.metadata() else {
+            return false;
+        };
+        let len = meta.len();
+        let identity = Some(watch_file_identity(&meta));
+        if identity != self.identity || len < self.offset {
+            // Rotated or truncated: resync to the end. Bytes written during
+            // the gap are unseen — fail-closed, the watch just stops
+            // vouching for that window.
+            self.offset = len;
+            self.identity = identity;
+            self.partial.clear();
+            return false;
+        }
+        if len == self.offset {
+            return false;
+        }
+        if file.seek(std::io::SeekFrom::Start(self.offset)).is_err() {
+            return false;
+        }
+        let mut fresh = Vec::new();
+        let Ok(read) = file.read_to_end(&mut fresh) else {
+            return false;
+        };
+        self.offset += read as u64;
+        let mut buffer = std::mem::take(&mut self.partial);
+        buffer.extend_from_slice(&fresh);
+        let mut consumed = 0usize;
+        let mut complete = Vec::new();
+        for line in buffer.split_inclusive(|byte| *byte == b'\n') {
+            if !line.ends_with(b"\n") {
+                break;
+            }
+            consumed += line.len();
+            complete.push(line.to_vec());
+        }
+        self.partial = buffer[consumed..].to_vec();
+        for line in complete {
+            self.consume_line(&line);
+        }
+        self.answered
+    }
+}
 
 /// "No opinion": the normal permission flow decides. This is the answer for
 /// every path that is not an explicit remote allow/deny.
@@ -271,15 +622,28 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
     // one with away off (`/new`, or a Reply while present) — so its gate
     // must not depend on away at all.
     //
-    // `windowless` must precede the away shortcut below: a background
-    // session has no terminal dialog anyone can see, so away-off is not a
-    // reason to route the request there. Computing it after the shortcut
-    // meant a bg-pty session with away off fell straight into the trap this
-    // path exists to prevent.
+    // Away is the ONE declaration, for BACKGROUND sessions too. The window
+    // probe answers "how is this session hosted", not "is anyone watching":
+    // a task forked into the daemon's bg-pty-host stays "windowless" forever
+    // even while its parent session sits in an attended terminal whose task
+    // panel surfaces and answers its dialogs. Exempting such sessions from
+    // the away shortcut (the old rule) meant /back still pushed their
+    // questions to the phone — measured 2026-08-28, reported by the user as
+    // "back should behave as if tinyCTB were not running". With away off,
+    // EVERY interactive gate steps aside; a background task then waits in
+    // its own pty exactly as it would without tinyctb.
+    //
+    // The terminal-answer boundary is frozen FIRST — before the windowless
+    // `/proc` walk, before config and the database. Everything after this
+    // line takes time in which the concurrent terminal dialog can be
+    // answered, and an answer landing before the boundary would be
+    // invisible to the watch forever.
+    let mut terminal_watch =
+        (kind == GateKind::Interactive).then(|| TerminalAnswerWatch::new(payload, now));
     let session_window =
         (kind == GateKind::Interactive).then(crate::claude::current_session_window);
     let windowless = session_window == Some(crate::claude::SessionWindow::Background);
-    if kind == GateKind::Interactive && !windowless && !away_mode_active() {
+    if kind == GateKind::Interactive && !away_mode_active() {
         return Ok(no_opinion());
     }
     let tool_name = payload
@@ -418,9 +782,10 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
     // While away is on, EVERY gated call gets its buttons pushed to
     // Telegram, and they stay live for the whole hold — desktop activity
     // decides nothing (see the presence-removal note at the top of this
-    // file). Away OFF means the terminal owns it outright — that is the
-    // user saying they are here. Windowless sessions push either way: they
-    // have no terminal dialog anyone could see.
+    // file), and the terminal can answer its own concurrent dialog at any
+    // time (the watch above folds the phone side when it does). Away OFF
+    // means the terminal owns it outright, background sessions included —
+    // the away shortcut at the top of this function already returned.
 
     // Monotonic gate age for settle stamps — see `settle_stamp_ms`.
     let gate_clock = std::time::Instant::now();
@@ -450,17 +815,13 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
     // reminder that was missing. The overall budget matches the installed
     // hook timeout; past it the hook dies anyway and silence is honest.
     let renewal_deadline = std::time::Instant::now() + WINDOWLESS_APPROVAL_WAIT;
-    // The hold can now last hours (renewals), and while a hook blocks the
-    // TUI paints nothing but a spinner — so the terminal must be told what
-    // is waiting and that /back is the way to answer here. Same law, same
-    // paint machinery as the question gate.
+    // The hold can now last hours (renewals). The permission dialog itself
+    // renders concurrently with this hook and stays answerable, but WHY the
+    // session also has buttons on a phone deserves a line of its own — same
+    // law, same paint machinery as the question gate.
     let banner = QuestionBanner::for_session(windowless);
     let mut round: u32 = 0;
     loop {
-        // Round 0 keeps the bare id (the tool_use_id, so a hook re-run is
-        // idempotent); every renewal gets a fresh `:rN` so its Telegram
-        // message carries live buttons while the lapsed round's report as
-        // expired.
         // Round 0 keeps the bare id (the tool_use_id, so a hook re-run is
         // idempotent); every renewal gets a fresh `:rN` so its Telegram
         // message carries live buttons while the lapsed rounds report as
@@ -522,7 +883,7 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
         }
         if round == 0 {
             banner.paint_note(&format!(
-                "🔐 {tool_name} 等待 Telegram 审批（away 开启；要在终端作答请先 /back）"
+                "🔐 {tool_name} 等待审批：手机按钮或本终端对话框均可作答，先答先得"
             ));
         } else {
             banner.paint_note(&format!("🔁 审批续期第 {} 轮，手机按钮已更新", round + 1));
@@ -537,13 +898,13 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
             renewal_deadline,
             now,
             &gate_clock,
-            windowless,
+            terminal_watch.as_mut(),
         )? {
-            WindowOutcome::Settled(value) => {
-                banner.paint_note(if value == json!({}) {
-                    "↩ 已交还本终端，对话框即将弹出"
-                } else {
-                    "✔ 审批已由手机作答"
+            WindowOutcome::Settled(value, via) => {
+                banner.paint_note(match via {
+                    SettledVia::Decision => "✔ 审批已有决定（手机按钮或已录决定）",
+                    SettledVia::HandBack => "↩ 已交还本终端，对话框即将弹出",
+                    SettledVia::TerminalAnswer => "✔ 本终端对话框已作答，手机按钮已收回",
                 });
                 return Ok(value);
             }
@@ -584,12 +945,24 @@ fn gate_tool_call(payload: &Value, kind: GateKind, now: u64) -> Result<Value> {
 
 /// What one approval window came to.
 enum WindowOutcome {
-    /// The gate is finished: a decision was applied, or `/back` handed the
-    /// prompt to the terminal. The value is the hook's reply.
-    Settled(Value),
+    /// The gate is finished. The value is the hook's reply; `via` names the
+    /// exit so the banner can say what actually happened.
+    Settled(Value, SettledVia),
     /// The window expired with no answer anywhere. The caller decides
     /// whether that ends the gate or renews the request.
     Unanswered,
+}
+
+/// Which exit finished the gate — three genuinely different stories the
+/// terminal banner must not conflate.
+enum SettledVia {
+    /// A recorded decision (a phone tap, or a decision another actor wrote).
+    Decision,
+    /// `/back`: the user reclaimed the terminal; the dialog appears next.
+    HandBack,
+    /// The user answered the CONCURRENT terminal dialog; the phone side was
+    /// folded.
+    TerminalAnswer,
 }
 
 /// Poll out one approval window. Every early exit settles atomically — a tap
@@ -605,7 +978,7 @@ fn wait_out_approval_window(
     renewal_deadline: std::time::Instant,
     now: u64,
     gate_clock: &std::time::Instant,
-    windowless: bool,
+    mut terminal_watch: Option<&mut TerminalAnswerWatch>,
 ) -> Result<WindowOutcome> {
     let deadline = (std::time::Instant::now() + wait).min(renewal_deadline);
     while std::time::Instant::now() < deadline {
@@ -613,7 +986,7 @@ fn wait_out_approval_window(
         if let Some(decision) = approval_decision(conn, approval_id)? {
             if decision != "expired" {
                 return apply_decision(conn, kind, thread_id, tool_name, &decision, now)
-                    .map(WindowOutcome::Settled);
+                    .map(|value| WindowOutcome::Settled(value, SettledVia::Decision));
             }
             // Someone else closed this window — for a headless turn that is
             // `/stop` sweeping the dialogs the turn owns. Polling out the
@@ -621,10 +994,13 @@ fn wait_out_approval_window(
             // for a turn the user already ended; the honest ending is the
             // same one a timeout reaches, now.
             if kind == GateKind::Headless {
-                return Ok(WindowOutcome::Settled(kind.deny(&format!(
-                    "this approval was closed by the bridge (the turn is being \
-                     stopped), so {tool_name} was not run. Do not retry; stop."
-                ))));
+                return Ok(WindowOutcome::Settled(
+                    kind.deny(&format!(
+                        "this approval was closed by the bridge (the turn is being \
+                         stopped), so {tool_name} was not run. Do not retry; stop."
+                    )),
+                    SettledVia::Decision,
+                ));
             }
         }
         // The ONE hand-back: the user declared themselves back (`/back`
@@ -637,18 +1013,59 @@ fn wait_out_approval_window(
         // activity is not a declaration; away is. Settling stays atomic —
         // a tap that already landed still wins.
         //
-        // A windowless session is excluded on purpose: there is no terminal
-        // dialog to hand anything to, so the phone stays the only channel
-        // that can answer while the tool blocks regardless.
-        if kind == GateKind::Interactive && !windowless && !away_mode_active() {
-            return match crate::state::expire_or_take_decision(
+        // Background sessions hand back the same way: their dialog renders
+        // on the bg pty and the parent session's task panel surfaces it —
+        // away off means the terminal side owns everything (measured
+        // 2026-08-28: exempting them here kept pushing questions to the
+        // phone after /back).
+        if kind == GateKind::Interactive && !away_mode_active() {
+            // Settle AND withdraw the queued push in one step: approval
+            // pushes ride origin="bridge", which the /back sweep leaves
+            // alone by design, so an unsent retry would still reach the
+            // phone after away turned off — the very silence /back declares.
+            return match crate::state::settle_expired_and_cancel_push(
                 conn,
                 approval_id,
                 settle_stamp_ms(now, gate_clock.elapsed()),
             )? {
-                Some(decision) => apply_decision(conn, kind, thread_id, tool_name, &decision, now)
-                    .map(WindowOutcome::Settled),
-                None => Ok(WindowOutcome::Settled(no_opinion())),
+                crate::state::SettleOutcome::Answered => {
+                    let decision = crate::state::approval_decision(conn, approval_id)?
+                        .unwrap_or_else(|| "expired".to_string());
+                    apply_decision(conn, kind, thread_id, tool_name, &decision, now)
+                        .map(|value| WindowOutcome::Settled(value, SettledVia::Decision))
+                }
+                crate::state::SettleOutcome::Expired => {
+                    Ok(WindowOutcome::Settled(no_opinion(), SettledVia::HandBack))
+                }
+            };
+        }
+        // The user answered the CONCURRENT terminal dialog (it renders while
+        // this hook blocks — re-verified 2026-08-28). The call is decided;
+        // holding (and renewing) its phone buttons would ship dead buttons
+        // for a command that already ran. Settling is atomic with any
+        // in-flight tap, and cancelling the unsent push rides the same
+        // transaction. INTERACTIVE ONLY: under `bypassPermissions` a
+        // headless turn reads `{}` as "nobody objected" and runs the tool.
+        if kind == GateKind::Interactive
+            && terminal_watch
+                .as_deref_mut()
+                .is_some_and(TerminalAnswerWatch::answered_in_terminal)
+        {
+            return match crate::state::settle_expired_and_cancel_push(
+                conn,
+                approval_id,
+                settle_stamp_ms(now, gate_clock.elapsed()),
+            )? {
+                crate::state::SettleOutcome::Answered => {
+                    let decision = crate::state::approval_decision(conn, approval_id)?
+                        .unwrap_or_else(|| "expired".to_string());
+                    apply_decision(conn, kind, thread_id, tool_name, &decision, now)
+                        .map(|value| WindowOutcome::Settled(value, SettledVia::Decision))
+                }
+                crate::state::SettleOutcome::Expired => Ok(WindowOutcome::Settled(
+                    no_opinion(),
+                    SettledVia::TerminalAnswer,
+                )),
             };
         }
     }
@@ -662,7 +1079,7 @@ fn wait_out_approval_window(
         settle_stamp_ms(now, gate_clock.elapsed()),
     )? {
         Some(decision) => apply_decision(conn, kind, thread_id, tool_name, &decision, now)
-            .map(WindowOutcome::Settled),
+            .map(|value| WindowOutcome::Settled(value, SettledVia::Decision)),
         // Nobody answered anywhere. Whether that ends the gate or renews the
         // request is the caller's ruling, not this window's.
         None => Ok(WindowOutcome::Unanswered),
@@ -692,11 +1109,12 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     let payload: Value =
         serde_json::from_str(raw.trim()).context("PreToolUse payload is not valid JSON")?;
 
-    // Same ordering rule as the approval gate: a windowless session is not
-    // covered by the away shortcut (its terminal dialog is invisible).
+    // Same rule as the approval gate: away is the one declaration, for
+    // background sessions too (see the note there — the window probe
+    // measures hosting, not attendance).
     let session_window = crate::claude::current_session_window();
     let windowless = session_window == crate::claude::SessionWindow::Background;
-    if !windowless && !away_mode_active() {
+    if !away_mode_active() {
         return Ok(no_opinion());
     }
     if payload.get("tool_name").and_then(Value::as_str) != Some("AskUserQuestion") {
@@ -771,9 +1189,9 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     };
     // Same rule as the approval gate: away on means the question is pushed
     // to Telegram and its buttons stay live for the whole hold — desktop
-    // activity decides nothing. Away off means the terminal owns it, and a
-    // windowless background session has no terminal dialog to own it so it
-    // asks remotely either way.
+    // activity decides nothing. Away off means the terminal owns it,
+    // background sessions included (the away shortcut at the top of this
+    // function already returned).
 
     // Monotonic gate age for settle stamps — see `settle_stamp_ms`.
     let gate_clock = std::time::Instant::now();
@@ -828,9 +1246,10 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     });
     enqueue_outbound_event(&conn, &event, now, "bridge")?;
     // The push exists; now make the wait VISIBLE where the user's law says
-    // it must be — in the terminal. Claude Code paints nothing for a
-    // question blocked behind this hook, so the banner is the only trace a
-    // person at the screen gets that anything is waiting.
+    // it must be — in the terminal. `PreToolUse` (unlike the permission
+    // hook) renders nothing while it blocks — spinner only, verified
+    // 2026-08-22 — so the banner is the only trace a person at the screen
+    // gets that anything is waiting, and /back is their answer path.
     let banner = QuestionBanner::for_session(windowless);
     banner.paint_question(&question_text, &options, multi_select);
     let phone_answered = |answer: &str| {
@@ -838,7 +1257,6 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         banner.paint_note(&format!("✔ 已由手机作答：{resolved}"));
         answered(&questions, &question_raw, &resolved)
     };
-
     let deadline = std::time::Instant::now() + wait;
     while std::time::Instant::now() < deadline {
         std::thread::sleep(POLL_INTERVAL);
@@ -847,13 +1265,17 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
                 return Ok(phone_answered(&answer));
             }
         }
-        // The ONE hand-back: `/back` turned away off. Keyboard activity no
-        // longer releases anything (the user's law, 2026-08-27: away on
-        // means both channels stay live and the first answer wins), so the
-        // exit honours any answer that raced in first and only then hands
-        // the dialog to the terminal.
-        if !windowless && !away_mode_active() {
-            return match crate::state::expire_or_take_answer(
+        // The ONE hand-back: `/back` turned away off. A per-session
+        // keypress reclaim was tried and is OFF THE TABLE for lack of a
+        // signal: the pts atime does not move on real keyboard reads
+        // (devpts probe, 2026-08-28) and typed bytes never queue in the
+        // kernel (FIONREAD probe, same day — the TUI drains stdin even
+        // while the hook blocks). The one signal that exists is the desktop
+        // keyboard, and a global keystroke killing every session's buttons
+        // is the exact bug the user outlawed. The exit honours any answer
+        // that raced in first.
+        if !away_mode_active() {
+            return match crate::state::settle_expired_question_and_cancel_push(
                 &conn,
                 &question_id,
                 settle_stamp_ms(now, gate_clock.elapsed()),
@@ -866,7 +1288,7 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
             };
         }
     }
-    match crate::state::expire_or_take_answer(
+    match crate::state::settle_expired_question_and_cancel_push(
         &conn,
         &question_id,
         settle_stamp_ms(now, gate_clock.elapsed()),
@@ -2326,7 +2748,8 @@ mod tests {
             format!(
                 "{}\n{}\n",
                 json!({"type": "user", "message": {"role": "user", "content": "go"}}),
-                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                json!({"type": "assistant", "timestamp": "1970-01-01T00:00:01.000Z",
+                       "message": {"role": "assistant", "content": [
                     {"type": "tool_use", "id": "toolu_probe", "name": "Bash",
                      "input": {"command": "rm -rf build/"}}
                 ]}})
@@ -2394,7 +2817,8 @@ mod tests {
             format!(
                 "{}\n{}\n",
                 json!({"type": "user", "message": {"role": "user", "content": "go"}}),
-                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                json!({"type": "assistant", "timestamp": "1970-01-01T00:00:01.000Z",
+                       "message": {"role": "assistant", "content": [
                     {"type": "tool_use", "id": "toolu_probe", "name": "Bash",
                      "input": {"command": "rm -rf build/"}}
                 ]}})
@@ -2421,6 +2845,17 @@ mod tests {
                         "{}",
                         json!({"type": "assistant", "message": {"role": "assistant",
                                 "content": [{"type": "text", "text": format!("chatter {i}")}]}})
+                    )
+                    .expect("write");
+                    // A tool_result for a DIFFERENT call must be as inert as
+                    // chatter: only THIS call's result may fold the gate.
+                    writeln!(
+                        file,
+                        "{}",
+                        json!({"type": "user", "message": {"role": "user",
+                                "content": [{"type": "tool_result",
+                                             "tool_use_id": format!("toolu_other_{i}"),
+                                             "content": "done"}]}})
                     )
                     .expect("write");
                 }
@@ -2459,6 +2894,301 @@ mod tests {
             result["hookSpecificOutput"]["decision"]["behavior"], "allow",
             "transcript growth must not close the gate; only the tap decides: {result}"
         );
+    }
+
+    /// A RECENT but already-COMPLETED identical call in the seed must not
+    /// fold a fresh gate: the reviewer's repro was a call finishing well
+    /// inside the ±120s window (here stamped 300-500ms before the gate)
+    /// while the current call's PermissionRequest starts before its own
+    /// tool_use flushes. The seed must bind only PENDING candidates, so the
+    /// gate stays live and the phone tap remains the decider.
+    #[test]
+    fn a_recent_completed_call_in_the_seed_does_not_fold_a_fresh_gate() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("seed-completed", true, 120);
+        let transcript = std::env::temp_dir().join(format!(
+            "tinyctb-seed-completed-{}.jsonl",
+            std::process::id()
+        ));
+        // 30 "seconds" before the gate's now=1000ms — within the ±120s
+        // window, so only the pending-only rule keeps it from binding.
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                json!({"type": "assistant", "timestamp": "1970-01-01T00:00:00.500Z",
+                       "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_old", "name": "Bash",
+                     "input": {"command": "rm -rf build/"}}
+                ]}}),
+                json!({"type": "user", "timestamp": "1970-01-01T00:00:00.700Z",
+                       "message": {"role": "user",
+                        "content": [{"type": "tool_result",
+                                     "tool_use_id": "toolu_old",
+                                     "content": "done earlier"}]}})
+            ),
+        )
+        .expect("seed transcript");
+        let mut payload = bash_payload();
+        payload["transcript_path"] = json!(transcript.display().to_string());
+
+        let tapper = std::thread::spawn(|| {
+            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                // The row must still be LIVE well past the first poll — an
+                // early fold would have settled it to expired already.
+                std::thread::sleep(Duration::from_millis(100));
+                if let Ok(id) = conn.query_row(
+                    "SELECT approval_id FROM pending_approvals WHERE decision IS NULL",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) {
+                    std::thread::sleep(Duration::from_millis(2500));
+                    match record_approval_decision(&conn, &id, "allow", 9000).expect("tap") {
+                        crate::state::ApprovalAnswer::Recorded => return,
+                        other => panic!(
+                            "the old call's result must not have settled the fresh gate: {other:?}"
+                        ),
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "approval row never appeared"
+                );
+            }
+        });
+        let result = gate_with_timeout(payload, Duration::from_secs(60));
+        tapper.join().expect("tapper");
+        let _ = fs::remove_file(&transcript);
+        assert_eq!(
+            result["hookSpecificOutput"]["decision"]["behavior"], "allow",
+            "the phone tap must decide it; a 30s-old identical call must not: {result}"
+        );
+    }
+
+    /// Several PENDING matching candidates in the seed: the NEWEST is the
+    /// bound one. The older sibling's result must not fold the gate; the
+    /// newest's must.
+    #[test]
+    fn the_newest_of_several_pending_candidates_is_bound() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("seed-newest", true, 120);
+        let transcript =
+            std::env::temp_dir().join(format!("tinyctb-seed-newest-{}.jsonl", std::process::id()));
+        let tool_use = |id: &str, ts: &str| {
+            json!({"type": "assistant", "timestamp": ts,
+                   "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": id, "name": "Bash",
+                 "input": {"command": "rm -rf build/"}}
+            ]}})
+        };
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                tool_use("toolu_older", "1970-01-01T00:00:00.400Z"),
+                tool_use("toolu_newest", "1970-01-01T00:00:00.900Z"),
+            ),
+        )
+        .expect("seed transcript");
+        let mut payload = bash_payload();
+        payload["transcript_path"] = json!(transcript.display().to_string());
+
+        let writer = {
+            let transcript = transcript.clone();
+            std::thread::spawn(move || {
+                use std::io::Write as _;
+                let append = |value: Value| {
+                    let mut file = fs::OpenOptions::new()
+                        .append(true)
+                        .open(&transcript)
+                        .expect("append");
+                    writeln!(file, "{value}").expect("write");
+                };
+                std::thread::sleep(Duration::from_millis(1500));
+                // The OLDER sibling finishes: must not fold the gate.
+                append(json!({"type": "user", "message": {"role": "user",
+                        "content": [{"type": "tool_result",
+                                     "tool_use_id": "toolu_older",
+                                     "content": "older done"}]}}));
+                std::thread::sleep(Duration::from_millis(2500));
+                {
+                    let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+                    let live: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM pending_approvals WHERE decision IS NULL",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .expect("count");
+                    assert_eq!(live, 1, "the older sibling's result must not fold the gate");
+                }
+                // The NEWEST (the bound one) finishes: folds.
+                append(json!({"type": "user", "message": {"role": "user",
+                        "content": [{"type": "tool_result",
+                                     "tool_use_id": "toolu_newest",
+                                     "content": "newest done"}]}}));
+            })
+        };
+        let result = gate_with_timeout(payload, Duration::from_secs(60));
+        writer.join().expect("writer");
+        let _ = fs::remove_file(&transcript);
+        assert_eq!(result, json!({}), "the newest candidate's answer folds it");
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let decision: Option<String> = conn
+            .query_row("SELECT decision FROM pending_approvals", [], |row| {
+                row.get(0)
+            })
+            .expect("row");
+        assert_eq!(decision.as_deref(), Some("expired"), "row settled");
+    }
+
+    /// An EMPTY seed (the call's tool_use not flushed when the hook fires):
+    /// the increments adopt the first recent match and its result folds the
+    /// gate.
+    #[test]
+    fn an_empty_seed_adopts_from_increments_and_folds() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("seed-empty", true, 120);
+        let transcript =
+            std::env::temp_dir().join(format!("tinyctb-seed-empty-{}.jsonl", std::process::id()));
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                json!({"type": "user", "message": {"role": "user", "content": "go"}})
+            ),
+        )
+        .expect("seed transcript");
+        let mut payload = bash_payload();
+        payload["transcript_path"] = json!(transcript.display().to_string());
+
+        let writer = {
+            let transcript = transcript.clone();
+            std::thread::spawn(move || {
+                use std::io::Write as _;
+                std::thread::sleep(Duration::from_millis(1500));
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&transcript)
+                    .expect("append");
+                // The tool_use flushes late, then its result lands.
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"type": "assistant", "timestamp": "1970-01-01T00:00:01.200Z",
+                           "message": {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "toolu_late", "name": "Bash",
+                         "input": {"command": "rm -rf build/"}}
+                    ]}})
+                )
+                .expect("write");
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"type": "user", "message": {"role": "user",
+                            "content": [{"type": "tool_result",
+                                         "tool_use_id": "toolu_late",
+                                         "content": "done"}]}})
+                )
+                .expect("write");
+            })
+        };
+        let started = std::time::Instant::now();
+        let result = gate_with_timeout(payload, Duration::from_secs(60));
+        writer.join().expect("writer");
+        let _ = fs::remove_file(&transcript);
+        assert_eq!(result, json!({}), "the late-adopted answer folds it");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the fold must come from the increments, not a window timeout: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The terminal's permission dialog renders CONCURRENTLY with the
+    /// blocking hook (re-verified 2026-08-28 under a pty capture), so the
+    /// user can answer it there while the phone holds buttons. When THIS
+    /// call's tool_result lands in the transcript, the gate must fold the
+    /// phone side — settle the row and withdraw its queued push — instead of
+    /// holding (and renewing) dead buttons for a command that already ran.
+    #[test]
+    fn an_answer_at_the_concurrent_dialog_folds_the_phone_side() {
+        let _guard = crate::state::test_env_lock();
+        let _env = GateEnv::new("terminal-answer", true, 120);
+        let transcript = std::env::temp_dir().join(format!(
+            "tinyctb-terminal-answer-{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                json!({"type": "user", "message": {"role": "user", "content": "go"}}),
+                json!({"type": "assistant", "timestamp": "1970-01-01T00:00:01.000Z",
+                       "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_probe", "name": "Bash",
+                     "input": {"command": "rm -rf build/"}}
+                ]}})
+            ),
+        )
+        .expect("seed transcript");
+        let mut payload = bash_payload();
+        payload["transcript_path"] = json!(transcript.display().to_string());
+
+        let writer = {
+            let transcript = transcript.clone();
+            std::thread::spawn(move || {
+                use std::io::Write as _;
+                std::thread::sleep(Duration::from_millis(1500));
+                // The user answers the terminal dialog; the tool runs and
+                // its result lands in the transcript.
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&transcript)
+                    .expect("append");
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"type": "user", "message": {"role": "user",
+                            "content": [{"type": "tool_result",
+                                         "tool_use_id": "toolu_probe",
+                                         "content": "removed"}]}})
+                )
+                .expect("write");
+            })
+        };
+        let started = std::time::Instant::now();
+        let result = gate_with_timeout(payload, Duration::from_secs(60));
+        writer.join().expect("writer");
+        let _ = fs::remove_file(&transcript);
+
+        assert_eq!(result, json!({}), "the terminal already decided it");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the gate must fold on the tool_result, not sit out its window: {:?}",
+            started.elapsed()
+        );
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let decision: Option<String> = conn
+            .query_row("SELECT decision FROM pending_approvals", [], |row| {
+                row.get(0)
+            })
+            .expect("row");
+        assert_eq!(
+            decision.as_deref(),
+            Some("expired"),
+            "the row must settle so /threads stops offering a dead button"
+        );
+        let stale_pushes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_events WHERE status IN ('pending', 'failed')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(stale_pushes, 0, "the queued push must be withdrawn");
     }
 
     /// An interrupted gate leaves its row un-decided with a lapsed
@@ -2662,83 +3392,44 @@ mod tests {
         );
     }
 
-    /// away OFF hands the dialog to the terminal — but a windowless session
-    /// has no terminal anyone is looking at, so the shortcut must not apply
-    /// to it. Both gates.
+    /// away OFF silences BACKGROUND sessions too. The window probe answers
+    /// "how is this session hosted", not "is anyone watching": a task forked
+    /// into the daemon's bg-pty-host is answerable through its parent
+    /// session's task panel, so with away off it must wait in its own pty
+    /// exactly as it would without tinyctb — no row minted, no push, for
+    /// both gates. (The old rule exempted background sessions from the away
+    /// shortcut; measured 2026-08-28, /back still pushed a background
+    /// task's question to the phone and the user rightly called it a bug.)
     #[test]
-    fn windowless_sessions_ask_remotely_even_with_away_off() {
+    fn background_sessions_go_silent_with_away_off_too() {
         let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("windowless-away-off", false, 5);
         std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
-        // A windowless gate waits a DAY (the configured 5s never applies),
-        // and with the transcript watcher gone the ONLY thing that ends the
-        // wait is the phone. Each half is answered there — which is itself
-        // the point: away off must not stop a windowless session from being
-        // answerable remotely.
-        let approval_tap = std::thread::spawn(|| {
-            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
-            loop {
-                if let Ok(id) = conn.query_row(
-                    "SELECT approval_id FROM pending_approvals WHERE decision IS NULL",
-                    [],
-                    |row| row.get::<_, String>(0),
-                ) {
-                    if matches!(
-                        crate::state::record_approval_decision(&conn, &id, "deny", 2000),
-                        Ok(crate::state::ApprovalAnswer::Recorded)
-                    ) {
-                        return;
-                    }
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "approval row never appeared"
-                );
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        });
-        let approval = {
-            let mut reader = std::io::Cursor::new(bash_payload().to_string());
-            run_approval_gate(&mut reader, 1000).expect("gate")
-        };
-        approval_tap.join().expect("approval tap");
-        assert_eq!(
-            approval["hookSpecificOutput"]["decision"]["behavior"], "deny",
-            "a windowless approval must be raised AND answerable remotely even with away \
-             off: {approval}"
-        );
 
-        let question_answerer = std::thread::spawn(|| {
-            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
-            loop {
-                if let Ok(id) = conn.query_row(
-                    "SELECT question_id FROM pending_questions WHERE answer IS NULL",
-                    [],
-                    |row| row.get::<_, String>(0),
-                ) {
-                    if matches!(
-                        crate::state::record_question_answer(&conn, &id, "SQLite", 2000),
-                        Ok(crate::state::ApprovalAnswer::Recorded)
-                    ) {
-                        return;
-                    }
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "question row never appeared"
-                );
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        });
+        let started = std::time::Instant::now();
+        let approval = gate(bash_payload());
         let question = question_gate(question_payload());
-        question_answerer.join().expect("question answerer");
         std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "0");
+        assert_eq!(approval, json!({}), "the terminal side owns it");
+        assert_eq!(question, json!({}), "the terminal side owns it");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "away off must step aside immediately, not wait any window: {:?}",
+            started.elapsed()
+        );
+        let conn = create_state_db(&state_db_path().expect("path")).expect("db");
+        let minted: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM pending_approvals)
+                      + (SELECT COUNT(*) FROM pending_questions)
+                      + (SELECT COUNT(*) FROM outbound_events)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
         assert_eq!(
-            question["hookSpecificOutput"]["hookEventName"], "PreToolUse",
-            "a windowless question must be raised AND answerable remotely even with away \
-             off: {question}"
+            minted, 0,
+            "away off must mint no rows and push nothing, background or not"
         );
     }
 
@@ -2924,8 +3615,9 @@ mod tests {
         assert_eq!(decision.as_deref(), Some("expired"));
         assert_eq!(
             crate::state::pending_outbound_count(&conn).expect("pending"),
-            1,
-            "Telegram was offered the window first"
+            0,
+            "the hand-back must withdraw the queued push — an unsent retry \
+             delivering after /back would break the silence /back declares"
         );
     }
 

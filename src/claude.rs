@@ -522,7 +522,7 @@ const TRANSCRIPT_SUMMARY_CACHE_MAX: usize = 128;
 /// Strict and UTC-only on purpose. One known producer writes these, and a
 /// lenient parser that guessed at other shapes would put a WRONG time into
 /// the ordering — worse than the `None` that falls back to the file mtime.
-fn transcript_timestamp_ms(raw: &str) -> Option<u64> {
+pub(crate) fn transcript_timestamp_ms(raw: &str) -> Option<u64> {
     fn fixed_width_number(raw: &str, width: usize) -> Option<i64> {
         // Fixed width and digits only: `2026-8-2T1:2:3Z` is not the shape
         // this claims to read, and a `-` slipping into a component would
