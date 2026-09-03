@@ -350,7 +350,7 @@ fn with_attach_pty<T>(session_id: &str, drive: impl FnOnce(RawFd) -> Result<T>) 
     // a `CString` allocation, or the PATH search `execvp` does — can deadlock
     // on an allocator lock some other thread was holding at fork time. So
     // resolve the program to an absolute path now and hand the child a ready
-    // argv it only has to `execv`.
+    // argv AND envp it only has to `execve`.
     let prog = std::ffi::CString::new(resolve_program(&attach_program())?)
         .map_err(|_| anyhow!("attach program path has an interior NUL"))?;
     let arg_attach = std::ffi::CString::new("attach").expect("literal has no NUL");
@@ -454,9 +454,9 @@ fn attach_program() -> String {
 }
 
 /// Resolve a program name to an absolute path in the PARENT (allocation is
-/// fine here), so the forked child can `execv` with no PATH search. A name
+/// fine here), so the forked child can `execve` with no PATH search. A name
 /// that already contains a slash is taken as-is; an unresolved bare name is
-/// returned unchanged so `execv` fails loudly into `_exit(127)`.
+/// returned unchanged so `execve` fails loudly into `_exit(127)`.
 fn resolve_program(name: &str) -> Result<String> {
     // The attach client IS claude, so honour tinyCTB's authoritative resolver
     // (CLAUDE_BIN override, then discovery) — the same binary the rest of the
