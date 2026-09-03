@@ -3511,6 +3511,12 @@ pub(crate) fn approval_standing(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ApprovalAnswer {
     Recorded,
+    /// The keys were DELIVERED to a released fork's live native dialog, but this
+    /// path recorded NOTHING — the PostToolUse "answered" hook records the fork's
+    /// own result. Distinct from `Recorded` so the callback audit does not claim
+    /// a DB write that did not happen here (the button is still consumed: that is
+    /// driven by `retryable = false`, not by this being `Recorded`).
+    Delivered,
     AlreadyAnswered,
     Expired,
     Unknown,
@@ -3915,38 +3921,6 @@ pub(crate) fn record_question_answer(
     })
 }
 
-/// Record a POSITIVELY-injected phone answer for a native-attach question,
-/// OVERWRITING the "answered elsewhere" soft-settle if the PostToolUse hook
-/// raced in between our Enter and here. The fork provably took the phone's
-/// option, so the real option must win over the sentinel — otherwise the audit
-/// and `/threads` would show `\0elsewhere` instead of what was chosen. A real
-/// answer already present, or the expired sentinel, is left as-is.
-pub(crate) fn record_native_answer(
-    conn: &Connection,
-    question_id: &str,
-    answer: &str,
-    now: u64,
-) -> Result<ApprovalAnswer> {
-    let changed = conn.execute(
-        "UPDATE pending_questions SET answer = ?2, answered_at = ?3
-         WHERE question_id = ?1 AND (answer IS NULL OR answer = ?4)",
-        params![
-            question_id,
-            answer,
-            to_sql_i64(now)?,
-            QUESTION_ANSWERED_ELSEWHERE
-        ],
-    )?;
-    if changed > 0 {
-        return Ok(ApprovalAnswer::Recorded);
-    }
-    Ok(match question_answer(conn, question_id)?.as_deref() {
-        Some(QUESTION_EXPIRED) => ApprovalAnswer::Expired,
-        Some(_) => ApprovalAnswer::AlreadyAnswered,
-        None => ApprovalAnswer::Unknown,
-    })
-}
-
 /// Sentinel stored in `answer` for a question nobody answered in time.
 pub(crate) const QUESTION_EXPIRED: &str = "\u{0}expired";
 
@@ -4017,6 +3991,75 @@ pub(crate) fn settle_open_native_questions_for_session(
         "UPDATE pending_questions SET answer = ?2, answered_at = ?3
          WHERE thread_id = ?1 AND answer IS NULL AND native_attach = 1",
         params![thread_id, QUESTION_ANSWERED_ELSEWHERE, to_sql_i64(now)?],
+    )?;
+    Ok(changed)
+}
+
+/// The PostToolUse "answered" hook's AUTHORITATIVE record. `answers` is the
+/// fork's OWN result — `tool_response.answers`, each entry (question text →
+/// the option the fork actually returned). The key equals this row's stored
+/// `question` verbatim (verified on-machine 2026-09-03 for a phone-inject AND a
+/// local-keyboard answer alike), so we write the real answer onto the matching
+/// native row. Recording the fork's own result — instead of scraping the pty to
+/// GUESS which surface closed the dialog — is what removes the causality gap:
+/// whoever won the "谁先抢答" race, the row ends up with what the fork truly
+/// took. It fills ONLY the still-OPEN row (`answer IS NULL`, see the SQL), so it
+/// never overwrites an already-recorded answer (an earlier identical question's
+/// audit), a settled row, or an EXPIRED row. Any native rows still open
+/// afterwards are STALE leftovers (missed answer events) and are closed
+/// anonymously via [`settle_open_native_questions_for_session`]. Returns how
+/// many rows it wrote or closed.
+pub(crate) fn record_native_answers_from_hook(
+    conn: &Connection,
+    thread_id: &str,
+    answers: &[(String, String)],
+    now: u64,
+) -> Result<usize> {
+    let mut touched = 0;
+    for (question, answer) in answers {
+        // Fill ONLY the still-OPEN row for this question (`answer IS NULL`). A
+        // fork blocks on one question at a time and the gate settles older open
+        // native rows when it opens a new one (`settle_stale_native_questions`),
+        // so at most one OPEN native row carries this text — the one just
+        // answered. Matching `answer IS NULL` therefore records onto that row
+        // WITHOUT overwriting an already-recorded answer for the same text (an
+        // earlier identical question's audit row), nor a settled/expired row.
+        touched += conn.execute(
+            "UPDATE pending_questions SET answer = ?3, answered_at = ?4
+             WHERE thread_id = ?1 AND question = ?2 AND native_attach = 1
+               AND answer IS NULL",
+            params![thread_id, question, answer, to_sql_i64(now)?],
+        )?;
+    }
+    // Any native rows still open afterwards had no matching answer in this
+    // completion (stale leftovers); close them anonymously.
+    touched += settle_open_native_questions_for_session(conn, thread_id, now)?;
+    Ok(touched)
+}
+
+/// Settle every OPEN native question for `thread_id` EXCEPT `keep_question_id` —
+/// what the gate does the instant it opens a NEW native question for a fork. A
+/// fork blocks on one question at a time, so any OLDER open native row is STALE
+/// (its own answer event was missed, or it was superseded). Closing it now means
+/// its phone button reads `Answered` and BAILS, instead of injecting an old
+/// option's number into the current — or a later — dialog (the stale-button
+/// blocker). Conditional on `answer IS NULL`, so it never overwrites a real
+/// recorded answer. Returns how many rows it closed.
+pub(crate) fn settle_stale_native_questions(
+    conn: &Connection,
+    thread_id: &str,
+    keep_question_id: &str,
+    now: u64,
+) -> Result<usize> {
+    let changed = conn.execute(
+        "UPDATE pending_questions SET answer = ?2, answered_at = ?3
+         WHERE thread_id = ?1 AND question_id != ?4 AND answer IS NULL AND native_attach = 1",
+        params![
+            thread_id,
+            QUESTION_ANSWERED_ELSEWHERE,
+            to_sql_i64(now)?,
+            keep_question_id
+        ],
     )?;
     Ok(changed)
 }

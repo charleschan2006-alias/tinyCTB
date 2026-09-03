@@ -56,6 +56,12 @@ pub(crate) fn option_keystrokes(index: usize) -> Vec<u8> {
 
 /// The `gnome-terminal` argv that opens the fork's native dialog in a
 /// window. Pure, so the wiring is testable without a display.
+///
+/// `claude attach` takes the SHORT 8-char job id (what `claude agents` prints as
+/// `id`), NOT the full session UUID — passing the full UUID fails with "No job
+/// matching …" and the attach exits immediately (the on-machine cause of both
+/// the "flashing" local window and the phone-inject "no chrome" failure). So the
+/// attach argument is `short_id(session_id)`.
 pub(crate) fn attach_window_argv(session_id: &str, claude_bin: &str) -> Vec<String> {
     vec![
         "--title".to_string(),
@@ -63,7 +69,7 @@ pub(crate) fn attach_window_argv(session_id: &str, claude_bin: &str) -> Vec<Stri
         "--".to_string(),
         claude_bin.to_string(),
         "attach".to_string(),
-        session_id.to_string(),
+        short_id(session_id),
     ]
 }
 
@@ -127,10 +133,15 @@ pub(crate) fn pop_attach_window(session_id: &str) -> Result<()> {
 
 // ---- the headless phone-side injection ------------------------------------
 
-/// How long to let `claude attach` connect and the fork's dialog render
-/// before injecting, and how long to hold the pty afterwards so the keys
-/// are consumed.
-const ATTACH_CONNECT_WAIT: Duration = Duration::from_secs(4);
+/// How long to WAIT for `claude attach` to connect and the fork's dialog to
+/// render before giving up, and how long to read the fork's next state after
+/// the Enter. The connect budget is a CEILING, not a fixed sleep — the presence
+/// check returns the instant the dialog's chrome appears (see `wait_for_chrome`),
+/// so a generous ceiling only bounds a dialog that never shows. It is generous
+/// because the real `claude attach` can take a second or more to paint (proven
+/// on-machine 2026-09-03: the chrome surfaced ~2s after connect), and a check
+/// that raced that render was the 0.2.11 phone-inject failure.
+const ATTACH_CONNECT_WAIT: Duration = Duration::from_secs(8);
 const ATTACH_SETTLE_WAIT: Duration = Duration::from_secs(3);
 
 /// The selector's own footer hint, drawn ONLY while an AskUserQuestion dialog
@@ -150,7 +161,9 @@ const SELECTOR_CHROME: &[u8] = b"Enter to select";
 const SELECTOR_KEY_GAP: Duration = Duration::from_millis(200);
 
 /// The default (connect, settle) waits — overridable in tests so a stub
-/// attach need not burn the real seven seconds.
+/// attach need not burn the real seconds (up to an 8s connect ceiling plus a
+/// 3s settle). The connect value is a CEILING: `wait_for_chrome` returns the
+/// instant the dialog appears, so a live dialog costs only its render time.
 fn default_waits() -> (Duration, Duration) {
     #[cfg(test)]
     if let Ok(ms) = std::env::var("TINYCTB_TEST_ATTACH_WAIT_MS") {
@@ -163,31 +176,37 @@ fn default_waits() -> (Duration, Duration) {
 /// What an injection attempt did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InjectOutcome {
-    /// POSITIVE delivery: the selector was live right up to the Enter, and it
-    /// then CLOSED — strong evidence the fork consumed the number. Only this
-    /// finalises the row on the phone side.
-    Injected,
-    /// The answer could NOT be positively delivered: the selector was not
-    /// found on the current screen, it did not close after the Enter, or the
-    /// attach never rendered / failed. Whether the dialog was already answered
-    /// at the keyboard, is still connecting, or errored, the phone cannot tell
-    /// them apart over a pty — so it claims NOTHING here (no record, no
-    /// settle), reports it as retryable, and lets the authoritative
-    /// PostToolUse hook close the row when the fork's answer actually lands.
+    /// The keystrokes were put in front of a LIVE dialog: the selector chrome was
+    /// present, and the option number + Enter were written to it. This does NOT
+    /// claim the fork RECORDED them — the PostToolUse "answered" hook records the
+    /// fork's OWN result authoritatively when the turn completes (whichever
+    /// surface won the "谁先抢答" race, and exactly what it chose). It only says
+    /// "delivered to a live dialog", so the phone button is consumed and need not
+    /// retry. This is what lets the inject side stop scraping the pty to GUESS the
+    /// outcome — the guess (and its unrecoverable false-positive) is gone.
+    Delivered,
+    /// The dialog was never found: the selector chrome did not appear within the
+    /// budget (already answered/closed, still connecting, or the attach failed).
+    /// NOTHING was typed. The phone reports this as retryable and records nothing;
+    /// the row stays open for another surface, and the hook settles it if an
+    /// answer lands, else it expires.
     Unreachable,
 }
 
 /// Answer a background fork's native single-select dialog by option index,
-/// but — when `verify_present` — ONLY if the selector is still showing, the
+/// but — when `verify_present` — ONLY if the selector is still showing AND
+/// `still_authorized()` says THIS question is still the fork's open one, the
 /// safety the "谁先抢答" design rests on. A pty child execs `claude attach
-/// <id>`; the parent reads the fork's screen, and only if the selector's
-/// prompt chrome is present does it type the option's number + Enter. With
-/// `verify_present` false it always injects — for the manual command, where
-/// the caller vouches the dialog is up.
+/// <id>`; the parent waits for the selector chrome, re-checks `still_authorized`
+/// (the generic chrome cannot tell one question's dialog from the next's, so the
+/// DB row's status is the identity check), and only then types the option's
+/// number + Enter. With `verify_present` false it always injects — for the
+/// manual command, where the caller vouches the dialog is up.
 pub(crate) fn inject_option(
     session_id: &str,
     index: usize,
     verify_present: bool,
+    still_authorized: impl Fn() -> bool,
 ) -> Result<InjectOutcome> {
     let (connect, settle) = default_waits();
     inject_option_timed(
@@ -197,6 +216,7 @@ pub(crate) fn inject_option(
         connect,
         SELECTOR_KEY_GAP,
         settle,
+        still_authorized,
     )
 }
 
@@ -218,68 +238,96 @@ pub(crate) fn inject_option_timed(
     connect_wait: Duration,
     key_gap: Duration,
     settle_wait: Duration,
+    still_authorized: impl Fn() -> bool,
 ) -> Result<InjectOutcome> {
     with_attach_pty(session_id, |master| {
-        // Let attach connect and paint. NO frames at all means the client never
-        // rendered — an exec/connect failure. Cannot deliver.
-        let intro = drain_capture(master, connect_wait);
-        if verify_present && intro.is_empty() {
-            return Ok(InjectOutcome::Unreachable);
-        }
         if !verify_present {
-            // The manual/vouched path: type the number + Enter, no checks.
+            // The manual/vouched path: let attach paint, type the number +
+            // Enter (the caller vouches the dialog is up).
+            drain_capture(master, connect_wait);
             write_all(master, &option_digits(index))?;
             drain_capture(master, key_gap);
             write_all(master, b"\r")?;
             drain_capture(master, settle_wait);
-            return Ok(InjectOutcome::Injected);
+            return Ok(InjectOutcome::Delivered);
         }
-        // Presence on the CURRENT screen: flush queued bytes, force a repaint,
-        // and check chrome ONLY in that fresh frame. Absent is AMBIGUOUS — the
-        // dialog may be answered at the keyboard, still connecting, or errored,
-        // and a pty cannot tell them apart — so claim NOTHING here (report
-        // Unreachable, let the PostToolUse hook close the row on the real
-        // answer).
-        if !dialog_present(&repaint_and_capture(master, key_gap)) {
+        // WAIT for the fork's dialog to render, then DELIVER the keystrokes into
+        // it. We do NOT scrape the screen afterwards to guess whether the fork
+        // "took" the answer — the PostToolUse hook records the fork's OWN result.
+        // `wait_for_chrome` accumulates until the selector chrome appears — the
+        // real `claude attach` can take a second or more to connect and paint
+        // (on-machine 2026-09-03: ~2s), and the chrome is scrollback-safe on a
+        // fresh forkpty, so accumulating cannot be fooled by history. No chrome
+        // within the budget ⇒ no live dialog ⇒ Unreachable (retryable, nothing
+        // typed).
+        let (intro, present) = wait_for_chrome(master, connect_wait);
+        if !present {
+            ilog(format!(
+                "inject {}: intro {}B no chrome -> Unreachable",
+                short_id(session_id),
+                intro.len(),
+            ));
             return Ok(InjectOutcome::Unreachable);
         }
-        // Type the number, but do NOT submit yet.
-        write_all(master, &option_digits(index))?;
-        // Re-confirm the selector is STILL live before the Enter that submits
-        // it: this withholds the only harmful key (Enter) once the dialog is
-        // gone, shrinking the check→submit race. Its residual (a deschedule
-        // between this check and the write) is a documented best-effort limit
-        // of driving a live TUI over a pty.
-        if !dialog_present(&repaint_and_capture(master, key_gap)) {
-            return Ok(InjectOutcome::Unreachable);
-        }
-        write_all(master, b"\r")?;
-        // Did the fork TAKE the number? Force a repaint and read the current
-        // screen. `Injected` requires POSITIVE evidence: a NON-EMPTY frame with
-        // the chrome GONE — i.e. the fork redrew its NEXT state after the dialog
-        // closed. `claude attach` mirrors the still-running session, so a
-        // successful answer leaves the fork WORKING and the attach producing
-        // output; an EMPTY frame means the attach produced nothing, i.e. it
-        // DIED/crashed — not a success. Chrome still present ⇒ the number was
-        // not taken (partial buffer, stuck attach). So EMPTY or CHROME-PRESENT
-        // ⇒ Unreachable; only NON-EMPTY-and-CHROME-GONE ⇒ Injected.
+        // A dialog is up — but is it OURS? `wait_for_chrome` may have waited
+        // seconds, during which this fork could have ANSWERED our question and
+        // moved on to the NEXT one, whose generic `Enter to select` chrome is
+        // indistinguishable. The gate settles our row the instant a new native
+        // question opens (`settle_stale_native_questions`), so re-checking the
+        // DB row's status HERE — after the chrome is up, right before we commit
+        // any key — REVOKES an in-flight injection whose question is gone: we
+        // must NOT drive a different question's dialog. This DB status IS the
+        // question-instance identity the chrome cannot give us. Nothing has been
+        // typed yet, so this bail is a clean, retryable Unreachable.
         //
-        // The two-sided ambiguity Sol raised is resolved by ASYMMETRIC HARM:
-        // claiming Injected on an empty frame RECORDS an answer the fork may
-        // never have taken — UNRECOVERABLE (the row is finalised, the hook's
-        // `answer IS NULL` settle can no longer fix it, the question is silently
-        // dropped). Reporting Unreachable on a true-but-invisible success is
-        // RECOVERABLE (retryable button; the PostToolUse hook still settles the
-        // row when the fork's answer actually lands; /threads re-offers). So we
-        // take the recoverable side. (The premise that attach EXITS the instant
-        // one question is answered is rejected: it mirrors the running session
-        // and only exits when the session ends or the viewer detaches.)
-        drain_capture(master, key_gap);
-        let after = repaint_and_capture(master, settle_wait);
-        if after.is_empty() || dialog_present(&after) {
+        // ACCEPTED RESIDUAL (documented inherent limit, not chased): there is a
+        // microsecond window between this status read and the digit write below
+        // in which — only if the fork answered THIS question locally AND the
+        // next question's create/settle transaction committed AND that new dialog
+        // rendered AND the OS descheduled us across all of it — a key could still
+        // reach a different question. Closing it fully needs a cross-process
+        // SQLite writer guard held across the pty writes; for a single-user tool
+        // that theoretical race is out of scope. The authoritative hook still
+        // records only what the fork actually took.
+        if !still_authorized() {
+            ilog(format!(
+                "inject {}: question no longer the fork's open one -> Unreachable",
+                short_id(session_id),
+            ));
             return Ok(InjectOutcome::Unreachable);
         }
-        Ok(InjectOutcome::Injected)
+        // Committed: type the number, a beat (`key_gap`, so the selector buffers
+        // the digit before Enter reads it — Enter on an empty buffer submits the
+        // defaults), then Enter. We do NOT re-check and bail AFTER the digit: a
+        // withheld Enter would strand the digit in the buffer and a retry would
+        // append another. The residual — a LOCAL keyboard answer during the
+        // digit→Enter beat — can send a stray Enter into THIS same fork's next
+        // state, which a working fork ignores; it can no longer drive a DIFFERENT
+        // question (the identity check above already ruled that out).
+        write_all(master, &option_digits(index))?;
+        drain_capture(master, key_gap);
+        // The digit is now in the selector's buffer. If the Enter write fails
+        // HERE (e.g. the attach closed → EIO), do NOT surface a retryable error —
+        // a retry would append a SECOND digit to a buffer that may still hold the
+        // first. Treat a post-digit failure as Delivered (NON-retryable): the
+        // digit reached the live dialog and the authoritative hook settles the row
+        // when the fork completes; if nothing ever submits it, the row expires. (A
+        // failure of the DIGIT write above types nothing, so its `?` → retryable
+        // is correct.)
+        if let Err(err) = write_all(master, b"\r") {
+            ilog(format!(
+                "inject {}: enter write failed after digit ({err}) -> Delivered (non-retryable)",
+                short_id(session_id),
+            ));
+            return Ok(InjectOutcome::Delivered);
+        }
+        drain_capture(master, settle_wait);
+        ilog(format!(
+            "inject {}: intro {}B chrome present, authorized -> Delivered",
+            short_id(session_id),
+            intro.len(),
+        ));
+        Ok(InjectOutcome::Delivered)
     })
 }
 
@@ -306,7 +354,11 @@ fn with_attach_pty<T>(session_id: &str, drive: impl FnOnce(RawFd) -> Result<T>) 
     let prog = std::ffi::CString::new(resolve_program(&attach_program())?)
         .map_err(|_| anyhow!("attach program path has an interior NUL"))?;
     let arg_attach = std::ffi::CString::new("attach").expect("literal has no NUL");
-    let arg_id = std::ffi::CString::new(session_id)
+    // `claude attach` takes the SHORT 8-char job id (what `claude agents` prints
+    // as `id`), NOT the full session UUID — the full UUID fails with "No job
+    // matching …" and the attach exits at once (the real cause of the phone
+    // inject's "no chrome → Unreachable" on-machine).
+    let arg_id = std::ffi::CString::new(short_id(session_id))
         .map_err(|_| anyhow!("session id has an interior NUL"))?;
     let argv: [*const libc::c_char; 4] = [
         prog.as_ptr(),
@@ -314,6 +366,35 @@ fn with_attach_pty<T>(session_id: &str, drive: impl FnOnce(RawFd) -> Result<T>) 
         arg_id.as_ptr(),
         std::ptr::null(),
     ];
+
+    // Build the child's ENVIRONMENT here too, so the child only `execve`s — no
+    // allocation after the fork. The daemon runs under systemd with NO `TERM`,
+    // and without it `claude attach` renders a DEGRADED view with no
+    // AskUserQuestion selector (no chrome) — the on-machine cause of the
+    // phone-inject "no chrome → Unreachable" failure. So carry the parent's
+    // environment through and ensure a `TERM` is present so the interactive
+    // dialog actually paints.
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut env_cstrings: Vec<std::ffi::CString> = Vec::new();
+    let mut has_term = false;
+    for (key, value) in std::env::vars_os() {
+        if key.as_bytes() == b"TERM" {
+            has_term = true;
+        }
+        let mut kv = Vec::with_capacity(key.as_bytes().len() + value.as_bytes().len() + 1);
+        kv.extend_from_slice(key.as_bytes());
+        kv.push(b'=');
+        kv.extend_from_slice(value.as_bytes());
+        if let Ok(cs) = std::ffi::CString::new(kv) {
+            env_cstrings.push(cs);
+        }
+    }
+    if !has_term {
+        env_cstrings
+            .push(std::ffi::CString::new("TERM=xterm-256color").expect("literal has no NUL"));
+    }
+    let mut envp: Vec<*const libc::c_char> = env_cstrings.iter().map(|c| c.as_ptr()).collect();
+    envp.push(std::ptr::null());
 
     let mut master: RawFd = 0;
     // A real window size so the dialog lays out normally and the arrow-key
@@ -336,12 +417,14 @@ fn with_attach_pty<T>(session_id: &str, drive: impl FnOnce(RawFd) -> Result<T>) 
         return Err(anyhow!("forkpty: {}", std::io::Error::last_os_error()));
     }
     if pid == 0 {
-        // Child: the pty slave is already our controlling terminal and
-        // stdio. Async-signal-safe calls ONLY from here. `execv` (not
-        // `execvp`): `prog` is already absolute, so there is no PATH search
-        // and no allocation. On failure, die loudly.
+        // Child: the pty slave is already our controlling terminal and stdio.
+        // Async-signal-safe calls ONLY from here. `execve` (not `execvp`):
+        // `prog` is absolute (no PATH search, no allocation) and `envp` (built
+        // above with a guaranteed `TERM`) is passed explicitly so the dialog
+        // renders even under the daemon's TERM-less environment. On failure, die
+        // loudly.
         unsafe {
-            libc::execv(prog.as_ptr(), argv.as_ptr());
+            libc::execve(prog.as_ptr(), argv.as_ptr(), envp.as_ptr());
             libc::_exit(127);
         }
     }
@@ -444,8 +527,17 @@ fn drain_capture(master: RawFd, dur: Duration) -> Vec<u8> {
         let ready = unsafe { libc::poll(&mut pfd, 1, 200) };
         if ready > 0 {
             let n = unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n <= 0 {
+            if n < 0 {
+                // EINTR is a retryable interruption, not end-of-stream; only a
+                // real error ends the capture. Treating EINTR as EOF would cut a
+                // frame short and could read a false "chrome gone".
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
                 break;
+            }
+            if n == 0 {
+                break; // EOF: the attach client closed the pty.
             }
             out.extend_from_slice(&buf[..n as usize]);
         }
@@ -477,36 +569,62 @@ fn force_repaint(master: RawFd) {
     }
 }
 
-/// Read and DISCARD everything already queued on the pty, without waiting —
-/// so a following capture reflects the repaint we are about to force, not
-/// bytes that scrolled past before it.
-fn flush_pending(master: RawFd) {
+/// Poll the pty until the selector chrome appears, up to `budget`, returning the
+/// ACCUMULATED frames and whether the chrome was seen. The real `claude attach`
+/// can take a second or more to connect and paint, so a single short capture
+/// races the render; accumulating until the chrome shows tolerates a slow
+/// attach. The chrome is scrollback-safe (drawn only while the dialog is live)
+/// and a fresh forkpty carries no prior attach's bytes, so this cannot be fooled
+/// by history. Returns the instant the chrome appears, so a generous budget
+/// never slows the success path — it only bounds the wait for a dialog that will
+/// never show. A read of 0 (EOF: attach exited) ends the wait early with
+/// whatever was seen; EINTR is retried, not mistaken for EOF.
+fn wait_for_chrome(master: RawFd, budget: Duration) -> (Vec<u8>, bool) {
+    let deadline = Instant::now() + budget;
+    let mut acc = Vec::new();
     let mut buf = [0u8; 8192];
-    loop {
+    // Nudge one repaint in case the dialog painted before we began draining.
+    force_repaint(master);
+    while Instant::now() < deadline {
         let mut pfd = libc::pollfd {
             fd: master,
             events: libc::POLLIN,
             revents: 0,
         };
-        // Zero timeout: only drain what is IMMEDIATELY available.
-        if unsafe { libc::poll(&mut pfd, 1, 0) } <= 0 {
-            break;
-        }
-        let n = unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n <= 0 {
-            break;
+        if unsafe { libc::poll(&mut pfd, 1, 150) } > 0 {
+            let n = unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if n == 0 {
+                break; // EOF: the attach client exited.
+            }
+            acc.extend_from_slice(&buf[..n as usize]);
+            if dialog_present(&acc) {
+                return (acc, true);
+            }
         }
     }
+    let present = dialog_present(&acc);
+    (acc, present)
 }
 
-/// Flush queued bytes, force a fresh repaint, then return what the fork redrew
-/// within `dur` — the CURRENT screen, so a presence check reflects now rather
-/// than anything that scrolled past earlier in the stream.
-fn repaint_and_capture(master: RawFd, dur: Duration) -> Vec<u8> {
-    flush_pending(master);
-    force_repaint(master);
-    drain_capture(master, dur)
+/// A diagnostic breadcrumb into the daemon log (`daemon.err.log`), so a
+/// real-machine injection failure is TRACEABLE instead of silent — the 0.2.11
+/// inject path logged nothing, which is why its failure had to be reverse
+/// engineered from the DB and a hand-rolled pty capture. It records only a
+/// short session id, byte counts, booleans and the outcome — never the option
+/// index (which would leak the answer for a two-option allow/deny), the
+/// question, or the option text. A no-op in tests to keep their output clean.
+#[cfg(not(test))]
+fn ilog(msg: String) {
+    eprintln!("tinyctb: {msg}");
 }
+#[cfg(test)]
+fn ilog(_msg: String) {}
 
 #[cfg(test)]
 mod tests {
@@ -521,7 +639,8 @@ mod tests {
     }
 
     #[test]
-    fn the_attach_window_runs_claude_attach_on_the_fork() {
+    fn the_attach_window_runs_claude_attach_on_the_forks_short_id() {
+        // `claude attach` takes the SHORT 8-char id, not the full session UUID.
         let argv = attach_window_argv("c8bac5f4-16c1-4392-8366-57b28b1997b6", "claude");
         assert_eq!(
             argv,
@@ -531,7 +650,7 @@ mod tests {
                 "--",
                 "claude",
                 "attach",
-                "c8bac5f4-16c1-4392-8366-57b28b1997b6",
+                "c8bac5f4",
             ]
         );
     }
@@ -588,19 +707,18 @@ mod tests {
         stub
     }
 
-    /// End to end against a stub: the selector chrome is on the current screen
-    /// through both liveness checks, the number for option index 2 ("3") is
-    /// typed, and the selector then closes (the stub stops redrawing once
-    /// answered) — so the outcome is `Injected`.
+    /// End to end against a stub: the selector chrome appears, and the number for
+    /// option index 2 ("3") + Enter are typed into the live dialog — so the
+    /// outcome is `Delivered`. The inject side no longer scrapes the screen to
+    /// judge whether the fork "took" it (the PostToolUse hook records the fork's
+    /// own result); `Delivered` means only "the keys were put in front of a live
+    /// dialog", so `after` here is irrelevant.
     #[test]
     fn a_present_dialog_gets_the_option_number() {
         let _guard = crate::state::test_env_lock();
         let dir = std::env::temp_dir().join(format!("tinyctb-inject-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let capture = dir.join("keys.bin");
-        // After the answer the fork redraws its next state ("continuing…") —
-        // a non-empty frame WITHOUT the selector chrome, the positive evidence
-        // of a real close.
         let stub = live_attach_stub(&dir, "Enter to select", "continuing…", &capture, 2);
         std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
         let outcome = inject_option_timed(
@@ -610,67 +728,48 @@ mod tests {
             Duration::from_millis(400),
             Duration::from_millis(250),
             Duration::from_millis(250),
+            || true,
         )
         .expect("inject");
         std::env::remove_var("TINYCTB_TEST_ATTACH");
-        assert_eq!(outcome, InjectOutcome::Injected);
+        assert_eq!(outcome, InjectOutcome::Delivered);
         let got = std::fs::read(&capture).unwrap_or_default();
         assert!(got.starts_with(&option_digits(2)), "stub received {got:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// attach passes both liveness checks, then goes SILENT after the Enter —
-    /// an EMPTY post-Enter frame. A live attach mirroring a WORKING fork would
-    /// keep producing output, so silence means it DIED before the key was
-    /// consumed. It is `Unreachable` (retryable, recoverable), NOT a claimed
-    /// success that permanently records an answer the fork never took.
+    /// The dialog is up, but by the time it renders THIS question is no longer
+    /// the fork's open one (it was answered and the fork moved on, so the gate
+    /// settled the row): `still_authorized()` returns false, so NOTHING is typed
+    /// and the outcome is `Unreachable`. This is the question-instance identity
+    /// the generic chrome cannot give — it stops a stale button, whose injection
+    /// is already in flight, from driving a LATER question's dialog.
     #[test]
-    fn an_empty_frame_after_enter_is_unreachable() {
+    fn a_superseded_question_is_not_driven() {
         let _guard = crate::state::test_env_lock();
-        let dir = std::env::temp_dir().join(format!("tinyctb-emptyframe-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tinyctb-superseded-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let capture = dir.join("keys.bin");
-        // Chrome through both checks, then SILENCE after the answer.
-        let stub = live_attach_stub(&dir, "Enter to select", "", &capture, 2);
+        // The selector chrome is present the whole time (a live dialog is up)...
+        let stub = live_attach_stub(&dir, "Enter to select", "Enter to select", &capture, 1);
         std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
+        // ...but the row is no longer authorized (answered/superseded/settled).
         let outcome = inject_option_timed(
             "sess-x",
-            2,
+            0,
             true,
             Duration::from_millis(400),
-            Duration::from_millis(250),
-            Duration::from_millis(250),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+            || false,
         )
         .expect("inject");
         std::env::remove_var("TINYCTB_TEST_ATTACH");
         assert_eq!(outcome, InjectOutcome::Unreachable);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The selector is STILL up after the Enter (the number was not taken — a
-    /// stuck attach or a partial buffer): chrome persists, so it is
-    /// `Unreachable`, never a claimed success.
-    #[test]
-    fn a_stuck_selector_after_enter_is_unreachable() {
-        let _guard = crate::state::test_env_lock();
-        let dir = std::env::temp_dir().join(format!("tinyctb-stuck-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let capture = dir.join("keys.bin");
-        // Chrome BEFORE and AFTER the answer — the dialog never closes.
-        let chrome = "Enter to select";
-        let stub = live_attach_stub(&dir, chrome, chrome, &capture, 2);
-        std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
-        let outcome = inject_option_timed(
-            "sess-x",
-            2,
-            true,
-            Duration::from_millis(400),
-            Duration::from_millis(250),
-            Duration::from_millis(250),
-        )
-        .expect("inject");
-        std::env::remove_var("TINYCTB_TEST_ATTACH");
-        assert_eq!(outcome, InjectOutcome::Unreachable);
+        assert!(
+            std::fs::read(&capture).unwrap_or_default().is_empty(),
+            "nothing typed once the question is no longer authorized"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -692,6 +791,7 @@ mod tests {
             Duration::from_millis(400),
             Duration::from_millis(200),
             Duration::from_millis(200),
+            || true,
         )
         .expect("inject");
         std::env::remove_var("TINYCTB_TEST_ATTACH");
@@ -719,6 +819,7 @@ mod tests {
             Duration::from_millis(400),
             Duration::from_millis(100),
             Duration::from_millis(100),
+            || true,
         )
         .expect("inject");
         std::env::remove_var("TINYCTB_TEST_ATTACH");

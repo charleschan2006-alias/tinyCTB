@@ -1,6 +1,6 @@
 [package]
 name = "tinyctb"
-version = "0.2.11"
+version = "0.2.12"
 edition = "2021"
 description = "Telegram away-mode control for local Claude Code sessions"
 license = "MIT"

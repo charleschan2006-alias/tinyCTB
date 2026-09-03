@@ -1202,18 +1202,31 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     // filled. Record that decision on the row now — the one source of truth
     // the phone side reads at tap time, instead of re-guessing from /proc.
     let native_attach = windowless && !multi_select && !options.is_empty();
-    crate::state::create_pending_question(
-        &conn,
-        &question_id,
-        &thread_id,
-        &question_text,
-        &options,
-        multi_select,
-        now,
-        now + wait.as_millis() as u64,
-    )?;
-    if native_attach {
-        crate::state::mark_question_native_attach(&conn, &question_id)?;
+    // Create the row, mark it native, and settle the fork's older open native
+    // rows as ONE transaction: the "at most one open native row per fork"
+    // invariant the phone side relies on must be durable, not a window between
+    // three separate autocommits where a crash could leave two open rows. The
+    // settle means the fork just moved to THIS question, so any OLDER open native
+    // row for it is stale — closing it now makes its phone button read `Answered`
+    // and BAIL, instead of a stale tap injecting an old option into this (or a
+    // later) dialog.
+    {
+        let tx = conn.unchecked_transaction()?;
+        crate::state::create_pending_question(
+            &tx,
+            &question_id,
+            &thread_id,
+            &question_text,
+            &options,
+            multi_select,
+            now,
+            now + wait.as_millis() as u64,
+        )?;
+        if native_attach {
+            crate::state::mark_question_native_attach(&tx, &question_id)?;
+            crate::state::settle_stale_native_questions(&tx, &thread_id, &question_id, now)?;
+        }
+        tx.commit()?;
     }
 
     let buttons = if multi_select {
@@ -1366,16 +1379,30 @@ pub(crate) fn run_question_answered_gate<R: Read>(reader: &mut R, now: u64) -> R
     if !crate::state::session_has_open_native_question_readonly(&path, thread_id) {
         return Ok(no_opinion());
     }
+    // The fork's OWN result is the AUTHORITATIVE answer. `tool_response.answers`
+    // maps each question text to the option the fork actually returned (verified
+    // on-machine 2026-09-03 — the key equals this row's stored `question`, for a
+    // phone-inject AND a local-keyboard answer alike). Recording THAT — rather
+    // than scraping the pty to guess which surface closed the dialog — is what
+    // closes the "谁先抢答" causality gap: the row ends up with what the fork
+    // truly took, overwriting any optimistic phone-inject guess. Rows we cannot
+    // match (stale leftovers) are closed anonymously inside the state helper.
+    // The `answers` key is the RAW question text; the row stores it `trim()`ed
+    // (PreToolUse derives `question_text` from `question_raw.trim()`). Trim the
+    // key here so a question with leading/trailing whitespace still matches its
+    // row — otherwise its real answer would be lost to the anonymous settle.
+    let answers: Vec<(String, String)> = payload
+        .get("tool_response")
+        .and_then(|tr| tr.get("answers"))
+        .and_then(Value::as_object)
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(q, v)| v.as_str().map(|s| (q.trim().to_string(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
     let conn = create_state_db(&path)?;
-    // The fork just answered an AskUserQuestion (here, or by the phone's
-    // injection). CLOSE every open native row for this session — the one just
-    // answered PLUS any older leftovers whose own answer events were missed
-    // (a fork is on one question at a time, so older open rows are stale). We
-    // do NOT parse the tool response for the option: a phone injection has
-    // already recorded the real answer (this settle is then a no-op on that
-    // non-null row, and would be OVERWRITTEN back by `record_native_answer`
-    // anyway); a purely-local answer only needs the row CLOSED.
-    crate::state::settle_open_native_questions_for_session(&conn, thread_id, now)?;
+    crate::state::record_native_answers_from_hook(&conn, thread_id, &answers, now)?;
     Ok(no_opinion())
 }
 

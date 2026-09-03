@@ -2639,16 +2639,17 @@ fn held_answer_toast(conn: &Connection, question_id: &str, answer: &str) -> Stri
     }
 }
 
-/// Deliver a phone answer to a RELEASED background fork by injecting the
-/// chosen option's number into its native dialog, finalising the row ONLY if
-/// the fork actually took it. Returns the toast and the audit outcome.
+/// Deliver a phone answer to a RELEASED background fork by injecting the chosen
+/// option's number into its native dialog. This DELIVERS keys only — it records
+/// NOTHING; the PostToolUse "answered" hook records the fork's OWN result when
+/// the turn completes. Returns the toast and the audit outcome.
 ///
-/// Inject-before-record is the safety the two-surface race needs: a failed
-/// injection must never leave a recorded answer the fork never received. The
-/// one-answer rule is guarded up front — an already answered or expired row is
-/// not injected again — and "谁先抢答" is honoured: if the dialog is already
-/// gone, a person answered it at the screen first, so report that and record
-/// nothing.
+/// The one-answer rule is guarded up front (an already answered or expired row
+/// is not injected again), and the injector re-checks — once the dialog is up
+/// and before any key — that THIS question is still the fork's open one, so a
+/// stale button cannot drive a later question. If the dialog is not reachable,
+/// report that and record nothing; whoever won "谁先抢答" is left for the hook
+/// to settle.
 fn inject_native_attach_answer(
     conn: &Connection,
     question_id: &str,
@@ -2699,18 +2700,32 @@ fn inject_native_attach_answer(
             false,
         ));
     };
-    // Deliver by injecting the number. Only POSITIVE delivery (`Injected`)
-    // records; anything else claims nothing here. A `Unreachable` or a pty/
-    // attach error is a TRANSIENT delivery failure → retryable; the row is left
-    // open, and the PostToolUse hook closes it if the fork's answer lands.
-    match crate::fork_dialog::inject_option(&prompt.thread_id, index, true) {
-        Ok(crate::fork_dialog::InjectOutcome::Injected) => {
-            // The fork provably took it. Record the real option — OVERWRITING
-            // the hook's "answered elsewhere" soft-settle if it raced in between
-            // our Enter and here — so the audit and /threads show the choice.
-            let outcome = crate::state::record_native_answer(conn, question_id, answer, now)?;
-            Ok((format!("已作答：{resolved}"), outcome, false))
-        }
+    // Deliver by injecting the number. We do NOT record the answer here — the
+    // PostToolUse "answered" hook records the fork's OWN result authoritatively
+    // when the turn completes (whichever surface won the "谁先抢答" race, and
+    // exactly what it chose), so a phone tap can never finalise a guess the fork
+    // did not take. `Delivered` = the keys reached a LIVE dialog (button consumed,
+    // no retry); `Unreachable` or a pty/attach error is a TRANSIENT delivery
+    // failure → retryable, nothing typed, the row left open for the hook.
+    //
+    // `still_open`: once the dialog's chrome is up and right BEFORE any key is
+    // sent, the injector re-checks that THIS question is still the fork's OPEN
+    // row. `wait_for_chrome` may have waited seconds; if the fork answered our
+    // question and moved on — the gate settled our row when the next question
+    // opened — the row is no longer `Open`, and the injector bails WITHOUT
+    // driving that other question's dialog. The generic selector chrome cannot
+    // tell the two apart; the row status is the question-instance identity.
+    let still_open = || {
+        crate::state::pending_question_status(conn, question_id, now)
+            .map(|status| status == crate::state::QuestionStatus::Open)
+            .unwrap_or(false)
+    };
+    match crate::fork_dialog::inject_option(&prompt.thread_id, index, true, still_open) {
+        Ok(crate::fork_dialog::InjectOutcome::Delivered) => Ok((
+            format!("已把「{resolved}」送到电脑上的对话框，由它确认后记录。"),
+            ApprovalAnswer::Delivered,
+            false,
+        )),
         Ok(crate::fork_dialog::InjectOutcome::Unreachable) => Ok((
             "没能连上对话框，请在电脑窗口作答（未记录，可重试）。".to_string(),
             ApprovalAnswer::Unknown,
@@ -2740,16 +2755,21 @@ fn record_callback_answer(
     if let (Some(question_id), Some(answer)) =
         (route.question_id.as_deref(), route.answer.as_deref())
     {
-        // A released background fork is answered by INJECTING into its native
-        // dialog, so inject before recording and never pre-finalise the row
-        // (P1-3). Every other question keeps the held path: finalise the row so
-        // the blocked hook reads the answer.
+        // A released background fork is answered by DELIVERING keys into its
+        // native dialog; the phone side records NOTHING — the PostToolUse hook
+        // records the fork's own result. Every other question keeps the held
+        // path: finalise the row so the blocked hook reads the answer.
         let (toast, outcome, retryable) = if question_is_native_attach(conn, question_id)? {
             inject_native_attach_answer(conn, question_id, answer, now)?
         } else {
             let outcome = crate::state::record_question_answer(conn, question_id, answer, now)?;
             let toast = match outcome {
-                ApprovalAnswer::Recorded => held_answer_toast(conn, question_id, answer),
+                // `record_question_answer` (the held path) never returns
+                // `Delivered` — that is a native-inject-only outcome — but the
+                // match must be exhaustive; treat it as a normal answer.
+                ApprovalAnswer::Recorded | ApprovalAnswer::Delivered => {
+                    held_answer_toast(conn, question_id, answer)
+                }
                 ApprovalAnswer::AlreadyAnswered => "这个问题已经回答过了。".to_string(),
                 ApprovalAnswer::Expired => {
                     "这个问题的手机答复窗口已关闭。用 /threads 看这个会话现在停在哪里。".to_string()
@@ -2815,7 +2835,9 @@ fn record_callback_answer(
         ApprovalAnswer::Expired => {
             "这条请求的手机答复窗口已关闭。用 /threads 看这个会话现在停在哪里。".to_string()
         }
-        ApprovalAnswer::Unknown => "这个按钮已经失效了。".to_string(),
+        // An approval decision never yields `Delivered` (native-inject only); the
+        // match must be exhaustive, so fold it in with the invalid-button case.
+        ApprovalAnswer::Unknown | ApprovalAnswer::Delivered => "这个按钮已经失效了。".to_string(),
     };
     Ok(json!({
         "ok": true,
@@ -2938,8 +2960,8 @@ fn answer_pending_question_from_reply(
     }
 
     let question_id = ref_id;
-    // Same split as the button path: a released background fork's typed answer
-    // is injected into its native dialog (inject before recording); every other
+    // Same split as the button path: a released background fork's typed answer is
+    // DELIVERED into its native dialog (the hook records the result); every other
     // question finalises the row for the blocked hook.
     // A typed reply that fails to reach the dialog need not carry a retry flag:
     // re-replying is a fresh message with its own route, so the retryable bit is
@@ -2949,7 +2971,12 @@ fn answer_pending_question_from_reply(
     } else {
         let outcome = crate::state::record_question_answer(conn, &question_id, text, now)?;
         let notice = match outcome {
-            ApprovalAnswer::Recorded => held_answer_toast(conn, &question_id, text),
+            // Held path (`record_question_answer`) never returns `Delivered`
+            // (native-inject only); exhaustive match folds it in with a normal
+            // answer. The native typed reply takes the `if` branch above.
+            ApprovalAnswer::Recorded | ApprovalAnswer::Delivered => {
+                held_answer_toast(conn, &question_id, text)
+            }
             ApprovalAnswer::AlreadyAnswered => "这个问题已经回答过了。".to_string(),
             ApprovalAnswer::Expired => {
                 "这个问题的手机答复窗口已关闭。用 /threads 看这个会话现在停在哪里。".to_string()
@@ -7744,10 +7771,11 @@ mod tests {
         stub
     }
 
-    /// A background fork's single-select answer is INJECTED into its native
+    /// A background fork's single-select answer is DELIVERED into its native
     /// dialog: the selector chrome is present, so the fork is sent the option's
-    /// number ("2" for SQLite at index 1) + Enter, the row is THEN finalised
-    /// for dedup, and the toast confirms it.
+    /// number ("2" for SQLite at index 1) + Enter. The phone side records
+    /// NOTHING — the row is left OPEN for the PostToolUse hook to finalise — and
+    /// the toast says the answer was delivered, not recorded.
     #[test]
     fn a_bg_fork_answer_is_injected_into_the_native_dialog() {
         let _guard = crate::state::test_env_lock();
@@ -7764,8 +7792,8 @@ mod tests {
         )
         .expect("create");
         crate::state::mark_question_native_attach(&conn, "qf1").expect("mark");
-        // Do NOT pre-record: the native path injects first and records only on
-        // success.
+        // The native path only DELIVERS keys; it records nothing — the PostToolUse
+        // hook records the fork's own result when the turn completes.
 
         let dir = std::env::temp_dir().join(format!("tinyctb-tg-inject-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
@@ -7778,8 +7806,8 @@ mod tests {
 
         std::env::remove_var("TINYCTB_TEST_ATTACH");
         std::env::remove_var("TINYCTB_TEST_ATTACH_WAIT_MS");
-        assert_eq!(toast, "已作答：SQLite");
-        assert_eq!(outcome, ApprovalAnswer::Recorded);
+        assert_eq!(toast, "已把「SQLite」送到电脑上的对话框，由它确认后记录。");
+        assert_eq!(outcome, ApprovalAnswer::Delivered);
         assert!(!retryable);
         let got = std::fs::read(&capture).unwrap_or_default();
         assert!(
@@ -7789,8 +7817,8 @@ mod tests {
         assert!(
             crate::state::question_answer(&conn, "qf1")
                 .expect("answer")
-                .is_some(),
-            "the fork took it, so the row is finalised"
+                .is_none(),
+            "the inject side records nothing — the PostToolUse hook finalises the row"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -7976,16 +8004,18 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A positively-injected phone answer OVERWRITES the hook's "answered
-    /// elsewhere" soft-settle, so the audit and /threads show the real option
-    /// rather than the sentinel, no matter which raced in first.
+    /// Opening a NEW native question settles the fork's older open native row
+    /// (so a stale button bails), and the hook then records the fork's real
+    /// answer onto the OPEN row WITHOUT clobbering the earlier same-text row's
+    /// audit — the two central invariants of the hook-authoritative model.
     #[test]
-    fn a_native_answer_overwrites_the_soft_settle() {
+    fn a_new_question_settles_the_old_and_the_hook_fills_only_the_open_row() {
         let _guard = crate::state::test_env_lock();
         let conn = crate::state::create_state_db_in_memory().expect("db");
+        // An earlier identical-text native question, still open.
         crate::state::create_pending_question(
             &conn,
-            "qn1",
+            "q_old",
             "sess-race",
             "选哪个？",
             &["Postgres".to_string(), "SQLite".to_string()],
@@ -7993,19 +8023,51 @@ mod tests {
             1000,
             9_000_000,
         )
-        .expect("create");
-        crate::state::mark_question_native_attach(&conn, "qn1").expect("mark");
-        // The hook raced in first and soft-settled the row.
-        crate::state::settle_open_native_questions_for_session(&conn, "sess-race", 1200)
-            .expect("settle");
-        // The phone's positively-injected answer still records the real option.
+        .expect("create old");
+        crate::state::mark_question_native_attach(&conn, "q_old").expect("mark old");
+        // The fork moves on to a NEW same-text question.
+        crate::state::create_pending_question(
+            &conn,
+            "q_new",
+            "sess-race",
+            "选哪个？",
+            &["Postgres".to_string(), "SQLite".to_string()],
+            false,
+            1200,
+            9_000_000,
+        )
+        .expect("create new");
+        crate::state::mark_question_native_attach(&conn, "q_new").expect("mark new");
+        // Opening q_new settles the older open native row so its stale button bails.
+        crate::state::settle_stale_native_questions(&conn, "sess-race", "q_new", 1250)
+            .expect("settle stale");
         assert_eq!(
-            crate::state::record_native_answer(&conn, "qn1", "SQLite", 1300).expect("record"),
-            crate::state::ApprovalAnswer::Recorded
+            crate::state::question_answer(&conn, "q_old").expect("answer"),
+            Some("\u{0}elsewhere".to_string()),
+            "the older open native row is settled when a new one opens"
         );
         assert_eq!(
-            crate::state::question_answer(&conn, "qn1").expect("answer"),
-            Some("SQLite".to_string())
+            crate::state::question_answer(&conn, "q_new").expect("answer"),
+            None,
+            "the current question stays open"
+        );
+        // The hook records the fork's real result onto the OPEN row only.
+        crate::state::record_native_answers_from_hook(
+            &conn,
+            "sess-race",
+            &[("选哪个？".to_string(), "SQLite".to_string())],
+            1300,
+        )
+        .expect("record");
+        assert_eq!(
+            crate::state::question_answer(&conn, "q_new").expect("answer"),
+            Some("SQLite".to_string()),
+            "the open row takes the real answer"
+        );
+        assert_eq!(
+            crate::state::question_answer(&conn, "q_old").expect("answer"),
+            Some("\u{0}elsewhere".to_string()),
+            "the earlier same-text row's audit is not clobbered"
         );
     }
 }
