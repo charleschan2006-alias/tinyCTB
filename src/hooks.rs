@@ -34,6 +34,13 @@ const HEADLESS_APPROVAL_HOOK_MARKER: &str = "headless-approval-gate";
 /// AskUserQuestion (buttons on the phone) instead of prose.
 pub(crate) const PROMPT_CONTEXT_HOOK_EVENT: &str = "UserPromptSubmit";
 const PROMPT_CONTEXT_HOOK_MARKER: &str = "prompt-context";
+/// Fires right AFTER an AskUserQuestion is answered — locally at the keyboard
+/// OR by the phone's injection. For a RELEASED background fork this is the
+/// authoritative "the question is settled" signal, so the pending row closes
+/// even when a person answered at the screen and the phone never probed the
+/// dialog. Pinned to AskUserQuestion by the same matcher as the gate.
+pub(crate) const QUESTION_ANSWERED_HOOK_EVENT: &str = "PostToolUse";
+const QUESTION_ANSWERED_HOOK_MARKER: &str = "question-answered-gate";
 const HOOK_MARKER: &str = "hook-event";
 const HOOK_TIMEOUT_SECONDS: u64 = 10;
 
@@ -93,6 +100,7 @@ fn is_tinyctb_hook(entry: &Value) -> bool {
                 && (command.contains(HOOK_MARKER)
                     || command.contains(APPROVAL_HOOK_MARKER)
                     || command.contains(QUESTION_HOOK_MARKER)
+                    || command.contains(QUESTION_ANSWERED_HOOK_MARKER)
                     || command.contains(HEADLESS_APPROVAL_HOOK_MARKER)
                     || command.contains(PROMPT_CONTEXT_HOOK_MARKER))
         })
@@ -276,6 +284,29 @@ pub(crate) fn install_hooks(bridge_command: &str, dry_run: bool) -> Result<Value
     }));
     installed.push(PROMPT_CONTEXT_HOOK_EVENT.to_string());
 
+    // PostToolUse(AskUserQuestion): the authoritative "answered" signal that
+    // closes a released background fork's row, even when a person answered at
+    // the keyboard and the phone never probed the dialog.
+    let question_answered_command = format!("{binary} {QUESTION_ANSWERED_HOOK_MARKER}");
+    let groups_value = hooks
+        .entry(QUESTION_ANSWERED_HOOK_EVENT.to_string())
+        .or_insert_with(|| json!([]));
+    let groups = groups_value.as_array_mut().with_context(|| {
+        format!("Claude settings hooks.{QUESTION_ANSWERED_HOOK_EVENT} must be an array")
+    })?;
+    strip_tinyctb_entries(groups);
+    groups.push(json!({
+        "matcher": QUESTION_HOOK_MATCHER,
+        "hooks": [{
+            "type": "command",
+            "command": question_answered_command,
+            "timeout": HOOK_TIMEOUT_SECONDS
+        }]
+    }));
+    installed.push(format!(
+        "{QUESTION_ANSWERED_HOOK_EVENT}({QUESTION_HOOK_MATCHER})"
+    ));
+
     if !dry_run {
         write_settings(&path, &settings)?;
         fs::create_dir_all(events_spool_dir()?)?;
@@ -305,6 +336,7 @@ pub(crate) fn uninstall_hooks(dry_run: bool) -> Result<Value> {
             .iter()
             .chain(std::iter::once(&APPROVAL_HOOK_EVENT))
             .chain(std::iter::once(&QUESTION_HOOK_EVENT))
+            .chain(std::iter::once(&QUESTION_ANSWERED_HOOK_EVENT))
             .chain(std::iter::once(&PROMPT_CONTEXT_HOOK_EVENT))
         {
             if let Some(groups) = hooks.get_mut(*event).and_then(Value::as_array_mut) {
@@ -355,6 +387,41 @@ fn marker_installed(settings: &Map<String, Value>, event: &str, marker: &str) ->
                         })
                     })
                     .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Like `marker_installed`, but the tinyctb hook must ALSO sit in a group
+/// pinned to `matcher`. A `PostToolUse`/`PreToolUse` gate with a corrupted or
+/// missing matcher would either never fire or run on every tool call, so
+/// status must not report it installed just because the command is present.
+fn marker_installed_with_matcher(
+    settings: &Map<String, Value>,
+    event: &str,
+    marker: &str,
+    matcher: &str,
+) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get(event))
+        .and_then(Value::as_array)
+        .map(|groups| {
+            groups.iter().any(|group| {
+                group.get("matcher").and_then(Value::as_str) == Some(matcher)
+                    && group
+                        .get("hooks")
+                        .and_then(Value::as_array)
+                        .map(|entries| {
+                            entries.iter().any(|entry| {
+                                is_tinyctb_hook(entry)
+                                    && entry
+                                        .get("command")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|command| command.contains(marker))
+                            })
+                        })
+                        .unwrap_or(false)
             })
         })
         .unwrap_or(false)
@@ -412,6 +479,15 @@ pub(crate) fn hooks_status() -> Result<Value> {
     check(
         format!("{QUESTION_HOOK_EVENT}({QUESTION_HOOK_MATCHER})"),
         marker_installed(&settings, QUESTION_HOOK_EVENT, QUESTION_HOOK_MARKER),
+    );
+    check(
+        format!("{QUESTION_ANSWERED_HOOK_EVENT}({QUESTION_HOOK_MATCHER})"),
+        marker_installed_with_matcher(
+            &settings,
+            QUESTION_ANSWERED_HOOK_EVENT,
+            QUESTION_ANSWERED_HOOK_MARKER,
+            QUESTION_HOOK_MATCHER,
+        ),
     );
     check(
         PROMPT_CONTEXT_HOOK_EVENT.to_string(),
@@ -575,8 +651,8 @@ mod tests {
         let uninstalled = uninstall_hooks(false).expect("uninstall");
         assert_eq!(
             uninstalled["removed"],
-            (HOOKED_EVENTS.len() + 4) as i64,
-            "spool hooks + PermissionRequest gate + both PreToolUse gates + prompt context"
+            (HOOKED_EVENTS.len() + 5) as i64,
+            "spool hooks + PermissionRequest gate + both PreToolUse gates + PostToolUse answered gate + prompt context"
         );
         let settings: Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings"))

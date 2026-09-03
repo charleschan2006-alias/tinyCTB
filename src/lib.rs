@@ -12,6 +12,7 @@ mod claude;
 mod cli;
 mod config;
 mod daemon;
+mod fork_dialog;
 mod hooks;
 mod projects;
 mod state;
@@ -376,10 +377,30 @@ fn run() -> Result<i32> {
                 approvals::run_question_gate(&mut stdin.lock(), now).unwrap_or_else(|_| json!({}));
             println!("{}", serde_json::to_string(&result)?);
         }
+        Commands::QuestionAnsweredGate => {
+            let now = now_millis().unwrap_or(0);
+            let stdin = std::io::stdin();
+            let result = approvals::run_question_answered_gate(&mut stdin.lock(), now)
+                .unwrap_or_else(|_| json!({}));
+            println!("{}", serde_json::to_string(&result)?);
+        }
         Commands::PromptContext => {
             let stdin = std::io::stdin();
             let result = approvals::run_prompt_context(&mut stdin.lock());
             println!("{}", serde_json::to_string(&result)?);
+        }
+        Commands::ForkDialog { session, pick } => {
+            match pick {
+                Some(index) => fork_dialog::inject_via_attach(
+                    &session,
+                    &fork_dialog::option_keystrokes(index),
+                )?,
+                None => fork_dialog::pop_attach_window(&session)?,
+            }
+            println!(
+                "{}",
+                json!({ "ok": true, "session": session, "pick": pick })
+            );
         }
         Commands::Projects { command } => match command {
             ProjectCommands::List { observed_limit } => {

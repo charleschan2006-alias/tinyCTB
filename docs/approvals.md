@@ -260,3 +260,28 @@ CAS 之后副作用的**顺序**还有两处崩溃窗口：①claim 提交后、
 **at-least-once（可能重复），不是 at-most-once。** 发送与 transport log 落库无法原子（一个跨网络、一个本地），daemon 若崩在两者之间，就进入不可判定窗口：Telegram 已接受但本地无记录，恢复时会重发，用户可能看到同一请求两次。
 
 选它的理由：反过来（先记日志再发）用可见的重复换静默丢失，而这个 outbox 存在的全部意义就是需要用户作答的请求不能凭空消失。重复是显眼且可处理的（一答一行，点第二条会收到已经处理过了）；丢失则和会话卡死长得一模一样。
+
+## 后台 fork 的原生对话框：attach 双向作答（2026-09-02 定，`src/fork_dialog.rs`）
+
+**问题的由来**：后台 fork（`claude --bg` / daemon fork）在一块没人看的隐藏 pty 上渲染 AskUserQuestion。此前 windowless 单选走「扣住工具调用 + 手机填 `updatedInput`」：手机能答，但本地看不见、答不了。用户要「双向、谁先抢答算谁的」，且要用**原生对话框**（自造的横幅/zenity 都被否）。
+
+**承重事实**：`claude attach <id>` 不只只读——用 pty 起 attach 客户端、向其 master 写字节，键真的送达 fork 的对话框。attach 是纯查看客户端，**零模型 token**；fork 本就带上下文在等，答完继续同一回合，与手机答开销相同。**全程不停、不发信号给任何 TUI**——只开新窗口、像人一样敲键，这是它安全、而 SIGSTOP 接管致命（bash 作业控制抢前台 + SIGTTIN 冻死，见 `terminal-takeover-impossible` 记忆）的根本区别。
+
+**如何选中一项（2026-09-03 真机实证，推翻早前的源码猜测）**：真交互 AskUserQuestion 框给选项**编号**（`1. RED`、`2. GREEN`…），**打选项的 1-based 数字即选中**——实测对 index 2 注入数字"3"+回车，fork 答出第 3 项 `BLUE`。方向键也能导航（真框底部提示 `Enter to select · ↑/↓ to navigate · Esc to cancel`），但**打数字是绝对选择**（不依赖别的 attach 客户端把高亮停在哪），正是两面抢答需要的。故手机注入 = **打 `index+1` 数字 + 回车**（`option_digits`）。（早前从二进制 `FLt` 组件读到的 `Select with numbers [1-N]` 是**另一个非交互渲染**、不是真交互框——7 轮静态审都没发现，正是真机验挖出来的。）数字与回车**分两步写、之间再确认活框**：回车是唯一会"提交"的键，只在框仍在时才发；本地此刻抢答、框已消失时，那颗孤零数字未提交地落在主框（低危、不误发），不发回车、判 `Unreachable`。回车后再强制重绘看当前屏：`Injected` 要**正证据＝新帧非空且 chrome 没了**（fork 关框后重绘了下一状态）。`claude attach` 镜像仍在跑的会话，成功后 fork 继续工作、attach 持续产出，故正常成功是**非空帧**；**空帧＝attach 没产出＝它死了（崩溃）**、**框还在＝没吃下**——两者都判 `Unreachable`。空帧的两向歧义按**不对称危害**定案（见⑤）：空帧判 Injected 会记下 fork 可能没收到的答案、**不可恢复**（行已终结、钩子的 `answer IS NULL` 再也修不了、问题被静默丢弃）；判 Unreachable 只是把"真成功但不可见"报成可重试、**可恢复**（钩子仍会在 fork 真答时结算行、/threads 重推）——取可恢复的一侧。
+
+**在场判定（三审 P1-1）**：不刮问题/选项文字（进历史回显判不准）；也不信连接窗口里累计的原始流。而是 `repaint_and_capture`＝**先 `flush_pending` 清掉已排队的旧字节、再强制重绘（`TIOCSWINSZ`→SIGWINCH）、只看这一帧**（清了帧边界，三审 #2）。签名用选择器专属 chrome `Enter to select`（`SELECTOR_CHROME`，真框底部提示 `Enter to select · ↑/↓ to navigate · Esc to cancel`；答后折叠成 `User answered…` 就没了、不进 scrollback、英文固定；2026-09-03 真机实证——早前的 `Select with numbers` 永远匹配不上真框）。
+
+**新流程（仅 windowless 单选、非空选项；多选与 free-text 走扣住+填/comma；审批留 v0.2.10）**：
+- **gate 放手**：windowless 单选非空选项分支建行、推手机按钮、`pop_attach_window` 弹 `claude attach` 窗口、`no_opinion` 让原生框渲染、建行后写 `native_attach`。空选项（free-text）不放手，落回扣住+填（Sol P1-4）。
+- **本地**：窗口里原生答（打数字或方向键皆可）。
+- **手机（先投递后记账，Sol P1-3；只认正证据，三审收敛为两态）**：daemon（`inject_native_attach_answer`）先 `pending_question_status` 查在开/已答/过期（含 deadline），仍开放；再**自己查 label→选项号**（区分"不是选项"＝坏答案不可重试，与投递失败＝可重试，三审 #6），再 `inject_option`：
+  - `Injected`（回车前活框在、回车后**非空帧且框消失**，见上）→ 用 `record_native_answer` 记真答案、toast「已作答」。**该记账能覆盖钩子的 `\0elsewhere` 软结算**——若 fork 答完后 PostToolUse 在这空档先把行软结算了，手机的真选项仍写进去，审计/`/threads` 显示真答案而非 sentinel（四审 P2）。
+  - `Unreachable`（回车前 chrome 不在／回车后框**还在或空帧**／attach 无帧／pty 错误——**pty 分不清"本地已答/还在连/报错"，一律不认作本地已答**，三审 #1）→ 不记不结算、行留开、toast「没能连上…未记录，可重试」、回 `retryable:true` 让按钮不被消费可再点。
+- **本地已答由 PostToolUse 钩子权威结算（三审 #1/#5）**：装 `PostToolUse(AskUserQuestion)` 钩子 `question-answered-gate`，AskUserQuestion 一答完（本地或注入）就触发，把该 session **所有开放 native 行**关掉（`settle_open_native_questions_for_session` 写 `\0elsewhere`——fork 同时只卡一个问题，故其余开放 native 行是漏了答题事件的旧残留，一并关掉，四审 P2）。于是本地先答、手机从没探过也不再被 `/threads` 重推；手机成功注入的真答案由上面的 `record_native_answer` 覆盖之。**唯一未真机验的假设＝PostToolUse 对 attach 答题会不会触发**（建期 API 限速验不了）；若不触发则此钩子惰性，行退回按窗口过期。钩子**只读探优先**：`create_state_db` 初始化本身会写（WAL 切换、迁移），故先用**只读连接** `session_has_open_native_question_readonly` 查有没有 native 行，有才开可写连接走 settle——真正避免常态 no-op 上 SQLite 写锁；只读打开失败即降级 no-op（六审 P3）。install/uninstall/status 对称，status 用 `marker_installed_with_matcher` **校验 matcher 是 `AskUserQuestion`**（四审 P3）。
+- **终端会话（非后台 fork）不变**：`native_attach` 假，走 v0.2.10 扣住+填。
+
+**注入进程安全（Sol P2-1）**：`with_attach_pty` fork **前**分配 CString/argv，子进程只 `execv`+`_exit`。`write_all` 处理部分写/EINTR，`waitpid` 处理 EINTR。**程序名走 `CLAUDE_BIN` 权威解析（`resolve_program`/`pop_attach_window`）；无效 `CLAUDE_BIN` 即报错、绝不回退裸 claude**（三审 #7）——注入的 attach 与本地弹的窗口都用 daemon 同一个 claude。
+
+**已知固有极限（pty 注入本质，非可封死的 bug，已如实记档）**：① check→回车之间的微竞态无原子保证，只能收窄（三审 #3）；② 不写整套 ANSI 终端模拟器就没有 100% 可靠的"当前屏"，`flush_pending`+重绘是最佳努力（三审 #2 内核）；③ `Injected` 靠"回车后框消失"作正证据，非应用层 ack（三审 #4），最终由 PostToolUse 钩子兜底核对；④ **数字键上游是否接受＝2026-09-03 真机已验（对 index 2 注入"3"→fork 答出 BLUE）**，不再是未验项；仍未真机验的只剩 PostToolUse 对 attach 答题是否触发、双 surface 并发时序（建期 API 限速）；⑤ **回车后空帧的处置**：`claude attach` 镜像仍在跑的会话，成功后 fork 继续工作、attach 持续产出，故空帧＝attach 没产出＝它死了（崩溃）→判 `Unreachable`（"attach 答完即退"的前提已否决）。即便退一步当歧义看，也按**不对称危害**取可恢复侧＝`Unreachable`：判 Injected 会记下 fork 可能没收到的答案、不可恢复；判 Unreachable 只是可重试、钩子仍会在真答时结算行（四→六审反复围绕此点，六审 P2 证 Injected 侧不可恢复）。
+
+**测试**：`fork_dialog` 8（数字序列、窗口 argv、chrome 判定、present→`Injected`、非选择器屏→`Unreachable`、无帧→`Unreachable`、**答后空帧→`Unreachable`（不可恢复侧的对立）**、**答后框还在→`Unreachable`**）；daemon 6（注入并事后记账、非选择器屏→`Unreachable` 行留开、attach 失败→`Unreachable`+`retryable`、终端会话不注入、**PostToolUse 钩子关全部开放行含旧残留**、**真答案覆盖软结算**）；hooks 幂等含 PostToolUse 组（removed +5）。stub＝**后台连续 printf 模拟活屏重绘 + `head -c` 收键 + 答后画 `after`**（`after` 空＝模拟 attach 死/答后没产出→空帧、`after`=chrome＝框卡住不消失）；死 stub 模拟无帧。全量三跑 423/423 全绿、clippy `-D warnings` 退 0、fmt 净。

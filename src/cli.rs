@@ -107,9 +107,25 @@ pub(crate) enum Commands {
     QuestionGate,
     #[command(
         hide = true,
+        about = "PostToolUse hook: close a released background fork's question row once it is answered"
+    )]
+    QuestionAnsweredGate,
+    #[command(
+        hide = true,
         about = "UserPromptSubmit hook: teach away-mode sessions to ask choices via AskUserQuestion"
     )]
     PromptContext,
+    #[command(
+        hide = true,
+        about = "Open a background fork's native dialog in a window, or answer it by option index"
+    )]
+    ForkDialog {
+        /// Background fork session id (or unique prefix)
+        session: String,
+        /// Option index to answer with (0-based); omitted just opens the window
+        #[arg(long)]
+        pick: Option<usize>,
+    },
     #[command(about = "Manage the curated project registry for Telegram-created sessions")]
     Projects {
         #[command(subcommand)]

@@ -1197,6 +1197,11 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     let gate_clock = std::time::Instant::now();
     let conn = create_state_db(&state_db_path()?)?;
     let question_id = format!("q{}", generate_session_uuid()?.replace('-', ""));
+    // The gate RELEASES a background fork's single-select, non-empty question
+    // to its native dialog (below), so its answer is injected rather than
+    // filled. Record that decision on the row now — the one source of truth
+    // the phone side reads at tap time, instead of re-guessing from /proc.
+    let native_attach = windowless && !multi_select && !options.is_empty();
     crate::state::create_pending_question(
         &conn,
         &question_id,
@@ -1207,6 +1212,9 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
         now,
         now + wait.as_millis() as u64,
     )?;
+    if native_attach {
+        crate::state::mark_question_native_attach(&conn, &question_id)?;
+    }
 
     let buttons = if multi_select {
         Vec::new()
@@ -1252,6 +1260,28 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
     // gets that anything is waiting, and /back is their answer path.
     let banner = QuestionBanner::for_session(windowless);
     banner.paint_question(&question_text, &options, multi_select);
+    // A background fork's single-select question is answered on its OWN
+    // native dialog, from two surfaces at once (the user's law: 双向、谁
+    //先抢答算谁的). Instead of holding the tool call and filling the
+    // result, the gate LETS the native dialog render (returns no_opinion),
+    // pops a `claude attach` window so a person at the screen can answer it
+    // with the arrow keys, and leaves the phone push live — a phone tap is
+    // injected into that same dialog by the daemon. Multi-select keeps the
+    // held comma-reply path (its native dialog needs space-toggles the
+    // injector does not send yet). The window is fire-and-forget; if it
+    // cannot open, the phone remains the other surface.
+    //
+    // A question with NO options is free text: its native dialog is a text
+    // field the injector cannot drive by option index, so releasing it would
+    // strand the phone. Those keep the held path below, where a typed reply
+    // fills the answer exactly as v0.2.10 did — `native_attach` is false for
+    // them, so this branch is skipped.
+    if native_attach {
+        if let Err(err) = crate::fork_dialog::pop_attach_window(&thread_id) {
+            eprintln!("tinyctb question-gate: attach window: {err:#}");
+        }
+        return Ok(no_opinion());
+    }
     let phone_answered = |answer: &str| {
         let resolved = resolve_answer(answer, &options);
         banner.paint_note(&format!("✔ 已由手机作答：{resolved}"));
@@ -1299,6 +1329,54 @@ pub(crate) fn run_question_gate<R: Read>(reader: &mut R, now: u64) -> Result<Val
             Ok(no_opinion())
         }
     }
+}
+
+/// PostToolUse(AskUserQuestion): the authoritative "this question is answered"
+/// signal for a RELEASED background fork. It CLOSES the open row so the
+/// open-prompt scan stops re-offering it and a stale phone tap dedups — even
+/// when a person answered at the keyboard and the phone never probed the
+/// dialog. Everything else is a no-op: this fires after EVERY AskUserQuestion
+/// in every session, so the checks are the cheapest possible.
+///
+/// Whether PostToolUse fires for a `--bg` session answered via `claude attach`
+/// is the one thing this rests on that could not be verified live (the API was
+/// throttled at build time). If it does not fire, this is inert — the row then
+/// falls back to expiring after its window, exactly as before this hook.
+pub(crate) fn run_question_answered_gate<R: Read>(reader: &mut R, now: u64) -> Result<Value> {
+    let mut raw = String::new();
+    reader.take(1024 * 1024).read_to_string(&mut raw)?;
+    let Ok(payload) = serde_json::from_str::<Value>(raw.trim()) else {
+        return Ok(no_opinion());
+    };
+    if payload.get("tool_name").and_then(Value::as_str) != Some("AskUserQuestion") {
+        return Ok(no_opinion());
+    }
+    let Some(thread_id) = payload.get("session_id").and_then(Value::as_str) else {
+        return Ok(no_opinion());
+    };
+    if thread_id.is_empty() {
+        return Ok(no_opinion());
+    }
+    let path = state_db_path()?;
+    // READ-ONLY probe first: this hook fires after EVERY AskUserQuestion in
+    // every session, almost none with a released fork. `create_state_db` WRITES
+    // on init (WAL switch, migrations), so open only a READ-ONLY connection to
+    // check — and take a writable connection (and the writer lock) ONLY when
+    // there is actually an open native row to close.
+    if !crate::state::session_has_open_native_question_readonly(&path, thread_id) {
+        return Ok(no_opinion());
+    }
+    let conn = create_state_db(&path)?;
+    // The fork just answered an AskUserQuestion (here, or by the phone's
+    // injection). CLOSE every open native row for this session — the one just
+    // answered PLUS any older leftovers whose own answer events were missed
+    // (a fork is on one question at a time, so older open rows are stale). We
+    // do NOT parse the tool response for the option: a phone injection has
+    // already recorded the real answer (this settle is then a no-op on that
+    // non-null row, and would be OVERWRITTEN back by `record_native_answer`
+    // anyway); a purely-local answer only needs the row CLOSED.
+    crate::state::settle_open_native_questions_for_session(&conn, thread_id, now)?;
+    Ok(no_opinion())
 }
 
 /// Best-effort visibility for the blocked question window, written straight
@@ -1520,7 +1598,7 @@ fn clip(text: &str, max_chars: usize) -> String {
 /// contains a comma (`Washington, D.C.`) got split and rejoined without the
 /// space, and a sentence that merely opens with a letter (`A, but only
 /// locally`) had that letter swapped for an option label.
-fn resolve_answer(answer: &str, options: &[String]) -> String {
+pub(crate) fn resolve_answer(answer: &str, options: &[String]) -> String {
     let trimmed = answer.trim();
     // A tapped button sends its label verbatim, and a typed answer may equally
     // well be one. Labels are free text, commas included, so recognise them
@@ -3457,53 +3535,31 @@ mod tests {
         assert_eq!(asked, 0, "and must not mint a question row");
     }
 
-    /// The question gate's two windowless behaviours, together: the row gets
-    /// the day-long window (not the configured 30s), and the phone answer is
-    /// what ends the wait. (This wait used to also exit on transcript
-    /// evidence; that watcher was removed with presence detection — under
-    /// the current TUI no dialog renders while the hook blocks, so nothing
-    /// legitimate can decide the call behind the gate's back.)
+    /// A windowless single-select question is answered on the fork's OWN
+    /// native dialog now (2026-09-02, Option 2): the gate does NOT hold and
+    /// fill — it returns no_opinion so the dialog renders, pops a `claude
+    /// attach` window, and leaves the phone push live for the daemon to
+    /// inject. The gate returns at once (no 24h block), and the row it
+    /// minted — which the daemon injects against — carries the day-long
+    /// window so the phone buttons stay answerable while the fork waits.
     #[test]
-    fn windowless_question_gets_the_long_window_and_the_phone_decides() {
+    fn windowless_single_select_renders_natively_without_holding() {
         let _guard = crate::state::test_env_lock();
         let _env = GateEnv::new("windowless-question", true, 30);
         std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
 
-        let answerer = std::thread::spawn(|| {
-            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
-            loop {
-                if let Ok(question_id) = conn.query_row(
-                    "SELECT question_id FROM pending_questions WHERE answer IS NULL",
-                    [],
-                    |row| row.get::<_, String>(0),
-                ) {
-                    if matches!(
-                        crate::state::record_question_answer(&conn, &question_id, "SQLite", 2000),
-                        Ok(crate::state::ApprovalAnswer::Recorded)
-                    ) {
-                        return;
-                    }
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "question row never appeared"
-                );
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        });
         let started = std::time::Instant::now();
         let result = question_gate(question_payload());
-        answerer.join().expect("answerer");
         std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "0");
 
         assert_eq!(
-            result["hookSpecificOutput"]["hookEventName"], "PreToolUse",
-            "the phone answer must complete the call: {result}"
+            result,
+            json!({}),
+            "windowless single-select must render natively, not be filled by the gate: {result}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "the phone answer must end the wait, not the 24h window: {:?}",
+            started.elapsed() < Duration::from_secs(5),
+            "the gate must not block: {:?}",
             started.elapsed()
         );
         let conn = create_state_db(&state_db_path().expect("path")).expect("db");
@@ -4129,9 +4185,10 @@ mod tests {
         );
     }
 
-    /// A windowless session has no terminal anyone watches: its Telegram
-    /// window is the only dialog, and painting its hidden pty would be
-    /// writing to nobody.
+    /// A windowless session has no terminal anyone watches: painting its
+    /// hidden pty would be writing to nobody. The gate lets the fork's
+    /// native single-select dialog render (no_opinion) and never touches
+    /// the tty.
     #[test]
     fn a_windowless_session_paints_no_banner() {
         let _guard = crate::state::test_env_lock();
@@ -4140,35 +4197,12 @@ mod tests {
         fs::write(&tty, "").expect("fake tty");
         std::env::set_var("TINYCTB_TEST_SESSION_TTY", &tty);
         std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "1");
-        let handle = std::thread::spawn(|| {
-            let conn = create_state_db(&state_db_path().expect("path")).expect("db");
-            for _ in 0..100 {
-                std::thread::sleep(Duration::from_millis(100));
-                let Ok(question_id) = conn.query_row(
-                    "SELECT question_id FROM pending_questions WHERE answer IS NULL",
-                    [],
-                    |row| row.get::<_, String>(0),
-                ) else {
-                    continue;
-                };
-                if matches!(
-                    crate::state::record_question_answer(&conn, &question_id, "SQLite", 2000),
-                    Ok(crate::state::ApprovalAnswer::Recorded)
-                ) {
-                    return;
-                }
-            }
-            panic!("question row never appeared");
-        });
         let result = question_gate(question_payload());
-        handle.join().expect("answering thread");
         std::env::set_var("TINYCTB_TEST_SESSION_WINDOWLESS", "0");
-        // The answer still flows — with its receipt — but the tty stays
-        // untouched.
         assert_eq!(
-            result["hookSpecificOutput"]["updatedInput"]["answers"]["这个项目用哪个数据库？"],
-            "SQLite",
-            "{result}"
+            result,
+            json!({}),
+            "windowless single-select renders natively: {result}"
         );
         assert_eq!(
             fs::read_to_string(&tty).expect("fake tty"),

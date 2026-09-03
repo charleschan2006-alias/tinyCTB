@@ -911,6 +911,12 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "telegram_command_routes", "payload_json", "TEXT")?;
     ensure_column(conn, "telegram_callback_routes", "approval_id", "TEXT")?;
     ensure_column(conn, "pending_questions", "multi_select", "INTEGER")?;
+    // Set once, when the gate created the row: whether this question's answer
+    // is delivered by INJECTING into a background fork's native dialog (the
+    // gate released it) rather than by filling a blocked hook. The gate knows
+    // this first-hand, so the phone side reads the flag instead of re-guessing
+    // from /proc at tap time.
+    ensure_column(conn, "pending_questions", "native_attach", "INTEGER")?;
     ensure_column(conn, "pending_prompts", "transcript_bytes", "INTEGER")?;
     ensure_column(conn, "pending_prompts", "notification_type", "TEXT")?;
     // WHICH INSTANCE of a prompt this row is. The id is `notify:{received_at}`
@@ -3616,6 +3622,19 @@ pub(crate) fn create_pending_question(
     Ok(())
 }
 
+/// Mark an already-created question as one the gate RELEASED to a background
+/// fork's native dialog, so its answer is injected there rather than filled
+/// into a blocked hook. Kept separate from `create_pending_question` so the
+/// many callers that create ordinary held questions need not carry the flag;
+/// the gate sets it in the same flow, right after creating the row.
+pub(crate) fn mark_question_native_attach(conn: &Connection, question_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_questions SET native_attach = 1 WHERE question_id = ?1",
+        params![question_id],
+    )?;
+    Ok(())
+}
+
 /// A prompt that is still WAITING on the user: its hook is blocked polling
 /// the row this very moment, so a fresh set of answer buttons — on a
 /// /threads message, say — feeds the same row and works exactly like the
@@ -3815,6 +3834,40 @@ pub(crate) fn question_answer(conn: &Connection, question_id: &str) -> Result<Op
     Ok(answer.flatten())
 }
 
+/// A pending question's fork, text, options and multi-select flag — what
+/// the daemon needs to inject a phone answer into the fork's native dialog:
+/// the thread id is the fork to attach, the options give the answer's index
+/// and the presence signatures.
+pub(crate) struct QuestionPrompt {
+    pub(crate) thread_id: String,
+    pub(crate) options: Vec<String>,
+    /// The gate released this question to a background fork's native dialog,
+    /// so its answer must be INJECTED into that dialog rather than filled into
+    /// a blocked hook. Set at row creation; see `create_pending_question`. It
+    /// is set only for single-select questions, so it already implies the
+    /// answer is a single option, not a multi-select set.
+    pub(crate) native_attach: bool,
+}
+
+pub(crate) fn question_prompt(
+    conn: &Connection,
+    question_id: &str,
+) -> Result<Option<QuestionPrompt>> {
+    let row: Option<(String, String, Option<i64>)> = conn
+        .query_row(
+            "SELECT thread_id, options_json, native_attach
+             FROM pending_questions WHERE question_id = ?1",
+            params![question_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(thread_id, options_json, native)| QuestionPrompt {
+        thread_id,
+        options: serde_json::from_str::<Vec<String>>(&options_json).unwrap_or_default(),
+        native_attach: native.unwrap_or(0) != 0,
+    }))
+}
+
 /// Same one-answer-only contract as approvals: the first answer wins, and an
 /// answer after the deadline is refused because the blocked hook has already
 /// given up and the terminal dialog has taken over.
@@ -3862,8 +3915,133 @@ pub(crate) fn record_question_answer(
     })
 }
 
+/// Record a POSITIVELY-injected phone answer for a native-attach question,
+/// OVERWRITING the "answered elsewhere" soft-settle if the PostToolUse hook
+/// raced in between our Enter and here. The fork provably took the phone's
+/// option, so the real option must win over the sentinel — otherwise the audit
+/// and `/threads` would show `\0elsewhere` instead of what was chosen. A real
+/// answer already present, or the expired sentinel, is left as-is.
+pub(crate) fn record_native_answer(
+    conn: &Connection,
+    question_id: &str,
+    answer: &str,
+    now: u64,
+) -> Result<ApprovalAnswer> {
+    let changed = conn.execute(
+        "UPDATE pending_questions SET answer = ?2, answered_at = ?3
+         WHERE question_id = ?1 AND (answer IS NULL OR answer = ?4)",
+        params![
+            question_id,
+            answer,
+            to_sql_i64(now)?,
+            QUESTION_ANSWERED_ELSEWHERE
+        ],
+    )?;
+    if changed > 0 {
+        return Ok(ApprovalAnswer::Recorded);
+    }
+    Ok(match question_answer(conn, question_id)?.as_deref() {
+        Some(QUESTION_EXPIRED) => ApprovalAnswer::Expired,
+        Some(_) => ApprovalAnswer::AlreadyAnswered,
+        None => ApprovalAnswer::Unknown,
+    })
+}
+
 /// Sentinel stored in `answer` for a question nobody answered in time.
 pub(crate) const QUESTION_EXPIRED: &str = "\u{0}expired";
+
+/// Sentinel stored in `answer` for a question a person answered at the keyboard
+/// (a released background fork's native dialog closed before the phone's
+/// injection reached it). It CLOSES the row — so the open-prompt scan stops
+/// re-offering it — without inventing an answer we never learned. Filtered from
+/// display the same as `QUESTION_EXPIRED`.
+pub(crate) const QUESTION_ANSWERED_ELSEWHERE: &str = "\u{0}elsewhere";
+
+/// The open/answered/expired status of a pending question, resolved WITHOUT
+/// mutating it. The native-attach path uses this to decide, before injecting,
+/// whether the question is still open — including the DEADLINE, which an
+/// `answer`-only peek would miss (so an expired button would otherwise still
+/// drive the fork's keys).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuestionStatus {
+    /// No such row.
+    Missing,
+    /// Already carries an answer (any surface, "answered elsewhere" included).
+    Answered,
+    /// Past its deadline — the sentinel is written, or `now` is beyond
+    /// `expires_at`.
+    Expired,
+    /// Still open for an answer.
+    Open,
+}
+
+pub(crate) fn pending_question_status(
+    conn: &Connection,
+    question_id: &str,
+    now: u64,
+) -> Result<QuestionStatus> {
+    let row: Option<(Option<String>, i64)> = conn
+        .query_row(
+            "SELECT answer, expires_at FROM pending_questions WHERE question_id = ?1",
+            params![question_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((answer, expires_at)) = row else {
+        return Ok(QuestionStatus::Missing);
+    };
+    match answer.as_deref() {
+        Some(QUESTION_EXPIRED) => return Ok(QuestionStatus::Expired),
+        Some(_) => return Ok(QuestionStatus::Answered),
+        None => {}
+    }
+    if timestamp_to_millis(now) > timestamp_to_millis(from_sql_i64(expires_at)?) {
+        return Ok(QuestionStatus::Expired);
+    }
+    Ok(QuestionStatus::Open)
+}
+
+/// Close EVERY open native-attach question for `thread_id` — what the
+/// PostToolUse "answered" hook does. A background fork blocks on ONE
+/// AskUserQuestion at a time, so any open native rows besides the one just
+/// answered are STALE (their own answer events were missed, e.g. a PostToolUse
+/// that never fired); closing them all is correct and stops `/threads`
+/// re-offering leftovers. Conditional on `answer IS NULL`, so it never
+/// overwrites a real recorded answer. Returns how many rows it closed.
+pub(crate) fn settle_open_native_questions_for_session(
+    conn: &Connection,
+    thread_id: &str,
+    now: u64,
+) -> Result<usize> {
+    let changed = conn.execute(
+        "UPDATE pending_questions SET answer = ?2, answered_at = ?3
+         WHERE thread_id = ?1 AND answer IS NULL AND native_attach = 1",
+        params![thread_id, QUESTION_ANSWERED_ELSEWHERE, to_sql_i64(now)?],
+    )?;
+    Ok(changed)
+}
+
+/// Cheap READ-ONLY probe: does `thread_id` have any open native-attach
+/// question, WITHOUT opening a read-write connection? `create_state_db` writes
+/// on init (WAL switch, migrations), so the PostToolUse hook — which fires
+/// after EVERY AskUserQuestion in every session, almost none with a released
+/// fork — opens a READ-ONLY connection here and only takes the writer lock when
+/// this returns true. Any failure (missing/locked/unmigrated DB) degrades to
+/// `false`: the hook then does nothing and the row falls back to expiring, no
+/// worse than if PostToolUse had not fired.
+pub(crate) fn session_has_open_native_question_readonly(db_path: &Path, thread_id: &str) -> bool {
+    let Ok(conn) = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return false;
+    };
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pending_questions
+         WHERE thread_id = ?1 AND answer IS NULL AND native_attach = 1)",
+        params![thread_id],
+        |row| row.get(0),
+    )
+    .unwrap_or(false)
+}
 
 /// Atomic counterpart of `expire_or_take_decision` for questions.
 pub(crate) fn expire_or_take_answer(
@@ -3879,7 +4057,8 @@ pub(crate) fn expire_or_take_answer(
     if changed > 0 {
         return Ok(None);
     }
-    Ok(question_answer(conn, question_id)?.filter(|answer| answer != QUESTION_EXPIRED))
+    Ok(question_answer(conn, question_id)?
+        .filter(|answer| answer != QUESTION_EXPIRED && answer != QUESTION_ANSWERED_ELSEWHERE))
 }
 
 fn approval_auto_allow_key(thread_id: &str, tool_name: &str) -> String {

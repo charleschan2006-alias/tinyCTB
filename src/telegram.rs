@@ -2617,9 +2617,119 @@ fn execute_telegram_command_prompt_reply(
     }
 }
 
-/// Turn a tapped button into a decision the blocked PreToolUse hook can read.
-/// The write is conditional on the approval still being unanswered, so a
-/// double tap (or the other button) cannot overturn the first answer.
+/// Whether this pending question was RELEASED to a background fork's native
+/// dialog, so its answer is delivered by injecting the option's number into
+/// that dialog rather than by finalising the row a blocked hook is polling.
+fn question_is_native_attach(conn: &Connection, question_id: &str) -> Result<bool> {
+    Ok(crate::state::question_prompt(conn, question_id)?
+        .map(|prompt| prompt.native_attach)
+        .unwrap_or(false))
+}
+
+/// The held-path toast for a just-recorded answer: the row the blocked hook
+/// is polling now carries the answer, so just confirm it (resolved to the
+/// option's label).
+fn held_answer_toast(conn: &Connection, question_id: &str, answer: &str) -> String {
+    match crate::state::question_prompt(conn, question_id) {
+        Ok(Some(prompt)) => format!(
+            "已作答：{}",
+            crate::approvals::resolve_answer(answer, &prompt.options)
+        ),
+        _ => format!("已作答：{answer}"),
+    }
+}
+
+/// Deliver a phone answer to a RELEASED background fork by injecting the
+/// chosen option's number into its native dialog, finalising the row ONLY if
+/// the fork actually took it. Returns the toast and the audit outcome.
+///
+/// Inject-before-record is the safety the two-surface race needs: a failed
+/// injection must never leave a recorded answer the fork never received. The
+/// one-answer rule is guarded up front — an already answered or expired row is
+/// not injected again — and "谁先抢答" is honoured: if the dialog is already
+/// gone, a person answered it at the screen first, so report that and record
+/// nothing.
+fn inject_native_attach_answer(
+    conn: &Connection,
+    question_id: &str,
+    answer: &str,
+    now: u64,
+) -> Result<(String, ApprovalAnswer, bool)> {
+    let Some(prompt) = crate::state::question_prompt(conn, question_id)? else {
+        return Ok((
+            "这个按钮已经失效了。".to_string(),
+            ApprovalAnswer::Unknown,
+            false,
+        ));
+    };
+    // Check the row's status — including the DEADLINE — BEFORE injecting, so an
+    // expired or already-answered button never drives the fork's keys.
+    match crate::state::pending_question_status(conn, question_id, now)? {
+        crate::state::QuestionStatus::Missing => {
+            return Ok((
+                "这个按钮已经失效了。".to_string(),
+                ApprovalAnswer::Unknown,
+                false,
+            ));
+        }
+        crate::state::QuestionStatus::Answered => {
+            return Ok((
+                "这个问题已经回答过了。".to_string(),
+                ApprovalAnswer::AlreadyAnswered,
+                false,
+            ));
+        }
+        crate::state::QuestionStatus::Expired => {
+            return Ok((
+                "这个问题的手机答复窗口已关闭。用 /threads 看这个会话现在停在哪里。".to_string(),
+                ApprovalAnswer::Expired,
+                false,
+            ));
+        }
+        crate::state::QuestionStatus::Open => {}
+    }
+    let resolved = crate::approvals::resolve_answer(answer, &prompt.options);
+    // Map the answer to an option NUMBER. A reply that is not one of the options
+    // cannot be a numbered selection — that is a bad answer, not a transient
+    // failure, so it is NOT retryable and nothing is recorded.
+    let Some(index) = prompt.options.iter().position(|opt| opt == &resolved) else {
+        return Ok((
+            format!("“{resolved}”不是这个问题的选项，没能作答（未记录）。"),
+            ApprovalAnswer::Unknown,
+            false,
+        ));
+    };
+    // Deliver by injecting the number. Only POSITIVE delivery (`Injected`)
+    // records; anything else claims nothing here. A `Unreachable` or a pty/
+    // attach error is a TRANSIENT delivery failure → retryable; the row is left
+    // open, and the PostToolUse hook closes it if the fork's answer lands.
+    match crate::fork_dialog::inject_option(&prompt.thread_id, index, true) {
+        Ok(crate::fork_dialog::InjectOutcome::Injected) => {
+            // The fork provably took it. Record the real option — OVERWRITING
+            // the hook's "answered elsewhere" soft-settle if it raced in between
+            // our Enter and here — so the audit and /threads show the choice.
+            let outcome = crate::state::record_native_answer(conn, question_id, answer, now)?;
+            Ok((format!("已作答：{resolved}"), outcome, false))
+        }
+        Ok(crate::fork_dialog::InjectOutcome::Unreachable) => Ok((
+            "没能连上对话框，请在电脑窗口作答（未记录，可重试）。".to_string(),
+            ApprovalAnswer::Unknown,
+            true,
+        )),
+        Err(err) => {
+            eprintln!(
+                "tinyctb: inject fork answer for {}: {err:#}",
+                prompt.thread_id
+            );
+            Ok((
+                "没能连上对话框，请在电脑窗口作答（未记录，可重试）。".to_string(),
+                ApprovalAnswer::Unknown,
+                true,
+            ))
+        }
+    }
+}
+
 fn record_callback_answer(
     conn: &Connection,
     route: &RoutedTelegramCallback,
@@ -2630,14 +2740,23 @@ fn record_callback_answer(
     if let (Some(question_id), Some(answer)) =
         (route.question_id.as_deref(), route.answer.as_deref())
     {
-        let outcome = crate::state::record_question_answer(conn, question_id, answer, now)?;
-        let toast = match outcome {
-            ApprovalAnswer::Recorded => format!("已作答：{answer}"),
-            ApprovalAnswer::AlreadyAnswered => "这个问题已经回答过了。".to_string(),
-            ApprovalAnswer::Expired => {
-                "这个问题的手机答复窗口已关闭。用 /threads 看这个会话现在停在哪里。".to_string()
-            }
-            ApprovalAnswer::Unknown => "这个按钮已经失效了。".to_string(),
+        // A released background fork is answered by INJECTING into its native
+        // dialog, so inject before recording and never pre-finalise the row
+        // (P1-3). Every other question keeps the held path: finalise the row so
+        // the blocked hook reads the answer.
+        let (toast, outcome, retryable) = if question_is_native_attach(conn, question_id)? {
+            inject_native_attach_answer(conn, question_id, answer, now)?
+        } else {
+            let outcome = crate::state::record_question_answer(conn, question_id, answer, now)?;
+            let toast = match outcome {
+                ApprovalAnswer::Recorded => held_answer_toast(conn, question_id, answer),
+                ApprovalAnswer::AlreadyAnswered => "这个问题已经回答过了。".to_string(),
+                ApprovalAnswer::Expired => {
+                    "这个问题的手机答复窗口已关闭。用 /threads 看这个会话现在停在哪里。".to_string()
+                }
+                ApprovalAnswer::Unknown => "这个按钮已经失效了。".to_string(),
+            };
+            (toast, outcome, false)
         };
         return Ok(json!({
             "ok": true,
@@ -2647,6 +2766,9 @@ fn record_callback_answer(
             "answer": answer,
             "outcome": format!("{outcome:?}"),
             "recorded": outcome == ApprovalAnswer::Recorded,
+            // A retryable failure (the dialog could not be reached) keeps the
+            // button live: the dispatcher does not consume the route.
+            "retryable": retryable,
             "toast": toast
         }));
     }
@@ -2816,14 +2938,25 @@ fn answer_pending_question_from_reply(
     }
 
     let question_id = ref_id;
-    let outcome = crate::state::record_question_answer(conn, &question_id, text, now)?;
-    let notice = match outcome {
-        ApprovalAnswer::Recorded => format!("已作答：{text}"),
-        ApprovalAnswer::AlreadyAnswered => "这个问题已经回答过了。".to_string(),
-        ApprovalAnswer::Expired => {
-            "这个问题的手机答复窗口已关闭。用 /threads 看这个会话现在停在哪里。".to_string()
-        }
-        ApprovalAnswer::Unknown => "这个问题已经失效了。".to_string(),
+    // Same split as the button path: a released background fork's typed answer
+    // is injected into its native dialog (inject before recording); every other
+    // question finalises the row for the blocked hook.
+    // A typed reply that fails to reach the dialog need not carry a retry flag:
+    // re-replying is a fresh message with its own route, so the retryable bit is
+    // only meaningful for the button dispatcher.
+    let (notice, outcome, _retryable) = if question_is_native_attach(conn, &question_id)? {
+        inject_native_attach_answer(conn, &question_id, text, now)?
+    } else {
+        let outcome = crate::state::record_question_answer(conn, &question_id, text, now)?;
+        let notice = match outcome {
+            ApprovalAnswer::Recorded => held_answer_toast(conn, &question_id, text),
+            ApprovalAnswer::AlreadyAnswered => "这个问题已经回答过了。".to_string(),
+            ApprovalAnswer::Expired => {
+                "这个问题的手机答复窗口已关闭。用 /threads 看这个会话现在停在哪里。".to_string()
+            }
+            ApprovalAnswer::Unknown => "这个问题已经失效了。".to_string(),
+        };
+        (notice, outcome, false)
     };
     let sent = send_telegram_command_text(telegram, &notice, timeout)?;
     Ok(Some(json!({
@@ -3280,7 +3413,16 @@ fn process_telegram_update_batch(
                 match extract_telegram_callback_route(conn, callback_query, telegram)? {
                     TelegramCallbackLookup::Route(route) => {
                         let mut answer = record_callback_answer(conn, &route, now)?;
-                        mark_telegram_callback_route_used(conn, &route.callback_id, now)?;
+                        // A retryable failure (the fork's dialog could not be
+                        // reached) keeps the button live for another tap; every
+                        // settled outcome consumes the route.
+                        let retryable = answer
+                            .get("retryable")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if !retryable {
+                            mark_telegram_callback_route_used(conn, &route.callback_id, now)?;
+                        }
                         let ack = acknowledge_callback_tap(
                             telegram,
                             &route.callback_query_id,
@@ -7563,5 +7705,307 @@ mod tests {
             extract_telegram_callback_route(&conn, &stranger, &telegram).expect("stranger"),
             TelegramCallbackLookup::Foreign
         ));
+    }
+
+    /// A stub `claude attach` that keeps a background printer redrawing `prints`
+    /// UNTIL it is answered, captures the first two bytes typed at it, then
+    /// redraws `after` — the fork's next state once the dialog closed, the
+    /// positive evidence the post-Enter check needs. Raw mode so the CR is not
+    /// mangled.
+    fn attach_stub(
+        dir: &std::path::Path,
+        prints: &str,
+        after: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let capture = dir.join("keys.bin");
+        let stub = dir.join("attach.sh");
+        let done = dir.join("answered.flag");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nstty raw -echo 2>/dev/null\n( while true; do if [ -f '{done}' ]; then printf '%s' '{after}'; else printf '%s' '{prints}'; fi; sleep 0.03; done ) &\nprinter=$!\nhead -c 2 > '{capture}' 2>/dev/null\n: > '{done}'\nsleep 0.4\nkill \"$printer\" 2>/dev/null\n",
+                done = done.display(),
+                capture = capture.display()
+            ),
+        )
+        .expect("stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        (stub, capture)
+    }
+
+    /// A stub `claude attach` that renders NOTHING and exits — attach failed to
+    /// bring up a screen.
+    fn dead_attach_stub(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let stub = dir.join("attach-dead.sh");
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        stub
+    }
+
+    /// A background fork's single-select answer is INJECTED into its native
+    /// dialog: the selector chrome is present, so the fork is sent the option's
+    /// number ("2" for SQLite at index 1) + Enter, the row is THEN finalised
+    /// for dedup, and the toast confirms it.
+    #[test]
+    fn a_bg_fork_answer_is_injected_into_the_native_dialog() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::create_pending_question(
+            &conn,
+            "qf1",
+            "sess-fork",
+            "选哪个数据库？",
+            &["Postgres".to_string(), "SQLite".to_string()],
+            false,
+            1000,
+            9_000_000,
+        )
+        .expect("create");
+        crate::state::mark_question_native_attach(&conn, "qf1").expect("mark");
+        // Do NOT pre-record: the native path injects first and records only on
+        // success.
+
+        let dir = std::env::temp_dir().join(format!("tinyctb-tg-inject-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (stub, capture) = attach_stub(&dir, "Enter to select", "continuing…");
+        std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
+        std::env::set_var("TINYCTB_TEST_ATTACH_WAIT_MS", "400");
+
+        let (toast, outcome, retryable) =
+            inject_native_attach_answer(&conn, "qf1", "SQLite", 2000).expect("inject");
+
+        std::env::remove_var("TINYCTB_TEST_ATTACH");
+        std::env::remove_var("TINYCTB_TEST_ATTACH_WAIT_MS");
+        assert_eq!(toast, "已作答：SQLite");
+        assert_eq!(outcome, ApprovalAnswer::Recorded);
+        assert!(!retryable);
+        let got = std::fs::read(&capture).unwrap_or_default();
+        assert!(
+            got.starts_with(&crate::fork_dialog::option_digits(1)),
+            "stub received {got:?}"
+        );
+        assert!(
+            crate::state::question_answer(&conn, "qf1")
+                .expect("answer")
+                .is_some(),
+            "the fork took it, so the row is finalised"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A real screen is up but it is NOT the selector (answered at the keyboard,
+    /// still connecting, or errored — a pty cannot tell): nothing is injected,
+    /// the row is LEFT OPEN, and the toast is honest and retryable. A purely-
+    /// local answer is closed by the PostToolUse hook, not by this inference.
+    #[test]
+    fn a_non_selector_screen_reports_unreachable() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::create_pending_question(
+            &conn,
+            "qf2",
+            "sess-fork",
+            "选哪个数据库？",
+            &["Postgres".to_string(), "SQLite".to_string()],
+            false,
+            1000,
+            9_000_000,
+        )
+        .expect("create");
+        crate::state::mark_question_native_attach(&conn, "qf2").expect("mark");
+
+        let dir = std::env::temp_dir().join(format!("tinyctb-tg-gone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (stub, capture) = attach_stub(&dir, "the session is busy elsewhere", "gone");
+        std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
+        std::env::set_var("TINYCTB_TEST_ATTACH_WAIT_MS", "400");
+
+        let (toast, outcome, retryable) =
+            inject_native_attach_answer(&conn, "qf2", "Postgres", 2000).expect("inject");
+
+        std::env::remove_var("TINYCTB_TEST_ATTACH");
+        std::env::remove_var("TINYCTB_TEST_ATTACH_WAIT_MS");
+        assert!(toast.contains("没能连上"), "{toast}");
+        assert_eq!(outcome, ApprovalAnswer::Unknown);
+        assert!(
+            retryable,
+            "a non-selector screen is a retryable delivery miss"
+        );
+        assert!(
+            std::fs::read(&capture).unwrap_or_default().is_empty(),
+            "no keys to a non-selector screen"
+        );
+        // The row is LEFT OPEN — the phone claimed nothing; the PostToolUse hook
+        // closes it if the fork's answer actually lands.
+        assert_eq!(
+            crate::state::pending_question_status(&conn, "qf2", 2000).expect("status"),
+            crate::state::QuestionStatus::Open
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An attach that never renders is `Unreachable`, NOT "answered locally":
+    /// nothing is recorded or settled, the row is LEFT OPEN, and the toast is
+    /// honest and retryable.
+    #[test]
+    fn a_bg_fork_answer_reports_unreachable_when_attach_fails() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::create_pending_question(
+            &conn,
+            "qf4",
+            "sess-fork",
+            "选哪个？",
+            &["Postgres".to_string(), "SQLite".to_string()],
+            false,
+            1000,
+            9_000_000,
+        )
+        .expect("create");
+        crate::state::mark_question_native_attach(&conn, "qf4").expect("mark");
+
+        let dir = std::env::temp_dir().join(format!("tinyctb-tg-dead-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let stub = dead_attach_stub(&dir);
+        std::env::set_var("TINYCTB_TEST_ATTACH", &stub);
+        std::env::set_var("TINYCTB_TEST_ATTACH_WAIT_MS", "400");
+
+        let (toast, outcome, retryable) =
+            inject_native_attach_answer(&conn, "qf4", "SQLite", 2000).expect("inject");
+
+        std::env::remove_var("TINYCTB_TEST_ATTACH");
+        std::env::remove_var("TINYCTB_TEST_ATTACH_WAIT_MS");
+        assert!(toast.contains("没能连上"), "{toast}");
+        assert_eq!(outcome, ApprovalAnswer::Unknown);
+        assert!(retryable, "an attach failure is retryable");
+        assert_eq!(
+            crate::state::pending_question_status(&conn, "qf4", 2000).expect("status"),
+            crate::state::QuestionStatus::Open
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A terminal session (not a background fork) keeps the held path: the
+    /// toast is the plain confirmation, no injection attempted.
+    #[test]
+    fn a_terminal_session_answer_is_not_injected() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::create_pending_question(
+            &conn,
+            "qf3",
+            "sess-terminal",
+            "选哪个？",
+            &["Postgres".to_string(), "SQLite".to_string()],
+            false,
+            1000,
+            9_000_000,
+        )
+        .expect("create");
+        // native_attach was never marked on this row, so it takes the held
+        // path: finalise for the blocked hook, plain confirmation, no injection.
+        assert!(!question_is_native_attach(&conn, "qf3").expect("native flag"));
+        crate::state::record_question_answer(&conn, "qf3", "SQLite", 2000).expect("record");
+        assert_eq!(held_answer_toast(&conn, "qf3", "SQLite"), "已作答：SQLite");
+    }
+
+    /// The PostToolUse hook CLOSES a released fork's open row once its question
+    /// is answered — the authoritative signal that settles a purely-local answer
+    /// even when the phone never probed the dialog. Fired for another tool, or
+    /// for a session with no open native row, it is a no-op.
+    #[test]
+    fn the_answered_hook_closes_the_open_native_row() {
+        let _guard = crate::state::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("tinyctb-hook-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::env::set_var("TINYCTB_STATE_DIR", &dir);
+        let db = crate::state::state_db_path().expect("db path");
+        let conn = crate::state::create_state_db(&db).expect("db");
+        crate::state::create_pending_question(
+            &conn,
+            "qh1",
+            "sess-hooked",
+            "选哪个？",
+            &["Postgres".to_string(), "SQLite".to_string()],
+            false,
+            1000,
+            9_000_000,
+        )
+        .expect("create");
+        crate::state::mark_question_native_attach(&conn, "qh1").expect("mark");
+        // A STALE older native row for the same session (its own answer event
+        // was missed) — the hook must close it too.
+        crate::state::create_pending_question(
+            &conn,
+            "qh0",
+            "sess-hooked",
+            "旧问题？",
+            &["A".to_string(), "B".to_string()],
+            false,
+            900,
+            9_000_000,
+        )
+        .expect("create");
+        crate::state::mark_question_native_attach(&conn, "qh0").expect("mark");
+
+        // Wrong tool → no-op, the rows stay open.
+        let mut other = br#"{"tool_name":"Bash","session_id":"sess-hooked"}"#.as_slice();
+        crate::approvals::run_question_answered_gate(&mut other, 1500).expect("gate");
+        assert_eq!(
+            crate::state::pending_question_status(&conn, "qh1", 1500).expect("status"),
+            crate::state::QuestionStatus::Open
+        );
+
+        // AskUserQuestion answered in this session → EVERY open native row for
+        // it closes (the one just answered plus the stale leftover).
+        let mut payload =
+            br#"{"tool_name":"AskUserQuestion","session_id":"sess-hooked"}"#.as_slice();
+        crate::approvals::run_question_answered_gate(&mut payload, 1500).expect("gate");
+        assert_eq!(
+            crate::state::pending_question_status(&conn, "qh1", 1500).expect("status"),
+            crate::state::QuestionStatus::Answered
+        );
+        assert_eq!(
+            crate::state::pending_question_status(&conn, "qh0", 1500).expect("status"),
+            crate::state::QuestionStatus::Answered
+        );
+
+        std::env::remove_var("TINYCTB_STATE_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A positively-injected phone answer OVERWRITES the hook's "answered
+    /// elsewhere" soft-settle, so the audit and /threads show the real option
+    /// rather than the sentinel, no matter which raced in first.
+    #[test]
+    fn a_native_answer_overwrites_the_soft_settle() {
+        let _guard = crate::state::test_env_lock();
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        crate::state::create_pending_question(
+            &conn,
+            "qn1",
+            "sess-race",
+            "选哪个？",
+            &["Postgres".to_string(), "SQLite".to_string()],
+            false,
+            1000,
+            9_000_000,
+        )
+        .expect("create");
+        crate::state::mark_question_native_attach(&conn, "qn1").expect("mark");
+        // The hook raced in first and soft-settled the row.
+        crate::state::settle_open_native_questions_for_session(&conn, "sess-race", 1200)
+            .expect("settle");
+        // The phone's positively-injected answer still records the real option.
+        assert_eq!(
+            crate::state::record_native_answer(&conn, "qn1", "SQLite", 1300).expect("record"),
+            crate::state::ApprovalAnswer::Recorded
+        );
+        assert_eq!(
+            crate::state::question_answer(&conn, "qn1").expect("answer"),
+            Some("SQLite".to_string())
+        );
     }
 }
