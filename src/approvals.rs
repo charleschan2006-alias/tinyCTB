@@ -1403,6 +1403,12 @@ pub(crate) fn run_question_answered_gate<R: Read>(reader: &mut R, now: u64) -> R
         .unwrap_or_default();
     let conn = create_state_db(&path)?;
     crate::state::record_native_answers_from_hook(&conn, thread_id, &answers, now)?;
+    // The question is settled, so the popped `claude attach` viewer window (if a
+    // person answered locally, or it was popped and the phone answered) has done
+    // its job — close it so it does not linger showing the fork's ongoing output.
+    // Best-effort; only ever targets a `claude attach <this fork's short id>`
+    // client, never the fork.
+    crate::fork_dialog::close_attach_windows(thread_id);
     Ok(no_opinion())
 }
 

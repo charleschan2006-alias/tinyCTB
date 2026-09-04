@@ -5,3 +5,6 @@ apps/macos-menu-bar/.build
 /exp
 /.claude/
 /.codex/
+# Byte-cache for the shipped python focus helper (src/focus_attach.py)
+__pycache__/
+*.pyc

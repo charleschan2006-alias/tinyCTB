@@ -106,6 +106,65 @@ fn terminal_bin() -> PathBuf {
     PathBuf::from("gnome-terminal")
 }
 
+/// The python-xlib focus helper, embedded so it ships with the binary (deploy
+/// stays "build + copy the binary"). Written to the cache dir on use and run as
+/// `python3 focus_attach.py <terminal> <args…>`; it snapshots the window list,
+/// launches the terminal, and pulls the new window to the foreground with
+/// keyboard focus — which a background daemon otherwise cannot get past Mutter's
+/// focus-stealing prevention. See the module doc and `docs/approvals.md`.
+#[cfg(not(test))]
+const FOCUS_HELPER_PY: &str = include_str!("focus_attach.py");
+
+/// Write the embedded focus helper to `~/.cache/tinyctb/focus_attach.py` (never
+/// the code dir, never `/tmp`) and return its path. Rewrites only when the
+/// on-disk copy differs, so concurrent pops don't thrash the file and an upgrade
+/// still refreshes it. `None` if the cache dir can't be resolved or written —
+/// the caller then pops the window WITHOUT focus assist.
+#[cfg(not(test))]
+fn materialize_focus_helper() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    let dir = base.join("tinyctb");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("focus_attach.py");
+    let fresh = std::fs::read(&path)
+        .map(|c| c == FOCUS_HELPER_PY.as_bytes())
+        .unwrap_or(false);
+    if !fresh {
+        // Publish atomically: write a UNIQUE temp then rename onto the path. A
+        // plain truncating write could hand a CONCURRENT pop's python a
+        // half-written script (parse fail → no window); rename(2) within the
+        // same dir is atomic, so any reader sees a whole file (Sol review).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(
+            "focus_attach.py.{}.{}.tmp",
+            std::process::id(),
+            seq
+        ));
+        std::fs::write(&tmp, FOCUS_HELPER_PY).ok()?;
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+    }
+    Some(path)
+}
+
+/// Python 3, absolute where this machine keeps it, else a PATH lookup. The
+/// daemon's systemd `PATH` includes `/usr/bin`, so the bare name also resolves.
+#[cfg(not(test))]
+fn python3_bin() -> PathBuf {
+    let abs = PathBuf::from("/usr/bin/python3");
+    if abs.exists() {
+        abs
+    } else {
+        PathBuf::from("python3")
+    }
+}
+
 /// Open the fork's native dialog in a desktop window. The window closes when
 /// `claude attach` exits (when the viewer detaches or the session ends).
 /// Fire-and-forget: a failure to pop the window is not fatal — the phone
@@ -120,8 +179,34 @@ pub(crate) fn pop_attach_window(session_id: &str) -> Result<()> {
         .path
         .to_string_lossy()
         .into_owned();
-    let mut cmd = Command::new(terminal_bin());
-    cmd.args(attach_window_argv(session_id, &claude_bin))
+    let terminal = terminal_bin();
+    let argv = attach_window_argv(session_id, &claude_bin);
+
+    // Preferred (production): launch THROUGH the python-xlib focus helper so the
+    // popped window comes to the foreground with keyboard focus. Mutter denies
+    // focus to a window a background daemon maps (the "dialog flashed but has no
+    // focus" report), and the helper steals it back with `_NET_ACTIVE_WINDOW`
+    // source=2. The helper always spawns the terminal itself — even if X or
+    // python-xlib is unavailable — so the window never depends on focus working;
+    // only if `python3` cannot be launched AT ALL do we fall through to popping
+    // the terminal directly.
+    #[cfg(not(test))]
+    if let Some(helper) = materialize_focus_helper() {
+        let mut cmd = Command::new(python3_bin());
+        cmd.arg(&helper)
+            .arg(&terminal)
+            .args(&argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        fill_x_env(&mut cmd);
+        if cmd.spawn().is_ok() {
+            return Ok(());
+        }
+    }
+
+    let mut cmd = Command::new(&terminal);
+    cmd.args(&argv)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -129,6 +214,87 @@ pub(crate) fn pop_attach_window(session_id: &str) -> Result<()> {
     cmd.spawn()
         .with_context(|| format!("pop attach window for {session_id}"))?;
     Ok(())
+}
+
+/// True when `argv` is exactly a `<claude> attach <short>` client — the popped
+/// viewer window's process, and NOT the fork itself. The fork runs under
+/// `bg-pty-host` with a long, totally different argv, so this narrow 3-element
+/// shape can only ever match an attach client.
+///
+/// `argv[0]` matches either the EXACT claude path the pop resolved
+/// (`claude_path` — the native/symlink case, where `execve` preserves argv[0]),
+/// OR any argv[0] whose BASENAME is exactly `claude` — the real binary an
+/// `exec`-type wrapper lands on. That covers both `exec /real/claude "$@"`
+/// (argv[0] = `/real/claude`) and the common PATH form `exec claude "$@"`
+/// (argv[0] = a bare `claude`, no slash). Requiring the whole basename to equal
+/// `claude` keeps it precise: it excludes a stray `/tmp/notclaude` (basename
+/// `notclaude`) and a bare `notclaude` — the false positive a loose
+/// `ends_with("claude")` had (Sol review, rounds 1–3). It DOES also match this
+/// same fork's own headless injector (`with_attach_pty`, another
+/// `<claude> attach <short>`), which is harmless: by the time the answer is
+/// recorded that injector has delivered, and SIGTERMing it just ends an already
+/// finished pty. Residual, unclosable, documented as a known limit — stated
+/// generally so it is complete by construction: ANY wrapper whose RUNNING
+/// argv[0] is neither `claude_path` nor has basename `claude` won't be matched
+/// (a leak, never a mis-kill). That covers an `exec` to a renamed / versioned /
+/// `readlink`-resolved real binary (`claude.real`), a shebang wrapper with NO
+/// `exec` (the kernel prepends the interpreter, so argv is not 3 elements), and
+/// `exec -a <name>` that rewrites argv[0]. The common forms — native, symlink,
+/// `exec /real/claude`, bare `exec claude` — are all covered.
+fn is_attach_client_argv(argv: &[&[u8]], claude_path: &[u8], short: &str) -> bool {
+    if argv.len() != 3 || argv[1] != b"attach" || argv[2] != short.as_bytes() {
+        return false;
+    }
+    // basename(argv[0]) = the segment after the last '/', or the whole arg when
+    // there is none (a bare `claude`). rsplit always yields at least one item.
+    let basename = argv[0].rsplit(|b| *b == b'/').next().unwrap_or(argv[0]);
+    argv[0] == claude_path || basename == b"claude"
+}
+
+/// Close any popped `claude attach <short-id>` viewer window for this fork — its
+/// whole job (letting a person at the screen answer the ONE question) is done
+/// the moment the question settles, so it should not linger showing the fork's
+/// ongoing output. Scans `/proc` for the attach CLIENT process (matched by its
+/// exact argv via [`is_attach_client_argv`], never the fork) and SIGTERMs it;
+/// `gnome-terminal` then closes the window as its child exits. Best-effort: a
+/// missing `/proc`, an unreadable cmdline, or a failed kill is not fatal, and a
+/// person who has already closed the window just leaves nothing to match.
+pub(crate) fn close_attach_windows(session_id: &str) {
+    let short = short_id(session_id);
+    // Match argv[0] against the SAME claude the pop resolved, so a `cc` /
+    // `claude-wrapper` symlink is still closed and a stray `/tmp/notclaude`
+    // isn't. If claude can't be resolved right now, skip closing — best-effort,
+    // exactly like a failed pop (the window then lingers, never mis-kills).
+    let Ok(resolved) = crate::claude::resolve_claude_binary() else {
+        return;
+    };
+    let claude_path = resolved.path.to_string_lossy();
+    let claude_path = claude_path.as_bytes();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        // /proc/<pid>/cmdline is NUL-separated with a trailing NUL; drop ONLY
+        // that trailing empty, keeping any (rare) internal empty arg so the
+        // "exactly three args" shape stays strict (Sol review).
+        let mut argv: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+        if argv.last().is_some_and(|s| s.is_empty()) {
+            argv.pop();
+        }
+        if is_attach_client_argv(&argv, claude_path, &short) {
+            // SIGTERM the viewer; the fork (a different process tree) is untouched.
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+    }
 }
 
 // ---- the headless phone-side injection ------------------------------------
@@ -653,6 +819,88 @@ mod tests {
                 "c8bac5f4",
             ]
         );
+    }
+
+    #[test]
+    fn only_a_claude_attach_client_matches_for_window_closing() {
+        let short = "af4b71cd";
+        let claude = &b"/home/charles/.local/bin/claude"[..];
+        // The popped viewer's own argv — matches (this is what we SIGTERM).
+        assert!(is_attach_client_argv(
+            &[claude, b"attach", b"af4b71cd"],
+            claude,
+            short
+        ));
+        // The FORK itself runs under bg-pty-host with a long argv — never match.
+        assert!(!is_attach_client_argv(
+            &[
+                &b"claude"[..],
+                b"bg-pty-host",
+                b"--session-id",
+                b"af4b71cd-ff34-406b-838d-90d333625ae0",
+            ],
+            claude,
+            short
+        ));
+        // A different session's viewer — must not match this fork's id.
+        assert!(!is_attach_client_argv(
+            &[claude, b"attach", b"deadbeef"],
+            claude,
+            short
+        ));
+        // Not the claude binary (e.g. a wrapping shell) — must not match.
+        assert!(!is_attach_client_argv(
+            &[&b"/usr/bin/bash"[..], b"attach", b"af4b71cd"],
+            claude,
+            short
+        ));
+        // A stray `/tmp/notclaude` (basename `notclaude`, NOT `claude`) must
+        // NOT match — the false positive a bare `ends_with("claude")` had.
+        assert!(!is_attach_client_argv(
+            &[&b"/tmp/notclaude"[..], b"attach", b"af4b71cd"],
+            claude,
+            short
+        ));
+        // Exec-type wrapper: the daemon resolved `CLAUDE_BIN=/opt/bin/cc`, but
+        // that wrapper `exec`s the real claude, so the RUNNING client's argv[0]
+        // is `/usr/local/bin/claude` — different from `claude_path`. It must
+        // still match, via the `/claude` basename (this is the case my first
+        // exact-only fix regressed; Sol round 2).
+        assert!(is_attach_client_argv(
+            &[&b"/usr/local/bin/claude"[..], b"attach", b"af4b71cd"],
+            &b"/opt/bin/cc"[..],
+            short
+        ));
+        // A NATIVE binary literally named `cc` (no wrapper, argv[0] preserved by
+        // execve) still matches via the exact-path clause.
+        let native_cc = &b"/opt/bin/cc"[..];
+        assert!(is_attach_client_argv(
+            &[native_cc, b"attach", b"af4b71cd"],
+            native_cc,
+            short
+        ));
+        // The common PATH form `exec claude "$@"` leaves a BARE `claude` (no
+        // slash) as argv[0]; basename is `claude`, so it matches (Sol round 3).
+        assert!(is_attach_client_argv(
+            &[&b"claude"[..], b"attach", b"af4b71cd"],
+            &b"/opt/bin/cc"[..],
+            short
+        ));
+        // …but a bare `notclaude` (basename `notclaude`) must NOT match.
+        assert!(!is_attach_client_argv(
+            &[&b"notclaude"[..], b"attach", b"af4b71cd"],
+            &b"/opt/bin/cc"[..],
+            short
+        ));
+        // Documented KNOWN LIMIT: a wrapper that `exec`s a RENAMED/versioned real
+        // binary (`claude.real`) leaves argv[0] that is neither `claude_path` nor
+        // basename `claude`, so its window is NOT closed (a leak, never a
+        // mis-kill). Locked in so the residual is explicit, not silently widened.
+        assert!(!is_attach_client_argv(
+            &[&b"/opt/anthropic/claude.real"[..], b"attach", b"af4b71cd"],
+            &b"/opt/bin/cc"[..],
+            short
+        ));
     }
 
     #[test]
