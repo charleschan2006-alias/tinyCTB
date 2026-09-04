@@ -54,6 +54,13 @@ pub(crate) fn option_keystrokes(index: usize) -> Vec<u8> {
 
 // ---- the visible local window --------------------------------------------
 
+/// Environment marker stamped on a window the DAEMON pops, so auto-close can
+/// tell it apart from a `claude attach <short>` the USER opened to watch the
+/// session. Only marked windows are closed — a window a person opened (and may
+/// have answered in at the keyboard) is never yanked out from under them
+/// (0.2.14 fix: 0.2.13 closed the user's own terminal after they answered in it).
+pub(crate) const POPPED_MARKER: &str = "TINYCTB_ATTACH_POPPED=1";
+
 /// The `gnome-terminal` argv that opens the fork's native dialog in a
 /// window. Pure, so the wiring is testable without a display.
 ///
@@ -62,11 +69,19 @@ pub(crate) fn option_keystrokes(index: usize) -> Vec<u8> {
 /// matching …" and the attach exits immediately (the on-machine cause of both
 /// the "flashing" local window and the phone-inject "no chrome" failure). So the
 /// attach argument is `short_id(session_id)`.
+///
+/// The command is wrapped in `env <POPPED_MARKER> …` so the running
+/// `claude attach` process carries the marker in its environ (its argv is
+/// unchanged — `env` execs claude directly — so [`is_attach_client_argv`] still
+/// matches). That marker is what lets [`close_attach_windows`] close only the
+/// window the daemon popped, never one the user opened.
 pub(crate) fn attach_window_argv(session_id: &str, claude_bin: &str) -> Vec<String> {
     vec![
         "--title".to_string(),
         format!("tinyCTB · 后台任务 {} 待答", short_id(session_id)),
         "--".to_string(),
+        "env".to_string(),
+        POPPED_MARKER.to_string(),
         claude_bin.to_string(),
         "attach".to_string(),
         short_id(session_id),
@@ -251,14 +266,25 @@ fn is_attach_client_argv(argv: &[&[u8]], claude_path: &[u8], short: &str) -> boo
     argv[0] == claude_path || basename == b"claude"
 }
 
-/// Close any popped `claude attach <short-id>` viewer window for this fork — its
-/// whole job (letting a person at the screen answer the ONE question) is done
+/// True when this process's `/proc/<pid>/environ` carries the daemon's pop
+/// marker — the environ is NUL-separated `KEY=VALUE` entries, and `env
+/// <POPPED_MARKER> …` put an exact `TINYCTB_ATTACH_POPPED=1` entry there. Pure
+/// over the raw environ bytes so it is testable without `/proc`.
+fn environ_has_marker(environ: &[u8], marker: &[u8]) -> bool {
+    environ.split(|b| *b == 0).any(|entry| entry == marker)
+}
+
+/// Close any popped `claude attach <short-id>` viewer window for this fork — the
+/// window the DAEMON popped so a person could answer the ONE question is done
 /// the moment the question settles, so it should not linger showing the fork's
 /// ongoing output. Scans `/proc` for the attach CLIENT process (matched by its
-/// exact argv via [`is_attach_client_argv`], never the fork) and SIGTERMs it;
-/// `gnome-terminal` then closes the window as its child exits. Best-effort: a
-/// missing `/proc`, an unreadable cmdline, or a failed kill is not fatal, and a
-/// person who has already closed the window just leaves nothing to match.
+/// exact argv via [`is_attach_client_argv`], never the fork) AND carrying the
+/// [`POPPED_MARKER`] in its environ, then SIGTERMs it; `gnome-terminal` closes
+/// the window as its child exits. The marker is the crucial guard: a
+/// `claude attach <short>` the USER opened to watch the session has NO marker
+/// and is left completely alone — never yanked out from under someone who
+/// answered in it at the keyboard (0.2.14 fix). Best-effort: a missing `/proc`,
+/// an unreadable cmdline/environ, or a failed kill is not fatal.
 pub(crate) fn close_attach_windows(session_id: &str) {
     let short = short_id(session_id);
     // Match argv[0] against the SAME claude the pop resolved, so a `cc` /
@@ -288,11 +314,22 @@ pub(crate) fn close_attach_windows(session_id: &str) {
         if argv.last().is_some_and(|s| s.is_empty()) {
             argv.pop();
         }
-        if is_attach_client_argv(&argv, claude_path, &short) {
-            // SIGTERM the viewer; the fork (a different process tree) is untouched.
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
+        if !is_attach_client_argv(&argv, claude_path, &short) {
+            continue;
+        }
+        // Only a window the DAEMON popped (carrying POPPED_MARKER in its environ)
+        // is closed — NEVER a `claude attach <short>` the user opened themselves,
+        // which has no marker. An unreadable environ means we can't prove it was
+        // ours, so we leave it alone (fail safe: don't kill a maybe-user window).
+        let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+            continue;
+        };
+        if !environ_has_marker(&environ, POPPED_MARKER.as_bytes()) {
+            continue;
+        }
+        // SIGTERM the viewer; the fork (a different process tree) is untouched.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
         }
     }
 }
@@ -806,7 +843,9 @@ mod tests {
 
     #[test]
     fn the_attach_window_runs_claude_attach_on_the_forks_short_id() {
-        // `claude attach` takes the SHORT 8-char id, not the full session UUID.
+        // `claude attach` takes the SHORT 8-char id, not the full session UUID;
+        // and the command is wrapped in `env <POPPED_MARKER>` so the daemon can
+        // recognise its OWN popped window for auto-close (0.2.14).
         let argv = attach_window_argv("c8bac5f4-16c1-4392-8366-57b28b1997b6", "claude");
         assert_eq!(
             argv,
@@ -814,11 +853,27 @@ mod tests {
                 "--title",
                 "tinyCTB · 后台任务 c8bac5f4 待答",
                 "--",
+                "env",
+                "TINYCTB_ATTACH_POPPED=1",
                 "claude",
                 "attach",
                 "c8bac5f4",
             ]
         );
+    }
+
+    #[test]
+    fn only_a_marked_window_is_recognised_as_daemon_popped() {
+        let marker = POPPED_MARKER.as_bytes();
+        // A daemon-popped attach: env has the exact marker entry among others.
+        let popped = b"PATH=/usr/bin\0TINYCTB_ATTACH_POPPED=1\0TERM=xterm-256color\0";
+        assert!(environ_has_marker(popped, marker));
+        // A user-opened attach: no marker → must be left alone.
+        let user = b"PATH=/usr/bin\0TERM=xterm-256color\0HOME=/home/charles\0";
+        assert!(!environ_has_marker(user, marker));
+        // A near-miss value must NOT count (exact entry match, not substring).
+        let near = b"TINYCTB_ATTACH_POPPED=10\0X_TINYCTB_ATTACH_POPPED=1\0";
+        assert!(!environ_has_marker(near, marker));
     }
 
     #[test]
